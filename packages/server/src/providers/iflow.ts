@@ -2,7 +2,8 @@ import { homedir } from "os";
 import { join } from "path";
 import { stat, unlink, rename, mkdir, readdir } from "fs/promises";
 import { glob } from "glob";
-import { parseJsonl } from "../utils/jsonl.js";
+import { parseJsonl, parseJsonlHead, countLines } from "../utils/jsonl.js";
+import { getCached, setCache, invalidateCache } from "../utils/cache.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -66,39 +67,41 @@ export class IFlowProvider implements ConversationProvider {
     const files = await glob(pattern);
 
     const results: ConversationMeta[] = [];
-    for (const filePath of files) {
-      try {
-        const meta = await this.extractMeta(filePath);
-        if (meta) results.push(meta);
-      } catch {
-        // 跳过
-      }
+    const metas = await Promise.all(
+      files.map((f) => this.extractMeta(f).catch(() => null))
+    );
+    for (const m of metas) {
+      if (m) results.push(m);
     }
     return results.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {
-    const entries = await parseJsonl<IFlowEntry>(filePath);
-    const messages = entries.filter(
+    const fileStat = await stat(filePath);
+    const cached = getCached(filePath, fileStat.mtimeMs);
+    if (cached) return cached;
+
+    const headEntries = await parseJsonlHead<IFlowEntry>(filePath, 30);
+    const headMessages = headEntries.filter(
       (e) => (e.type === "user" || e.type === "assistant") && e.message && !e.isSidechain
     );
 
-    if (messages.length === 0) return null;
+    if (headMessages.length === 0) {
+      const msgCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+      if (msgCount === 0) return null;
+    }
 
     const fileName = filePath.split(/[/\\]/).pop()!;
     const sessionId = fileName.replace(".jsonl", "");
-
-    // 项目分组 key：文件夹名
     const pathParts = filePath.replace(/\\/g, "/").split("/");
     const projectFolder = pathParts[pathParts.length - 2] || "";
 
-    // 显示路径：优先用第一条 user entry 的 cwd
-    const firstUserEntry = entries.find((e) => e.type === "user" && e.cwd);
+    const firstUserEntry = headEntries.find((e) => e.type === "user" && e.cwd);
     const project = firstUserEntry?.cwd
       ? normalizePath(firstUserEntry.cwd)
       : projectFolder;
 
-    const firstUserMsg = messages.find((e) => {
+    const firstUserMsg = headMessages.find((e) => {
       if (e.type !== "user" || !e.message) return false;
       const text = extractTextContent(e.message.content);
       if (!text.trim() || text.startsWith("/")) return false;
@@ -108,22 +111,27 @@ export class IFlowProvider implements ConversationProvider {
       ? extractTextContent(firstUserMsg.message.content).slice(0, 100)
       : "未知对话";
 
-    const firstTs = new Date(messages[0].timestamp).getTime();
-    const lastTs = new Date(messages[messages.length - 1].timestamp).getTime();
-    const fileStat = await stat(filePath);
+    const firstTs = headMessages[0]?.timestamp
+      ? new Date(headMessages[0].timestamp).getTime()
+      : fileStat.birthtimeMs;
 
-    return {
+    const messageCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+
+    const meta: ConversationMeta = {
       id: `iflow:${sessionId}`,
       provider: this.name,
       title: title.replace(/<[^>]+>/g, "").trim() || "未知对话",
       project,
       projectKey: projectFolder,
       createdAt: firstTs,
-      updatedAt: lastTs,
-      messageCount: messages.length,
+      updatedAt: fileStat.mtimeMs,
+      messageCount,
       fileSize: fileStat.size,
       filePath,
     };
+
+    setCache(filePath, fileStat.mtimeMs, meta);
+    return meta;
   }
 
   async read(id: string): Promise<Conversation> {
@@ -158,7 +166,6 @@ export class IFlowProvider implements ConversationProvider {
             timestamp: new Date(entry.timestamp).getTime(),
           });
         }
-        // tool calls
         if (Array.isArray(entry.message.content)) {
           for (const block of entry.message.content) {
             if (block.type === "tool_use") {
@@ -186,6 +193,7 @@ export class IFlowProvider implements ConversationProvider {
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
+    invalidateCache(files[0]);
     await unlink(files[0]);
   }
 
@@ -197,6 +205,7 @@ export class IFlowProvider implements ConversationProvider {
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
 
     const srcFile = files[0];
+    invalidateCache(srcFile);
     const fileName = srcFile.split(/[/\\]/).pop()!;
     const targetDir = join(basePath, targetProjectKey);
     await mkdir(targetDir, { recursive: true });

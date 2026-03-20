@@ -2,7 +2,8 @@ import { homedir } from "os";
 import { join } from "path";
 import { stat, readdir, unlink, rename, mkdir } from "fs/promises";
 import { glob } from "glob";
-import { parseJsonl } from "../utils/jsonl.js";
+import { parseJsonl, parseJsonlHead, countLines } from "../utils/jsonl.js";
+import { getCached, setCache, invalidateCache } from "../utils/cache.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -10,7 +11,6 @@ import type {
   Message,
 } from "./types.js";
 
-// Claude Code JSONL 行的类型
 interface ClaudeCodeEntry {
   type: string;
   subtype?: string;
@@ -27,8 +27,6 @@ interface ClaudeCodeEntry {
   };
   cwd?: string;
   timestamp?: string;
-  toolUseID?: string;
-  toolResult?: unknown;
 }
 
 function extractTextContent(
@@ -56,7 +54,6 @@ function extractToolCalls(
     }));
 }
 
-// 归一化路径：统一为正斜杠，去掉末尾斜杠
 function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "");
 }
@@ -83,49 +80,58 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const pattern = join(basePath, "*", "*.jsonl").replace(/\\/g, "/");
     const files = await glob(pattern);
 
+    // 并发提取元数据（限制并发数）
     const results: ConversationMeta[] = [];
-    for (const filePath of files) {
-      try {
-        const meta = await this.extractMeta(filePath);
-        if (meta) results.push(meta);
-      } catch {
-        // 跳过无法解析的文件
+    const batchSize = 20;
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      const metas = await Promise.all(
+        batch.map((f) => this.extractMeta(f).catch(() => null))
+      );
+      for (const m of metas) {
+        if (m) results.push(m);
       }
     }
     return results.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {
-    const entries = await parseJsonl<ClaudeCodeEntry>(filePath);
-    const messages = entries.filter(
+    const fileStat = await stat(filePath);
+
+    // 缓存命中
+    const cached = getCached(filePath, fileStat.mtimeMs);
+    if (cached) return cached;
+
+    // 只读前 40 行提取标题和 cwd
+    const headEntries = await parseJsonlHead<ClaudeCodeEntry>(filePath, 40);
+    const headMessages = headEntries.filter(
       (e) =>
         (e.type === "user" || e.type === "assistant") &&
-        !e.isMeta &&
-        !e.isSidechain &&
-        e.message
+        !e.isMeta && !e.isSidechain && e.message
     );
 
-    if (messages.length === 0) return null;
+    // 如果头部完全没有消息，可能是空会话或只有系统消息
+    // 用快速行计数确认
+    if (headMessages.length === 0) {
+      const msgCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+      if (msgCount === 0) return null;
+    }
 
-    // 文件名即 sessionId
     const fileName = filePath.split(/[/\\]/).pop()!;
     const sessionId = fileName.replace(".jsonl", "");
 
-    // 项目分组 key：文件夹名（保证同项目归到一起）
     const pathParts = filePath.replace(/\\/g, "/").split("/");
     const projectFolder = pathParts[pathParts.length - 2] || "";
 
-    // 显示路径：优先用第一条 user entry 的 cwd（精确），fallback 到文件夹名
-    const firstUserEntry = entries.find((e) => e.type === "user" && e.cwd);
+    const firstUserEntry = headEntries.find((e) => e.type === "user" && e.cwd);
     const project = firstUserEntry?.cwd
       ? normalizePath(firstUserEntry.cwd)
       : projectFolder;
 
-    // 标题取首条有效用户消息（跳过命令和空消息）
-    const firstUserMsg = messages.find((e) => {
+    // 标题
+    const firstUserMsg = headMessages.find((e) => {
       if (e.type !== "user" || !e.message) return false;
       const text = extractTextContent(e.message.content);
-      // 跳过斜杠命令、空消息、系统命令标记
       if (!text.trim() || text.startsWith("/") || text.includes("<command-name>") || text.includes("<local-command-")) return false;
       return true;
     });
@@ -133,27 +139,29 @@ export class ClaudeCodeProvider implements ConversationProvider {
       ? extractTextContent(firstUserMsg.message!.content).slice(0, 100)
       : "未知对话";
 
-    // 时间
-    const fileStat = await stat(filePath);
-    const firstTs = messages[0]?.timestamp
-      ? new Date(messages[0].timestamp).getTime()
+    // 时间：用 stat 代替解析最后一行
+    const firstTs = headMessages[0]?.timestamp
+      ? new Date(headMessages[0].timestamp).getTime()
       : fileStat.birthtimeMs;
-    const lastTs = messages[messages.length - 1]?.timestamp
-      ? new Date(messages[messages.length - 1].timestamp!).getTime()
-      : fileStat.mtimeMs;
 
-    return {
+    // 消息数：快速行计数
+    const messageCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+
+    const meta: ConversationMeta = {
       id: `claude-code:${sessionId}`,
       provider: this.name,
       title: title.replace(/<[^>]+>/g, "").trim() || "未知对话",
       project,
       projectKey: projectFolder,
       createdAt: firstTs,
-      updatedAt: lastTs,
-      messageCount: messages.length,
+      updatedAt: fileStat.mtimeMs,
+      messageCount,
       fileSize: fileStat.size,
       filePath,
     };
+
+    setCache(filePath, fileStat.mtimeMs, meta);
+    return meta;
   }
 
   async read(id: string): Promise<Conversation> {
@@ -165,20 +173,18 @@ export class ClaudeCodeProvider implements ConversationProvider {
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
     const filePath = files[0];
 
+    // read 时全量解析（用户主动点击查看才触发）
     const entries = await parseJsonl<ClaudeCodeEntry>(filePath);
     const messages: Message[] = [];
 
     for (const entry of entries) {
       if (entry.isSidechain || entry.isMeta) continue;
       if (!entry.message) continue;
-      // 跳过系统类型消息（local_command 等）
       if (entry.type === "system") continue;
 
       if (entry.type === "user") {
         const text = extractTextContent(entry.message.content);
-        // 跳过空消息、系统命令、斜杠命令
         if (!text.trim() || text.includes("<local-command-") || text.includes("<command-name>") || text.includes("<local-command-stdout>")) continue;
-        // 清理 XML 标签
         const cleanText = text.replace(/<[^>]+>/g, "").trim();
         if (!cleanText) continue;
         messages.push({
@@ -195,7 +201,6 @@ export class ClaudeCodeProvider implements ConversationProvider {
             timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
           });
         }
-        // tool calls
         if (Array.isArray(entry.message.content)) {
           const tools = extractToolCalls(entry.message.content);
           messages.push(...tools);
@@ -215,6 +220,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
+    invalidateCache(files[0]);
     await unlink(files[0]);
   }
 
@@ -226,6 +232,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
 
     const srcFile = files[0];
+    invalidateCache(srcFile);
     const fileName = srcFile.split(/[/\\]/).pop()!;
     const targetDir = join(basePath, targetProjectKey);
     await mkdir(targetDir, { recursive: true });

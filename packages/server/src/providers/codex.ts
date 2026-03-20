@@ -2,7 +2,8 @@ import { homedir } from "os";
 import { join } from "path";
 import { stat, unlink, readFile, writeFile } from "fs/promises";
 import { glob } from "glob";
-import { parseJsonl } from "../utils/jsonl.js";
+import { parseJsonl, parseJsonlHead, countLines } from "../utils/jsonl.js";
+import { getCached, setCache, invalidateCache } from "../utils/cache.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -56,59 +57,60 @@ export class CodexProvider implements ConversationProvider {
     const files = await glob(pattern);
 
     const results: ConversationMeta[] = [];
-    for (const filePath of files) {
-      try {
-        const meta = await this.extractMeta(filePath);
-        if (meta) results.push(meta);
-      } catch {
-        // 跳过
+    const batchSize = 20;
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      const metas = await Promise.all(
+        batch.map((f) => this.extractMeta(f).catch(() => null))
+      );
+      for (const m of metas) {
+        if (m) results.push(m);
       }
     }
     return results.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {
-    const entries = await parseJsonl<CodexEntry>(filePath);
-    if (entries.length === 0) return null;
+    const fileStat = await stat(filePath);
+    const cached = getCached(filePath, fileStat.mtimeMs);
+    if (cached) return cached;
 
-    const sessionMeta = entries.find((e) => e.type === "session_meta");
+    // 只读前 20 行获取 session_meta 和首条用户消息
+    const headEntries = await parseJsonlHead<CodexEntry>(filePath, 20);
+    if (headEntries.length === 0) return null;
+
+    const sessionMeta = headEntries.find((e) => e.type === "session_meta");
     const sessionId = sessionMeta?.payload?.id || filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     const cwd = sessionMeta?.payload?.cwd || "";
 
-    // 找第一条用户消息作为标题
-    const userMessages = entries.filter(
+    const userMessages = headEntries.filter(
       (e) => e.type === "event_msg" && e.payload?.type === "user_message" && e.payload.message
-    );
-    const responseItems = entries.filter(
-      (e) => e.type === "response_item" && e.payload?.role
     );
 
     const title = userMessages[0]?.payload?.message?.slice(0, 100) || "未知对话";
-    const messageCount = responseItems.filter(
-      (e) => e.payload?.role === "user" || e.payload?.role === "assistant"
-    ).length;
 
+    // 快速行计数
+    const messageCount = await countLines(filePath, ['"role":"user"', '"role":"assistant"']);
     if (messageCount === 0 && userMessages.length === 0) return null;
 
-    const firstTs = new Date(entries[0].timestamp).getTime();
-    const lastTs = new Date(entries[entries.length - 1].timestamp).getTime();
-
+    const firstTs = new Date(headEntries[0].timestamp).getTime();
     const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
 
-    const fileStat = await stat(filePath);
-
-    return {
+    const meta: ConversationMeta = {
       id: `codex:${sessionId}`,
       provider: this.name,
       title: title.replace(/<[^>]+>/g, "").trim() || "未知对话",
       project: normalizedCwd,
       projectKey: normalizedCwd,
       createdAt: firstTs,
-      updatedAt: lastTs,
+      updatedAt: fileStat.mtimeMs,
       messageCount: Math.max(messageCount, userMessages.length),
       fileSize: fileStat.size,
       filePath,
     };
+
+    setCache(filePath, fileStat.mtimeMs, meta);
+    return meta;
   }
 
   async read(id: string): Promise<Conversation> {
@@ -158,6 +160,7 @@ export class CodexProvider implements ConversationProvider {
     const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
+    invalidateCache(files[0]);
     await unlink(files[0]);
   }
 
@@ -169,6 +172,7 @@ export class CodexProvider implements ConversationProvider {
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
 
     const filePath = files[0];
+    invalidateCache(filePath);
     // targetProjectKey 对 Codex 是一个归一化路径（如 C:/Users/mortis097/Desktop/code_area/r-bioinfo）
     // 需要把它还原为 Windows 路径写回 session_meta.payload.cwd
     const newCwd = targetProjectKey.replace(/\//g, "\\");

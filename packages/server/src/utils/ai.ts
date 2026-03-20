@@ -1,7 +1,7 @@
 import { exec } from "child_process";
 import { promisify } from "util";
-import { writeFile, unlink, mkdtemp } from "fs/promises";
-import { tmpdir } from "os";
+import { writeFile, unlink, mkdir } from "fs/promises";
+import { homedir } from "os";
 import { join } from "path";
 import type { Message } from "../providers/types.js";
 
@@ -31,10 +31,12 @@ const CLI_TOOLS: CliTool[] = [
   },
 ];
 
-// 会话状态：记录每个 CLI 工具是否已有活跃会话
+// 固定的工作目录，确保 -c 能续用同一会话
+const WORK_DIR = join(homedir(), ".chatlog-viewer", "ai-work");
+
+// 会话状态
 const activeSession = new Map<string, boolean>();
 
-// 检测哪些 CLI 可用
 async function detectAvailableCli(): Promise<CliTool[]> {
   const available: CliTool[] = [];
   for (const tool of CLI_TOOLS) {
@@ -48,7 +50,6 @@ async function detectAvailableCli(): Promise<CliTool[]> {
   return available;
 }
 
-// 从消息中构建摘要上下文（取最新的几轮对话）
 function buildContext(messages: Message[], maxChars = 2000): string {
   const lines: string[] = [];
   let charCount = 0;
@@ -68,7 +69,6 @@ function buildContext(messages: Message[], maxChars = 2000): string {
   return lines.join("\n");
 }
 
-// 从 CLI 输出中提取纯文本
 function extractCleanOutput(stdout: string): string {
   let clean = stdout.replace(/<Execution Info>[\s\S]*/m, "").trim();
   clean = clean.replace(/\x1b\[[0-9;]*m/g, "");
@@ -91,8 +91,9 @@ export async function generateTitle(messages: Message[]): Promise<{
   const context = buildContext(messages);
   const fullPrompt = INSTRUCTION + context;
 
-  const tmpDir = await mkdtemp(join(tmpdir(), "chatlog-"));
-  const promptFile = join(tmpDir, "prompt.txt").replace(/\\/g, "/");
+  // 使用固定工作目录，确保 -c 能在同一目录下找到最近会话
+  await mkdir(WORK_DIR, { recursive: true });
+  const promptFile = join(WORK_DIR, "prompt.txt").replace(/\\/g, "/");
   await writeFile(promptFile, fullPrompt, "utf-8");
 
   try {
@@ -100,24 +101,23 @@ export async function generateTitle(messages: Message[]): Promise<{
       try {
         const hasSession = activeSession.get(tool.name) || false;
         const cmd = tool.buildCmd(promptFile, hasSession);
-        console.log(`[AI] 调用 ${tool.name}${hasSession ? " (续用会话)" : " (新建会话)"}: ${cmd.slice(0, 80)}...`);
+        console.log(`[AI] 调用 ${tool.name}${hasSession ? " (续用会话)" : " (新建会话)"}`);
 
         const { stdout } = await execAsync(cmd, {
           timeout: 60000,
           encoding: "utf-8",
           env: { ...process.env },
+          cwd: WORK_DIR,  // 关键：固定 cwd 使 -c 能找到最近会话
         });
 
         const title = extractCleanOutput(stdout);
         console.log(`[AI] ${tool.name} 输出: "${title}"`);
         if (title && title.length > 0 && title.length < 100) {
-          // 标记会话已建立
           activeSession.set(tool.name, true);
           return { title, usedCli: tool.name };
         }
       } catch (e) {
         console.error(`${tool.name} 生成标题失败:`, (e as Error).message);
-        // 失败后重置会话状态，下次新建
         activeSession.delete(tool.name);
       }
     }
@@ -128,7 +128,6 @@ export async function generateTitle(messages: Message[]): Promise<{
   throw new Error("所有 AI CLI 工具均未能生成有效标题");
 }
 
-// 重置会话（允许前端在需要时调用）
 export function resetSession(toolName?: string) {
   if (toolName) {
     activeSession.delete(toolName);
@@ -137,7 +136,6 @@ export function resetSession(toolName?: string) {
   }
 }
 
-// 获取可用的 CLI 列表和会话状态
 export async function getAvailableClis(): Promise<{ name: string; hasSession: boolean }[]> {
   const tools = await detectAvailableCli();
   return tools.map((t) => ({
