@@ -151,6 +151,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
       createdAt: firstTs,
       updatedAt: lastTs,
       messageCount: messages.length,
+      fileSize: fileStat.size,
       filePath,
     };
   }

@@ -110,6 +110,7 @@ export class IFlowProvider implements ConversationProvider {
 
     const firstTs = new Date(messages[0].timestamp).getTime();
     const lastTs = new Date(messages[messages.length - 1].timestamp).getTime();
+    const fileStat = await stat(filePath);
 
     return {
       id: `iflow:${sessionId}`,
@@ -120,6 +121,7 @@ export class IFlowProvider implements ConversationProvider {
       createdAt: firstTs,
       updatedAt: lastTs,
       messageCount: messages.length,
+      fileSize: fileStat.size,
       filePath,
     };
   }

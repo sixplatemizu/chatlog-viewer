@@ -16,6 +16,7 @@ export interface ConversationMeta {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
+  fileSize: number;
   filePath: string;
 }
 

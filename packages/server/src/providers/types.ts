@@ -21,6 +21,7 @@ export interface ConversationMeta {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
+  fileSize: number;         // 文件体积（字节）
   filePath: string;
 }
 

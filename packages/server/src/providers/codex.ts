@@ -95,6 +95,8 @@ export class CodexProvider implements ConversationProvider {
 
     const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
 
+    const fileStat = await stat(filePath);
+
     return {
       id: `codex:${sessionId}`,
       provider: this.name,
@@ -104,6 +106,7 @@ export class CodexProvider implements ConversationProvider {
       createdAt: firstTs,
       updatedAt: lastTs,
       messageCount: Math.max(messageCount, userMessages.length),
+      fileSize: fileStat.size,
       filePath,
     };
   }

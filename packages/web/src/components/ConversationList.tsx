@@ -10,6 +10,21 @@ const PROVIDER_BADGE: Record<string, string> = {
   opencode: "bg-cyan-500",
 };
 
+// 文件夹图标颜色跟随 provider
+const FOLDER_COLOR: Record<string, string> = {
+  "claude-code": "text-orange-400",
+  codex: "text-green-400",
+  iflow: "text-blue-400",
+  "gemini-cli": "text-purple-400",
+  opencode: "text-cyan-400",
+};
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 interface Props {
   conversations: ConversationMeta[];
   selectedId: string | null;
@@ -164,7 +179,7 @@ export function ConversationList({
                 ) : (
                   <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
                 )}
-                <FolderOpen className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
+                <FolderOpen className={`w-3.5 h-3.5 flex-shrink-0 ${FOLDER_COLOR[groupProvider] || "text-amber-500"}`} />
                 <span className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">
                   {displayName}
                 </span>
@@ -211,6 +226,10 @@ export function ConversationList({
                         <div className="flex items-center gap-2 mt-0.5">
                           <span className="text-xs text-gray-400">
                             {conv.messageCount} 条
+                          </span>
+                          <span className="text-xs text-gray-300 dark:text-gray-600">·</span>
+                          <span className="text-xs text-gray-400">
+                            {formatFileSize(conv.fileSize)}
                           </span>
                         </div>
                       </div>
