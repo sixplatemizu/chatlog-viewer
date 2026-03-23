@@ -1,9 +1,8 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneLight, oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { ChevronDown, ChevronRight, Wrench, User, Bot, Cpu } from "lucide-react";
 import type { Message } from "../lib/api";
+import { CodeBlock } from "./CodeBlock";
 
 interface Props {
   message: Message;
@@ -13,7 +12,7 @@ function isDark() {
   return document.documentElement.classList.contains("dark");
 }
 
-export function MessageBubble({ message }: Props) {
+export const MessageBubble = memo(function MessageBubble({ message }: Props) {
   const [expanded, setExpanded] = useState(false);
   const dark = isDark();
 
@@ -90,16 +89,7 @@ export function MessageBubble({ message }: Props) {
                 const match = /language-(\w+)/.exec(className || "");
                 const codeStr = String(children).replace(/\n$/, "");
                 if (match) {
-                  return (
-                    <SyntaxHighlighter
-                      style={dark ? oneDark : oneLight}
-                      language={match[1]}
-                      PreTag="div"
-                      customStyle={{ overflow: "auto" }}
-                    >
-                      {codeStr}
-                    </SyntaxHighlighter>
-                  );
+                  return <CodeBlock dark={dark} language={match[1]} code={codeStr} />;
                 }
                 return (
                   <code className={className} {...props}>
@@ -130,4 +120,5 @@ export function MessageBubble({ message }: Props) {
       </div>
     </div>
   );
-}
+});
+

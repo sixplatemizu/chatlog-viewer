@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { MessageSquare, FolderOpen, ChevronDown, ChevronRight } from "lucide-react";
 import type { ConversationMeta } from "../lib/api";
+import { getDisambiguatedProjectName, getProjectPathHint, normalizeProjectPath } from "../lib/project";
 
 const PROVIDER_BADGE: Record<string, string> = {
   "claude-code": "bg-orange-500",
@@ -36,6 +37,16 @@ interface Props {
   onDrop: (convId: string, targetProjectKey: string, sourceProvider: string, targetProvider: string) => void;
 }
 
+interface ConversationGroup {
+  key: string;
+  displayPath: string;
+  provider: string;
+  projectKey: string;
+  conversations: ConversationMeta[];
+  ids: string[];
+  latestUpdatedAt: number;
+}
+
 function formatTime(ts: number): string {
   const d = new Date(ts);
   const now = new Date();
@@ -51,31 +62,135 @@ function formatTime(ts: number): string {
   return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
 }
 
-function getProjectDisplayName(project: string): string {
-  const parts = project.split("/").filter(Boolean);
-  if (parts.length <= 1) return project || "未知目录";
-  return parts.slice(-2).join("/");
-}
+function getProjectDisplayScore(project: string, projectKey: string): number {
+  const normalized = normalizeProjectPath(project || "");
+  if (!normalized || normalized === projectKey) return 0;
 
-function groupByProject(conversations: ConversationMeta[]) {
-  const groups = new Map<string, { displayPath: string; provider: string; projectKey: string; convos: ConversationMeta[] }>();
-  for (const conv of conversations) {
-    const pk = conv.projectKey || conv.project || "未知目录";
-    // 用 provider + projectKey 做 key，避免不同 provider 同路径合并
-    const key = `${conv.provider}::${pk}`;
-    if (!groups.has(key)) {
-      groups.set(key, { displayPath: conv.project || pk, provider: conv.provider, projectKey: pk, convos: [] });
-    }
-    groups.get(key)!.convos.push(conv);
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return 0;
+  if (parts.length === 3 && /^[A-Za-z]:$/.test(parts[0]) && parts[1] === "Users") {
+    return 1;
   }
-  return [...groups.entries()].sort((a, b) => {
-    const aMax = Math.max(...a[1].convos.map((c) => c.updatedAt));
-    const bMax = Math.max(...b[1].convos.map((c) => c.updatedAt));
-    return bMax - aMax;
-  });
+  return parts.length + 10;
 }
 
-export function ConversationList({
+function pickBetterDisplayPath(current: string, candidate: string, projectKey: string): string {
+  if (!current) return candidate || projectKey;
+  if (!candidate) return current;
+
+  const currentScore = getProjectDisplayScore(current, projectKey);
+  const candidateScore = getProjectDisplayScore(candidate, projectKey);
+
+  if (candidateScore > currentScore) return candidate;
+  if (candidateScore === currentScore && candidate.length > current.length) return candidate;
+  return current;
+}
+
+function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] {
+  const groups = new Map<string, ConversationGroup>();
+
+  for (const conv of conversations) {
+    const projectKey = conv.projectKey || conv.project || "未知目录";
+    const key = `${conv.provider}::${projectKey}`;
+    let group = groups.get(key);
+
+    if (!group) {
+      group = {
+        key,
+        displayPath: conv.project || projectKey,
+        provider: conv.provider,
+        projectKey,
+        conversations: [],
+        ids: [],
+        latestUpdatedAt: conv.updatedAt,
+      };
+      groups.set(key, group);
+    } else {
+      group.displayPath = pickBetterDisplayPath(group.displayPath, conv.project || projectKey, projectKey);
+    }
+
+    group.conversations.push(conv);
+    group.ids.push(conv.id);
+    if (conv.updatedAt > group.latestUpdatedAt) {
+      group.latestUpdatedAt = conv.updatedAt;
+    }
+  }
+
+  return [...groups.values()].sort((a, b) => b.latestUpdatedAt - a.latestUpdatedAt);
+}
+
+const ConversationRow = memo(function ConversationRow({
+  conv,
+  checked,
+  selected,
+  onSelect,
+  onToggleSelect,
+}: {
+  conv: ConversationMeta;
+  checked: boolean;
+  selected: boolean;
+  onSelect: (id: string) => void;
+  onToggleSelect: (id: string) => void;
+}) {
+  const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+    e.dataTransfer.setData("application/x-conv-id", conv.id);
+    e.dataTransfer.setData("application/x-conv-provider", conv.provider);
+    e.dataTransfer.effectAllowed = "move";
+  };
+
+  return (
+    <div
+      draggable
+      onDragStart={handleDragStart}
+      className={`flex items-start gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors cursor-grab active:cursor-grabbing ${
+        selected
+          ? "bg-blue-50 dark:bg-blue-900/20 border-r-2 border-blue-500"
+          : ""
+      } ${checked && !selected ? "bg-blue-50/50 dark:bg-blue-900/10" : ""}`}
+      onClick={() => onSelect(conv.id)}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={() => onToggleSelect(conv.id)}
+        onClick={(e) => e.stopPropagation()}
+        className="w-3.5 h-3.5 mt-1 rounded accent-blue-500 cursor-pointer flex-shrink-0"
+      />
+      <div
+        className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
+          PROVIDER_BADGE[conv.provider] || "bg-gray-400"
+        }`}
+        title={conv.provider}
+      />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm text-gray-900 dark:text-gray-100 truncate">
+            {conv.title}
+          </span>
+          {conv.provider === "codex" && conv.modelProvider && (
+            <span className="text-[9px] px-1.5 py-0 rounded-full bg-green-50 text-green-600 border border-green-200 dark:bg-green-900/30 dark:text-green-400 dark:border-green-700 flex-shrink-0 leading-4">
+              {conv.modelProvider}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 mt-0.5">
+          <span className="text-xs text-gray-400">
+            {conv.messageCount} 条
+          </span>
+          <span className="text-xs text-gray-300 dark:text-gray-600">·</span>
+          <span className="text-xs text-gray-400">
+            {formatFileSize(conv.fileSize)}
+          </span>
+        </div>
+      </div>
+      <span className="text-xs text-gray-400 flex-shrink-0">
+        {formatTime(conv.updatedAt)}
+      </span>
+    </div>
+  );
+});
+
+export const ConversationList = memo(function ConversationList({
   conversations,
   selectedId,
   onSelect,
@@ -87,6 +202,23 @@ export function ConversationList({
 }: Props) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
+
+  const groups = useMemo(() => groupByProject(conversations), [conversations]);
+  const groupSelectionState = useMemo(() => {
+    const selectedCountByGroup = new Map<string, number>();
+
+    for (const group of groups) {
+      let selectedCount = 0;
+      for (const id of group.ids) {
+        if (selectedIds.has(id)) {
+          selectedCount++;
+        }
+      }
+      selectedCountByGroup.set(group.key, selectedCount);
+    }
+
+    return selectedCountByGroup;
+  }, [groups, selectedIds]);
 
   if (loading) {
     return (
@@ -105,7 +237,6 @@ export function ConversationList({
     );
   }
 
-  const groups = groupByProject(conversations);
   const toggleGroup = (key: string) => {
     setCollapsedGroups((prev) => {
       const next = new Set(prev);
@@ -113,12 +244,6 @@ export function ConversationList({
       else next.add(key);
       return next;
     });
-  };
-
-  const handleDragStart = (e: React.DragEvent, convId: string, provider: string) => {
-    e.dataTransfer.setData("application/x-conv-id", convId);
-    e.dataTransfer.setData("application/x-conv-provider", provider);
-    e.dataTransfer.effectAllowed = "move";
   };
 
   const handleDragOver = (e: React.DragEvent, key: string) => {
@@ -141,104 +266,73 @@ export function ConversationList({
 
   return (
     <div>
-      {groups.map(([key, { displayPath, provider: groupProvider, projectKey: groupPk, convos }]) => {
-        const collapsed = collapsedGroups.has(key);
-        const displayName = getProjectDisplayName(displayPath);
-        const hasSelected = convos.some((c) => c.id === selectedId);
-        const groupIds = convos.map((c) => c.id);
-        const allChecked = groupIds.every((id) => selectedIds.has(id));
-        const someChecked = !allChecked && groupIds.some((id) => selectedIds.has(id));
-        const isDragTarget = dragOverKey === key;
+      {groups.map((group) => {
+        const collapsed = collapsedGroups.has(group.key);
+        const displayName = getDisambiguatedProjectName(
+          group.displayPath,
+          group.projectKey,
+          groups
+            .filter((item) => item.key !== group.key)
+            .map((item) => ({ project: item.displayPath, projectKey: item.projectKey }))
+        );
+        const hasSelected = selectedId ? group.ids.includes(selectedId) : false;
+        const selectedCount = groupSelectionState.get(group.key) ?? 0;
+        const allChecked = selectedCount > 0 && selectedCount === group.ids.length;
+        const someChecked = selectedCount > 0 && selectedCount < group.ids.length;
+        const isDragTarget = dragOverKey === group.key;
 
         return (
-          <div key={key}>
-            {/* 文件夹组头 — 拖放目标 */}
+          <div key={group.key}>
             <div
               className={`flex items-center gap-1 px-3 py-1.5 bg-gray-100/80 dark:bg-gray-700/60 border-b border-gray-200 dark:border-gray-600 sticky top-0 z-10 transition-colors ${
                 hasSelected && collapsed ? "!bg-blue-50 dark:!bg-blue-900/20" : ""
               } ${isDragTarget ? "!bg-blue-100 dark:!bg-blue-800/40 ring-2 ring-blue-400 ring-inset" : ""}`}
-              onDragOver={(e) => handleDragOver(e, key)}
+              onDragOver={(e) => handleDragOver(e, group.key)}
               onDragLeave={handleDragLeave}
-              onDrop={(e) => handleDrop(e, key, groupProvider, groupPk)}
+              onDrop={(e) => handleDrop(e, group.key, group.provider, group.projectKey)}
             >
               <input
                 type="checkbox"
                 checked={allChecked}
-                ref={(el) => { if (el) el.indeterminate = someChecked; }}
-                onChange={() => onToggleSelectGroup(groupIds)}
+                ref={(el) => {
+                  if (el) el.indeterminate = someChecked;
+                }}
+                onChange={() => onToggleSelectGroup(group.ids)}
                 className="w-3.5 h-3.5 rounded accent-blue-500 cursor-pointer flex-shrink-0"
                 onClick={(e) => e.stopPropagation()}
               />
               <button
-                onClick={() => toggleGroup(key)}
+                onClick={() => toggleGroup(group.key)}
                 className="flex items-center gap-1 flex-1 min-w-0 hover:bg-gray-100 dark:hover:bg-gray-700 rounded px-1 transition-colors"
-                title={displayPath}
+                title={getProjectPathHint(group.displayPath, group.projectKey)}
               >
                 {collapsed ? (
                   <ChevronRight className="w-3 h-3 text-gray-400 flex-shrink-0" />
                 ) : (
                   <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
                 )}
-                <FolderOpen className={`w-3.5 h-3.5 flex-shrink-0 ${FOLDER_COLOR[groupProvider] || "text-amber-500"}`} />
+                <FolderOpen className={`w-3.5 h-3.5 flex-shrink-0 ${FOLDER_COLOR[group.provider] || "text-amber-500"}`} />
                 <span className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">
                   {displayName}
                 </span>
                 <span className="text-xs text-gray-400 ml-auto flex-shrink-0">
-                  {convos.length}
+                  {group.conversations.length}
                 </span>
               </button>
             </div>
 
-            {/* 对话列表 — 可拖拽 */}
             {!collapsed && (
               <div className="divide-y divide-gray-50 dark:divide-gray-700/50">
-                {convos.map((conv) => {
-                  const checked = selectedIds.has(conv.id);
-                  return (
-                    <div
-                      key={conv.id}
-                      draggable
-                      onDragStart={(e) => handleDragStart(e, conv.id, conv.provider)}
-                      className={`flex items-start gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors cursor-grab active:cursor-grabbing ${
-                        selectedId === conv.id
-                          ? "bg-blue-50 dark:bg-blue-900/20 border-r-2 border-blue-500"
-                          : ""
-                      } ${checked && selectedId !== conv.id ? "bg-blue-50/50 dark:bg-blue-900/10" : ""}`}
-                      onClick={() => onSelect(conv.id)}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => onToggleSelect(conv.id)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="w-3.5 h-3.5 mt-1 rounded accent-blue-500 cursor-pointer flex-shrink-0"
-                      />
-                      <div
-                        className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
-                          PROVIDER_BADGE[conv.provider] || "bg-gray-400"
-                        }`}
-                        title={conv.provider}
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm text-gray-900 dark:text-gray-100 truncate">
-                          {conv.title}
-                        </div>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          <span className="text-xs text-gray-400">
-                            {conv.messageCount} 条
-                          </span>
-                          <span className="text-xs text-gray-300 dark:text-gray-600">·</span>
-                          <span className="text-xs text-gray-400">
-                            {formatFileSize(conv.fileSize)}
-                          </span>
-                        </div>
-                      </div>
-                      <span className="text-xs text-gray-400 flex-shrink-0">
-                        {formatTime(conv.updatedAt)}
-                      </span>
-                    </div>
-                  );
-                })}
+                {group.conversations.map((conv) => (
+                  <ConversationRow
+                    key={conv.id}
+                    conv={conv}
+                    checked={selectedIds.has(conv.id)}
+                    selected={selectedId === conv.id}
+                    onSelect={onSelect}
+                    onToggleSelect={onToggleSelect}
+                  />
+                ))}
               </div>
             )}
           </div>
@@ -246,4 +340,4 @@ export function ConversationList({
       })}
     </div>
   );
-}
+});

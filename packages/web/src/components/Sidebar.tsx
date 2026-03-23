@@ -1,5 +1,6 @@
+import { useMemo } from "react";
 import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles } from "lucide-react";
-import type { ProviderInfo, ConversationMeta } from "../lib/api";
+import type { ProviderInfo, ConversationMeta, CodexModelProvider } from "../lib/api";
 import { ConversationList } from "./ConversationList";
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -33,6 +34,9 @@ interface SidebarProps {
   onBatchGenerate: () => void;
   batchGenerating: boolean;
   onMoveConversation: (convId: string, targetProjectKey: string, srcProvider: string, targetProvider: string) => void;
+  codexModelProviders: CodexModelProvider[];
+  activeModelProviders: Set<string>;
+  onToggleModelProvider: (name: string) => void;
 }
 
 export function Sidebar({
@@ -58,12 +62,43 @@ export function Sidebar({
   onBatchGenerate,
   batchGenerating,
   onMoveConversation,
+  codexModelProviders,
+  activeModelProviders,
+  onToggleModelProvider,
 }: SidebarProps) {
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
 
+  const providerCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const conv of conversations) {
+      counts.set(conv.provider, (counts.get(conv.provider) ?? 0) + 1);
+    }
+    return counts;
+  }, [conversations]);
+
+  const codexProviderCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const conv of conversations) {
+      if (conv.provider !== "codex" || !conv.modelProvider) continue;
+      counts.set(conv.modelProvider, (counts.get(conv.modelProvider) ?? 0) + 1);
+    }
+    return counts;
+  }, [conversations]);
+
+  const footerText = useMemo(() => {
+    const parts = providers
+      .filter((p) => p.available && activeProviders.has(p.name))
+      .map((p) => {
+        const count = providerCounts.get(p.name) ?? 0;
+        return count > 0 ? `${p.displayName}: ${count}` : "";
+      })
+      .filter(Boolean);
+
+    return parts.length > 0 ? `共 ${total} 条对话 | ${parts.join(" | ")}` : `共 ${total} 条对话`;
+  }, [activeProviders, providerCounts, providers, total]);
+
   return (
     <div className="w-80 border-r border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col h-full">
-      {/* 搜索栏 */}
       <div className="p-3 border-b border-gray-200 dark:border-gray-700">
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -99,7 +134,6 @@ export function Sidebar({
         </div>
       </div>
 
-      {/* Provider 筛选 */}
       <div className="p-3 border-b border-gray-200 dark:border-gray-700">
         <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">工具筛选</div>
         <div className="flex flex-wrap gap-1.5">
@@ -123,9 +157,33 @@ export function Sidebar({
             </button>
           ))}
         </div>
+
+        {activeProviders.has("codex") && codexModelProviders.length > 0 && (
+          <div className="mt-2 pt-2 border-t border-gray-100 dark:border-gray-600">
+            <div className="text-[10px] text-gray-400 dark:text-gray-500 mb-1.5">Codex Provider</div>
+            <div className="flex flex-wrap gap-1">
+              {codexModelProviders.map((mp) => (
+                <button
+                  key={mp.name}
+                  onClick={() => onToggleModelProvider(mp.name)}
+                  className={`
+                    text-[10px] px-2 py-0.5 rounded-full border transition-all
+                    ${
+                      activeModelProviders.has(mp.name)
+                        ? "bg-green-50 text-green-700 border-green-300 dark:bg-green-900/30 dark:text-green-300 dark:border-green-700"
+                        : "bg-gray-50 dark:bg-gray-700 text-gray-400 border-gray-200 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600"
+                    }
+                  `}
+                >
+                  {mp.name}
+                  <span className="ml-0.5 opacity-60">{codexProviderCounts.get(mp.name) ?? 0}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* 对话列表 */}
       <div className="flex-1 overflow-y-auto">
         <ConversationList
           conversations={conversations}
@@ -139,7 +197,6 @@ export function Sidebar({
         />
       </div>
 
-      {/* 批量操作栏 / 状态栏 */}
       {selectedIds.size > 0 ? (
         <div className="p-2 border-t border-gray-200 dark:border-gray-700 bg-blue-50 dark:bg-blue-900/30 flex items-center justify-between">
           <span className="text-xs text-blue-700 dark:text-blue-300 font-medium">
@@ -179,14 +236,7 @@ export function Sidebar({
       ) : (
         <div className="p-2 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
           <div className="text-xs text-gray-500 dark:text-gray-400 text-center">
-            共 {total} 条对话
-            {providers
-              .filter((p) => p.available && activeProviders.has(p.name))
-              .map((p) => {
-                const count = conversations.filter((c) => c.provider === p.name).length;
-                return count > 0 ? ` | ${p.displayName}: ${count}` : "";
-              })
-              .join("")}
+            {footerText}
           </div>
         </div>
       )}

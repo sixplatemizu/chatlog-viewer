@@ -2,3 +2,4 @@ node_modules/
 dist/
 .pnpmrc.json
 *.tsbuildinfo
+.ace-tool/

@@ -1,15 +1,21 @@
 import { homedir } from "os";
 import { join } from "path";
 import { stat, unlink, readFile, writeFile } from "fs/promises";
+import { createRequire } from "module";
 import { glob } from "glob";
-import { parseJsonl, parseJsonlHead, countLines } from "../utils/jsonl.js";
-import { getCached, setCache, invalidateCache } from "../utils/cache.js";
+import type BetterSqlite3 from "better-sqlite3";
+import { parseJsonl, parseJsonlHead, parseJsonlTail, countLines } from "../utils/jsonl.js";
+import { getCached, getListCache, setCache, setListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
   Message,
+  ConversationReadOptions,
 } from "./types.js";
+
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3") as typeof BetterSqlite3;
 
 interface CodexEntry {
   timestamp: string;
@@ -34,9 +40,92 @@ function extractContent(content: Array<{ type: string; text?: string }>): string
     .join("\n");
 }
 
+function buildMessages(entries: CodexEntry[]): Message[] {
+  const messages: Message[] = [];
+
+  for (const entry of entries) {
+    if (entry.type !== "response_item" || !entry.payload?.role) continue;
+
+    const role = entry.payload.role as "user" | "assistant";
+    if (role !== "user" && role !== "assistant") continue;
+
+    const content = entry.payload.content
+      ? extractContent(entry.payload.content)
+      : "";
+    if (content.includes("<environment_context>")) continue;
+    if (!content.trim()) continue;
+
+    messages.push({
+      role,
+      content,
+      timestamp: new Date(entry.timestamp).getTime(),
+    });
+  }
+
+  return messages;
+}
+
+function getListCacheKey(providerName: string, storagePath: string): string {
+  return `${providerName}::${storagePath}`;
+}
+
+async function buildListSignature(files: string[]): Promise<string> {
+  let mtimeSum = 0;
+  for (const file of files) {
+    try {
+      const fileStat = await stat(file);
+      mtimeSum += fileStat.mtimeMs;
+    } catch {
+      // 忽略单文件异常，签名仍然变化
+    }
+  }
+  return `${files.length}:${mtimeSum}`;
+}
+
+function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
+  const limit = options?.limit;
+  const before = options?.before ?? 0;
+
+  if (!limit || limit <= 0) {
+    return { items, hasMore: false };
+  }
+
+  const end = Math.max(0, items.length - before);
+  const start = Math.max(0, end - limit);
+  return {
+    items: items.slice(start, end),
+    hasMore: start > 0,
+  };
+}
+
 export class CodexProvider implements ConversationProvider {
   name = "codex";
   displayName = "Codex";
+
+  private db: BetterSqlite3.Database | null = null;
+
+  private getDb(): BetterSqlite3.Database | null {
+    if (this.db) return this.db;
+    try {
+      const dbPath = join(homedir(), ".codex", "state_5.sqlite");
+      this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
+      return this.db;
+    } catch {
+      return null;
+    }
+  }
+
+  // 从 SQLite 查询 model_provider
+  private getModelProvider(sessionId: string): string | undefined {
+    const db = this.getDb();
+    if (!db) return undefined;
+    try {
+      const row = db.prepare("SELECT model_provider FROM threads WHERE id = ?").get(sessionId) as { model_provider: string } | undefined;
+      return row?.model_provider;
+    } catch {
+      return undefined;
+    }
+  }
 
   getStoragePath(): string {
     return join(homedir(), ".codex", "sessions");
@@ -55,6 +144,12 @@ export class CodexProvider implements ConversationProvider {
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "**", "*.jsonl").replace(/\\/g, "/");
     const files = await glob(pattern);
+    const cacheKey = getListCacheKey(this.name, basePath);
+    const signature = await buildListSignature(files);
+    const cachedList = getListCache(cacheKey, signature);
+    if (cachedList) {
+      return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
+    }
 
     const results: ConversationMeta[] = [];
     const batchSize = 20;
@@ -67,6 +162,8 @@ export class CodexProvider implements ConversationProvider {
         if (m) results.push(m);
       }
     }
+
+    setListCache(cacheKey, signature, results);
     return results.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
@@ -96,6 +193,9 @@ export class CodexProvider implements ConversationProvider {
     const firstTs = new Date(headEntries[0].timestamp).getTime();
     const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
 
+    // 从 SQLite 查询 model_provider
+    const modelProvider = this.getModelProvider(sessionId);
+
     const meta: ConversationMeta = {
       id: `codex:${sessionId}`,
       provider: this.name,
@@ -107,13 +207,14 @@ export class CodexProvider implements ConversationProvider {
       messageCount: Math.max(messageCount, userMessages.length),
       fileSize: fileStat.size,
       filePath,
+      modelProvider,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
     return meta;
   }
 
-  async read(id: string): Promise<Conversation> {
+  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
     const sessionId = id.replace("codex:", "");
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
@@ -121,37 +222,28 @@ export class CodexProvider implements ConversationProvider {
 
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
     const filePath = files[0];
+    const fileStat = await stat(filePath);
 
-    const entries = await parseJsonl<CodexEntry>(filePath);
-    const messages: Message[] = [];
+    const limit = options?.limit;
+    const before = options?.before ?? 0;
+    const shouldWindowRead = !!limit && limit > 0;
+    const requiredMessages = shouldWindowRead ? before + limit + 1 : 0;
 
-    for (const entry of entries) {
-      if (entry.type === "response_item" && entry.payload?.role) {
-        const role = entry.payload.role as "user" | "assistant";
-        if (role !== "user" && role !== "assistant") continue;
-
-        const content = entry.payload.content
-          ? extractContent(entry.payload.content)
-          : "";
-        // 跳过 environment_context 等系统消息
-        if (content.includes("<environment_context>")) continue;
-        if (!content.trim()) continue;
-
-        messages.push({
-          role,
-          content,
-          timestamp: new Date(entry.timestamp).getTime(),
-        });
-      } else if (entry.type === "event_msg" && entry.payload?.type === "user_message") {
-        // event_msg 类型的用户消息 - 避免与 response_item 重复
-        // 只在没有对应 response_item 时使用
-      }
-    }
+    const entries = shouldWindowRead
+      ? await parseJsonlTail<CodexEntry>(filePath, {
+          bytesHint: Math.max(256 * 1024, fileStat.size > 0 ? Math.min(fileStat.size, (before + limit) * 4096) : 256 * 1024),
+          maxBytes: fileStat.size,
+          isEnough: (tailEntries) => buildMessages(tailEntries).length >= requiredMessages,
+        })
+      : await parseJsonl<CodexEntry>(filePath);
+    const messages = buildMessages(entries);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
 
-    return { ...meta, messages };
+    const { items: windowedMessages, hasMore } = sliceWindow(messages, options);
+
+    return { ...meta, messages: windowedMessages, hasMore };
   }
 
   async delete(id: string): Promise<void> {
@@ -160,6 +252,7 @@ export class CodexProvider implements ConversationProvider {
     const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
+    invalidateListCache(getListCacheKey(this.name, basePath));
     invalidateCache(files[0]);
     await unlink(files[0]);
   }
@@ -172,9 +265,8 @@ export class CodexProvider implements ConversationProvider {
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
 
     const filePath = files[0];
+    invalidateListCache(getListCacheKey(this.name, basePath));
     invalidateCache(filePath);
-    // targetProjectKey 对 Codex 是一个归一化路径（如 C:/Users/mortis097/Desktop/code_area/r-bioinfo）
-    // 需要把它还原为 Windows 路径写回 session_meta.payload.cwd
     const newCwd = targetProjectKey.replace(/\//g, "\\");
 
     const content = await readFile(filePath, "utf-8");
@@ -196,7 +288,6 @@ export class CodexProvider implements ConversationProvider {
   }
 
   async listProjects(): Promise<string[]> {
-    // Codex 按 cwd 分组，从现有对话中收集所有不同的 cwd
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "**", "*.jsonl").replace(/\\/g, "/");
     const files = await glob(pattern);
@@ -204,8 +295,8 @@ export class CodexProvider implements ConversationProvider {
 
     for (const filePath of files) {
       try {
-        const entries = await parseJsonl<CodexEntry>(filePath);
-        const meta = entries.find((e) => e.type === "session_meta");
+        const head = await parseJsonlHead<CodexEntry>(filePath, 5);
+        const meta = head.find((e) => e.type === "session_meta");
         const cwd = meta?.payload?.cwd;
         if (cwd) cwds.add(cwd.replace(/\\/g, "/").replace(/\/+$/, ""));
       } catch {
@@ -213,5 +304,38 @@ export class CodexProvider implements ConversationProvider {
       }
     }
     return [...cwds];
+  }
+
+  // 列出所有 model_provider 及对话数
+  listModelProviders(): { name: string; count: number }[] {
+    const db = this.getDb();
+    if (!db) return [];
+    try {
+      const rows = db.prepare("SELECT model_provider, COUNT(*) as count FROM threads GROUP BY model_provider ORDER BY count DESC").all() as { model_provider: string; count: number }[];
+      return rows.map((r) => ({ name: r.model_provider, count: r.count }));
+    } catch {
+      return [];
+    }
+  }
+
+  // 修改对话的 model_provider
+  async changeModelProvider(id: string, newProvider: string): Promise<void> {
+    const sessionId = id.replace("codex:", "");
+    const dbPath = join(homedir(), ".codex", "state_5.sqlite");
+    // 写操作需要新开一个可写连接
+    const db = new Database(dbPath);
+    try {
+      const result = db.prepare("UPDATE threads SET model_provider = ? WHERE id = ?").run(newProvider, sessionId);
+      if (result.changes === 0) throw new Error(`SQLite 中未找到对话: ${sessionId}`);
+    } finally {
+      db.close();
+    }
+
+    // 清除文件缓存（缓存 key 是文件路径，不是对话 ID）
+    const basePath = this.getStoragePath();
+    const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
+    const files = await glob(pattern);
+    for (const f of files) invalidateCache(f);
+    invalidateListCache(getListCacheKey(this.name, basePath));
   }
 }

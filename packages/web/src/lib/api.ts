@@ -1,5 +1,69 @@
 const BASE = "/api";
 
+export class ApiError extends Error {
+  status: number;
+  details: unknown;
+
+  constructor(message: string, status: number, details?: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.details = details;
+  }
+}
+
+function extractApiErrorMessage(details: unknown, fallback: string): string {
+  if (
+    details &&
+    typeof details === "object" &&
+    "error" in details &&
+    typeof (details as { error?: unknown }).error === "string"
+  ) {
+    return (details as { error: string }).error;
+  }
+
+  return fallback;
+}
+
+async function createApiError(res: Response): Promise<ApiError> {
+  const fallback = `请求失败 (${res.status})`;
+  const contentType = res.headers.get("content-type") || "";
+
+  try {
+    if (contentType.includes("application/json")) {
+      const details = await res.json();
+      return new ApiError(extractApiErrorMessage(details, fallback), res.status, details);
+    }
+
+    const text = (await res.text()).trim();
+    return new ApiError(text || fallback, res.status);
+  } catch {
+    return new ApiError(fallback, res.status);
+  }
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw await createApiError(res);
+  return res.json() as Promise<T>;
+}
+
+async function requestBlob(url: string, init?: RequestInit): Promise<Blob> {
+  const res = await fetch(url, init);
+  if (!res.ok) throw await createApiError(res);
+  return res.blob();
+}
+
+export function getErrorMessage(error: unknown, fallback = "请求失败"): string {
+  if (error instanceof ApiError) return error.message;
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 export interface ProviderInfo {
   name: string;
   displayName: string;
@@ -18,6 +82,7 @@ export interface ConversationMeta {
   messageCount: number;
   fileSize: number;
   filePath: string;
+  modelProvider?: string;
 }
 
 export interface Message {
@@ -31,33 +96,51 @@ export interface Message {
 
 export interface Conversation extends ConversationMeta {
   messages: Message[];
+  hasMore?: boolean;
 }
 
-export async function fetchProviders(): Promise<ProviderInfo[]> {
-  const res = await fetch(`${BASE}/providers`);
-  return res.json();
+export async function fetchProviders(signal?: AbortSignal): Promise<ProviderInfo[]> {
+  return requestJson<ProviderInfo[]>(`${BASE}/providers`, { signal });
 }
 
 export async function fetchConversations(params: {
   provider?: string;
   search?: string;
   sort?: string;
+  modelProvider?: string;
+  signal?: AbortSignal;
 }): Promise<{ total: number; conversations: ConversationMeta[] }> {
   const qs = new URLSearchParams();
   if (params.provider) qs.set("provider", params.provider);
   if (params.search) qs.set("search", params.search);
   if (params.sort) qs.set("sort", params.sort);
-  const res = await fetch(`${BASE}/conversations?${qs}`);
-  return res.json();
+  if (params.modelProvider !== undefined) qs.set("modelProvider", params.modelProvider);
+  return requestJson<{ total: number; conversations: ConversationMeta[] }>(
+    `${BASE}/conversations?${qs}`,
+    { signal: params.signal }
+  );
 }
 
-export async function fetchConversation(id: string): Promise<Conversation> {
-  const res = await fetch(`${BASE}/conversations/${encodeURIComponent(id)}`);
-  return res.json();
+export async function fetchConversation(
+  id: string,
+  options?: {
+    before?: number;
+    limit?: number;
+    signal?: AbortSignal;
+  }
+): Promise<Conversation> {
+  const qs = new URLSearchParams();
+  if (options?.limit !== undefined) qs.set("limit", String(options.limit));
+  if (options?.before !== undefined) qs.set("before", String(options.before));
+  const suffix = qs.size > 0 ? `?${qs}` : "";
+
+  return requestJson<Conversation>(`${BASE}/conversations/${encodeURIComponent(id)}${suffix}`, {
+    signal: options?.signal,
+  });
 }
 
 export async function deleteConversation(id: string): Promise<void> {
-  await fetch(`${BASE}/conversations/${encodeURIComponent(id)}`, {
+  await requestJson<{ success: boolean }>(`${BASE}/conversations/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
 }
@@ -66,19 +149,18 @@ export async function exportConversations(
   ids: string[],
   format: "json" | "markdown"
 ): Promise<Blob> {
-  const res = await fetch(`${BASE}/export`, {
+  return requestBlob(`${BASE}/export`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids, format }),
   });
-  return res.blob();
 }
 
 export async function updateTitle(
   id: string,
   title: string
 ): Promise<{ success: boolean; title: string }> {
-  const res = await fetch(
+  return requestJson<{ success: boolean; title: string }>(
     `${BASE}/conversations/${encodeURIComponent(id)}/title`,
     {
       method: "PUT",
@@ -86,22 +168,24 @@ export async function updateTitle(
       body: JSON.stringify({ title }),
     }
   );
-  return res.json();
 }
 
 export async function generateAiTitle(
   id: string
 ): Promise<{ success: boolean; title: string; usedCli: string; error?: string }> {
-  const res = await fetch(
+  return requestJson<{ success: boolean; title: string; usedCli: string; error?: string }>(
     `${BASE}/conversations/${encodeURIComponent(id)}/generate-title`,
     { method: "POST" }
   );
-  return res.json();
 }
 
-export async function fetchAvailableClis(): Promise<string[]> {
-  const res = await fetch(`${BASE}/ai/clis`);
-  return res.json();
+export interface AvailableCliInfo {
+  name: string;
+  hasSession: boolean;
+}
+
+export async function fetchAvailableClis(): Promise<AvailableCliInfo[]> {
+  return requestJson<AvailableCliInfo[]>(`${BASE}/ai/clis`);
 }
 
 export interface ProjectInfo {
@@ -112,15 +196,14 @@ export interface ProjectInfo {
 
 export async function fetchProjects(provider?: string): Promise<ProjectInfo[]> {
   const qs = provider ? `?provider=${provider}` : "";
-  const res = await fetch(`${BASE}/projects${qs}`);
-  return res.json();
+  return requestJson<ProjectInfo[]>(`${BASE}/projects${qs}`);
 }
 
 export async function moveConversation(
   id: string,
   targetProjectKey: string
 ): Promise<{ success: boolean; error?: string }> {
-  const res = await fetch(
+  return requestJson<{ success: boolean; error?: string }>(
     `${BASE}/conversations/${encodeURIComponent(id)}/move`,
     {
       method: "POST",
@@ -128,5 +211,27 @@ export async function moveConversation(
       body: JSON.stringify({ targetProjectKey }),
     }
   );
-  return res.json();
+}
+
+export interface CodexModelProvider {
+  name: string;
+  count: number;
+}
+
+export async function fetchCodexProviders(signal?: AbortSignal): Promise<CodexModelProvider[]> {
+  return requestJson<CodexModelProvider[]>(`${BASE}/codex-providers`, { signal });
+}
+
+export async function changeModelProvider(
+  id: string,
+  modelProvider: string
+): Promise<{ success: boolean; error?: string }> {
+  return requestJson<{ success: boolean; error?: string }>(
+    `${BASE}/conversations/${encodeURIComponent(id)}/model-provider`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ modelProvider }),
+    }
+  );
 }

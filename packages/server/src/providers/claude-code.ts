@@ -2,13 +2,14 @@ import { homedir } from "os";
 import { join } from "path";
 import { stat, readdir, unlink, rename, mkdir } from "fs/promises";
 import { glob } from "glob";
-import { parseJsonl, parseJsonlHead, countLines } from "../utils/jsonl.js";
-import { getCached, setCache, invalidateCache } from "../utils/cache.js";
+import { parseJsonl, parseJsonlHead, parseJsonlTail, countLines } from "../utils/jsonl.js";
+import { getCached, getListCache, setCache, setListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
   Message,
+  ConversationReadOptions,
 } from "./types.js";
 
 interface ClaudeCodeEntry {
@@ -58,6 +59,76 @@ function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
+function getListCacheKey(providerName: string, storagePath: string): string {
+  return `${providerName}::${storagePath}`;
+}
+
+async function buildListSignature(files: string[]): Promise<string> {
+  let mtimeSum = 0;
+  for (const file of files) {
+    try {
+      const fileStat = await stat(file);
+      mtimeSum += fileStat.mtimeMs;
+    } catch {
+      // 忽略单文件异常，签名仍然变化
+    }
+  }
+  return `${files.length}:${mtimeSum}`;
+}
+
+function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
+  const limit = options?.limit;
+  const before = options?.before ?? 0;
+
+  if (!limit || limit <= 0) {
+    return { items, hasMore: false };
+  }
+
+  const end = Math.max(0, items.length - before);
+  const start = Math.max(0, end - limit);
+  return {
+    items: items.slice(start, end),
+    hasMore: start > 0,
+  };
+}
+
+function buildMessages(entries: ClaudeCodeEntry[]): Message[] {
+  const messages: Message[] = [];
+
+  for (const entry of entries) {
+    if (entry.isSidechain || entry.isMeta) continue;
+    if (!entry.message) continue;
+    if (entry.type === "system") continue;
+
+    if (entry.type === "user") {
+      const text = extractTextContent(entry.message.content);
+      if (!text.trim() || text.includes("<local-command-") || text.includes("<command-name>") || text.includes("<local-command-stdout>")) continue;
+      const cleanText = text.replace(/<[^>]+>/g, "").trim();
+      if (!cleanText) continue;
+      messages.push({
+        role: "user",
+        content: cleanText,
+        timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
+      });
+    } else if (entry.type === "assistant") {
+      const text = extractTextContent(entry.message.content);
+      if (text.trim() && !text.startsWith("No response requested")) {
+        messages.push({
+          role: "assistant",
+          content: text,
+          timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
+        });
+      }
+      if (Array.isArray(entry.message.content)) {
+        const tools = extractToolCalls(entry.message.content);
+        messages.push(...tools);
+      }
+    }
+  }
+
+  return messages;
+}
+
 export class ClaudeCodeProvider implements ConversationProvider {
   name = "claude-code";
   displayName = "Claude Code";
@@ -79,6 +150,12 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "*", "*.jsonl").replace(/\\/g, "/");
     const files = await glob(pattern);
+    const cacheKey = getListCacheKey(this.name, basePath);
+    const signature = await buildListSignature(files);
+    const cachedList = getListCache(cacheKey, signature);
+    if (cachedList) {
+      return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
+    }
 
     // 并发提取元数据（限制并发数）
     const results: ConversationMeta[] = [];
@@ -92,6 +169,8 @@ export class ClaudeCodeProvider implements ConversationProvider {
         if (m) results.push(m);
       }
     }
+
+    setListCache(cacheKey, signature, results);
     return results.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
@@ -164,7 +243,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     return meta;
   }
 
-  async read(id: string): Promise<Conversation> {
+  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
     const sessionId = id.replace("claude-code:", "");
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
@@ -172,46 +251,29 @@ export class ClaudeCodeProvider implements ConversationProvider {
 
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
     const filePath = files[0];
+    const fileStat = await stat(filePath);
 
-    // read 时全量解析（用户主动点击查看才触发）
-    const entries = await parseJsonl<ClaudeCodeEntry>(filePath);
-    const messages: Message[] = [];
+    const limit = options?.limit;
+    const before = options?.before ?? 0;
+    const shouldWindowRead = !!limit && limit > 0;
+    const requiredMessages = shouldWindowRead ? before + limit + 1 : 0;
 
-    for (const entry of entries) {
-      if (entry.isSidechain || entry.isMeta) continue;
-      if (!entry.message) continue;
-      if (entry.type === "system") continue;
-
-      if (entry.type === "user") {
-        const text = extractTextContent(entry.message.content);
-        if (!text.trim() || text.includes("<local-command-") || text.includes("<command-name>") || text.includes("<local-command-stdout>")) continue;
-        const cleanText = text.replace(/<[^>]+>/g, "").trim();
-        if (!cleanText) continue;
-        messages.push({
-          role: "user",
-          content: cleanText,
-          timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
-        });
-      } else if (entry.type === "assistant") {
-        const text = extractTextContent(entry.message.content);
-        if (text.trim() && !text.startsWith("No response requested")) {
-          messages.push({
-            role: "assistant",
-            content: text,
-            timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
-          });
-        }
-        if (Array.isArray(entry.message.content)) {
-          const tools = extractToolCalls(entry.message.content);
-          messages.push(...tools);
-        }
-      }
-    }
+    // read 时默认全量解析，详情页可通过窗口模式只取最近一段
+    const entries = shouldWindowRead
+      ? await parseJsonlTail<ClaudeCodeEntry>(filePath, {
+          bytesHint: Math.max(256 * 1024, fileStat.size > 0 ? Math.min(fileStat.size, (before + limit) * 4096) : 256 * 1024),
+          maxBytes: fileStat.size,
+          isEnough: (tailEntries) => buildMessages(tailEntries).length >= requiredMessages,
+        })
+      : await parseJsonl<ClaudeCodeEntry>(filePath);
+    const messages = buildMessages(entries);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
 
-    return { ...meta, messages };
+    const { items: windowedMessages, hasMore } = sliceWindow(messages, options);
+
+    return { ...meta, messages: windowedMessages, hasMore };
   }
 
   async delete(id: string): Promise<void> {
@@ -220,6 +282,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
+    invalidateListCache(getListCacheKey(this.name, basePath));
     invalidateCache(files[0]);
     await unlink(files[0]);
   }
@@ -232,6 +295,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     if (files.length === 0) throw new Error(`对话不存在: ${id}`);
 
     const srcFile = files[0];
+    invalidateListCache(getListCacheKey(this.name, basePath));
     invalidateCache(srcFile);
     const fileName = srcFile.split(/[/\\]/).pop()!;
     const targetDir = join(basePath, targetProjectKey);

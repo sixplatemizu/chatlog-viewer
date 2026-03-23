@@ -4,7 +4,14 @@ import { useTheme } from "./hooks/useTheme";
 import { Sidebar } from "./components/Sidebar";
 import { ConversationViewer } from "./components/ConversationViewer";
 import { ExportDialog } from "./components/ExportDialog";
-import { exportConversations, deleteConversation, generateAiTitle, moveConversation } from "./lib/api";
+import {
+  exportConversations,
+  deleteConversation,
+  generateAiTitle,
+  moveConversation,
+  changeModelProvider,
+  getErrorMessage,
+} from "./lib/api";
 import { Sun, Moon, Monitor, X, Sparkles, Loader2, CheckCircle2, XCircle } from "lucide-react";
 
 interface GenProgress {
@@ -30,12 +37,17 @@ export default function App() {
     selectConversation,
     conversation,
     loadingDetail,
+    loadingEarlier,
+    loadEarlierMessages,
     refresh,
     selectedIds,
     toggleSelect,
     selectAll,
     deselectAll,
     toggleSelectGroup,
+    codexModelProviders,
+    activeModelProviders,
+    toggleModelProvider,
   } = useConversations();
 
   const { theme, setTheme } = useTheme();
@@ -73,10 +85,10 @@ export default function App() {
         a.download = `chatlog-export-${exportIds.length === 1 ? "1" : exportIds.length + "条"}.${format === "markdown" ? "md" : "json"}`;
         a.click();
         URL.revokeObjectURL(url);
-      } catch (e) {
-        console.error("导出失败:", e);
+        setExportOpen(false);
+      } catch (error) {
+        alert(`导出失败: ${getErrorMessage(error, "导出失败")}`);
       }
-      setExportOpen(false);
     },
     [exportIds]
   );
@@ -99,22 +111,22 @@ export default function App() {
         await deleteConversation(id);
       }
       deselectAll();
+      setDeleteConfirmIds([]);
       refresh();
-    } catch (e) {
-      console.error("删除失败:", e);
+    } catch (error) {
+      alert(`删除失败: ${getErrorMessage(error, "删除失败")}`);
     }
-    setDeleteConfirmIds([]);
   }, [deleteConfirmIds, refresh, deselectAll]);
 
   // 标题更新后同步刷新列表和详情
   const handleTitleChanged = useCallback(
-    (id: string, newTitle: string) => {
-      refresh();
-      if (conversation && conversation.id === id) {
-        conversation.title = newTitle;
+    async (id: string) => {
+      await refresh();
+      if (selectedId === id) {
+        await selectConversation(id);
       }
     },
-    [refresh, conversation]
+    [refresh, selectedId, selectConversation]
   );
 
   // 拖拽移动对话到另一个文件夹
@@ -137,11 +149,32 @@ export default function App() {
         } else {
           alert(`移动失败: ${res.error}`);
         }
-      } catch (e) {
-        console.error("移动失败:", e);
+      } catch (error) {
+        alert(`移动失败: ${getErrorMessage(error, "移动失败")}`);
       }
     },
     [conversations, refresh]
+  );
+
+  // 修改 Codex 对话的 model_provider
+  const handleChangeModelProvider = useCallback(
+    async (id: string, newProvider: string) => {
+      try {
+        const res = await changeModelProvider(id, newProvider);
+        if (res.success) {
+          await refresh();
+          // 重新加载当前对话详情以更新 modelProvider
+          if (selectedId === id) {
+            await selectConversation(id);
+          }
+        } else {
+          alert(`迁移失败: ${res.error}`);
+        }
+      } catch (error) {
+        alert(`迁移失败: ${getErrorMessage(error, "迁移失败")}`);
+      }
+    },
+    [refresh, selectedId, selectConversation]
   );
 
   // 批量 AI 生成标题
@@ -171,8 +204,8 @@ export default function App() {
         } else {
           results.push({ id, error: res.error || "未知错误" });
         }
-      } catch {
-        results.push({ id, error: "请求失败" });
+      } catch (error) {
+        results.push({ id, error: getErrorMessage(error, "请求失败") });
       }
       setGenProgress((prev) => ({ ...prev!, results: [...results] }));
     }
@@ -246,13 +279,20 @@ export default function App() {
           onBatchGenerate={handleBatchGenerate}
           batchGenerating={batchGenerating}
           onMoveConversation={handleMoveConversation}
+          codexModelProviders={codexModelProviders}
+          activeModelProviders={activeModelProviders}
+          onToggleModelProvider={toggleModelProvider}
         />
         <ConversationViewer
           conversation={conversation}
           loading={loadingDetail}
+          loadingEarlier={loadingEarlier}
+          onLoadEarlier={loadEarlierMessages}
           onExport={handleExport}
           onDelete={handleDelete}
           onTitleChanged={handleTitleChanged}
+          codexModelProviders={codexModelProviders}
+          onChangeModelProvider={handleChangeModelProvider}
         />
       </div>
 

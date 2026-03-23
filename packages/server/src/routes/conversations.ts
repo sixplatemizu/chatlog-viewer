@@ -1,7 +1,9 @@
 import { Hono } from "hono";
 import type { ConversationProvider, ConversationMeta } from "../providers/types.js";
+import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
 import { generateTitle, getAvailableClis } from "../utils/ai.js";
+import { logProviderError } from "../utils/logger.js";
 
 export function createConversationRoutes(providers: ConversationProvider[]) {
   const app = new Hono();
@@ -24,10 +26,18 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerFilter = c.req.query("provider");
     const search = c.req.query("search")?.toLowerCase();
     const sort = c.req.query("sort") || "updatedAt";
+    const modelProviderFilter = c.req.query("modelProvider");
 
-    const activeProviders = providerFilter
-      ? providers.filter((p) => providerFilter.split(",").includes(p.name))
-      : providers;
+    let activeProviders = providers;
+    if (providerFilter !== undefined) {
+      const providerNames = providerFilter
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean);
+      activeProviders = providerNames.length > 0
+        ? providers.filter((p) => providerNames.includes(p.name))
+        : [];
+    }
 
     const allConversations: ConversationMeta[] = [];
     const customTitles = await getAllTitles();
@@ -35,19 +45,34 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       try {
         if (!(await provider.detect())) continue;
         const convos = await provider.list();
-        // 应用自定义标题覆盖
-        for (const conv of convos) {
-          if (customTitles[conv.id]) {
-            conv.title = customTitles[conv.id];
-          }
-        }
-        allConversations.push(...convos);
-      } catch {
-        // provider 失败不影响其他
+        allConversations.push(
+          ...convos.map((conv) => ({
+            ...conv,
+            title: customTitles[conv.id] ?? conv.title,
+          }))
+        );
+      } catch (error) {
+        logProviderError("conversations.list", provider.name, error);
       }
     }
 
     let filtered = allConversations;
+
+    // 按 modelProvider 筛选（仅 Codex）
+    if (modelProviderFilter !== undefined) {
+      const mpSet = new Set(
+        modelProviderFilter
+          .split(",")
+          .map((name) => name.trim())
+          .filter(Boolean)
+      );
+      filtered = filtered.filter((c) => {
+        if (c.provider !== "codex") return true;
+        if (!c.modelProvider) return true;
+        return mpSet.has(c.modelProvider);
+      });
+    }
+
     if (search) {
       filtered = filtered.filter(
         (c) =>
@@ -78,8 +103,16 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
 
+    const limitParam = c.req.query("limit");
+    const beforeParam = c.req.query("before");
+    const limit = limitParam ? Number.parseInt(limitParam, 10) : undefined;
+    const before = beforeParam ? Number.parseInt(beforeParam, 10) : undefined;
+
     try {
-      const conversation = await provider.read(id);
+      const conversation = await provider.read(id, {
+        limit: Number.isFinite(limit) && limit! > 0 ? limit : undefined,
+        before: Number.isFinite(before) && before! >= 0 ? before : undefined,
+      });
       const customTitle = await getTitle(id);
       if (customTitle) conversation.title = customTitle;
       return c.json(conversation);
@@ -168,8 +201,8 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
             displayName: pk,
           });
         }
-      } catch {
-        // 跳过
+      } catch (error) {
+        logProviderError("projects.list", p.name, error);
       }
     }
     return c.json(result);
@@ -179,6 +212,36 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   app.get("/ai/clis", async (c) => {
     const clis = await getAvailableClis();
     return c.json(clis);
+  });
+
+  // Codex model_provider 列表
+  app.get("/codex-providers", (c) => {
+    const codex = providers.find((p) => p.name === "codex") as CodexProvider | undefined;
+    if (!codex) return c.json([]);
+    return c.json(codex.listModelProviders());
+  });
+
+  // 修改 Codex 对话的 model_provider
+  app.put("/conversations/:id/model-provider", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    if (!id.startsWith("codex:")) {
+      return c.json({ error: "仅支持修改 Codex 对话的 model provider" }, 400);
+    }
+
+    const codex = providers.find((p) => p.name === "codex") as CodexProvider | undefined;
+    if (!codex) return c.json({ error: "Codex provider 不可用" }, 404);
+
+    const body = await c.req.json<{ modelProvider: string }>();
+    if (!body.modelProvider?.trim()) {
+      return c.json({ error: "model provider 不能为空" }, 400);
+    }
+
+    try {
+      await codex.changeModelProvider(id, body.modelProvider.trim());
+      return c.json({ success: true });
+    } catch (e) {
+      return c.json({ error: (e as Error).message }, 500);
+    }
   });
 
   return app;

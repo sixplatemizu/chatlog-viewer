@@ -1,11 +1,16 @@
 // 统一数据模型
 
+export interface ConversationReadOptions {
+  before?: number;
+  limit?: number;
+}
+
 export interface ConversationProvider {
   name: string;
   displayName: string;
   detect(): Promise<boolean>;
   list(): Promise<ConversationMeta[]>;
-  read(id: string): Promise<Conversation>;
+  read(id: string, options?: ConversationReadOptions): Promise<Conversation>;
   delete(id: string): Promise<void>;
   move?(id: string, targetProjectKey: string): Promise<void>;
   listProjects?(): Promise<string[]>;
@@ -23,10 +28,12 @@ export interface ConversationMeta {
   messageCount: number;
   fileSize: number;         // 文件体积（字节）
   filePath: string;
+  modelProvider?: string;   // Codex 的 model_provider（如 right、custom 等）
 }
 
 export interface Conversation extends ConversationMeta {
   messages: Message[];
+  hasMore?: boolean;
 }
 
 export interface Message {

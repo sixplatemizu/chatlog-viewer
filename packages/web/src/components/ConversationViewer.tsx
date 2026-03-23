@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import {
   Download,
   Trash2,
@@ -10,39 +11,69 @@ import {
   Check,
   X,
   Loader2,
+  ArrowRightLeft,
 } from "lucide-react";
-import type { Conversation } from "../lib/api";
-import { updateTitle, generateAiTitle } from "../lib/api";
+import type { Conversation, CodexModelProvider } from "../lib/api";
+import { updateTitle, generateAiTitle, getErrorMessage } from "../lib/api";
+import { getProjectName, getProjectPathHint } from "../lib/project";
 import { MessageBubble } from "./MessageBubble";
 
 interface Props {
   conversation: Conversation | null;
   loading: boolean;
+  loadingEarlier: boolean;
+  onLoadEarlier: () => void | Promise<void>;
   onExport: (id: string) => void;
   onDelete: (id: string) => void;
-  onTitleChanged: (id: string, newTitle: string) => void;
+  onTitleChanged: (id: string) => void | Promise<void>;
+  codexModelProviders: CodexModelProvider[];
+  onChangeModelProvider: (id: string, newProvider: string) => void;
 }
 
 export function ConversationViewer({
   conversation,
   loading,
+  loadingEarlier,
+  onLoadEarlier,
   onExport,
   onDelete,
   onTitleChanged,
+  codexModelProviders,
+  onChangeModelProvider,
 }: Props) {
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const restoreIndexRef = useRef<number | null>(null);
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
   const [generating, setGenerating] = useState(false);
   const [genStatus, setGenStatus] = useState("");
 
+  const totalMessages = conversation?.messageCount ?? conversation?.messages.length ?? 0;
+  const loadedMessages = conversation?.messages ?? [];
+  const hiddenCount = Math.max(0, totalMessages - loadedMessages.length);
+
+  const messageKeys = useMemo(
+    () => loadedMessages.map((msg, index) => `${index}-${msg.timestamp ?? "na"}-${msg.role}`),
+    [loadedMessages]
+  );
+
   useEffect(() => {
-    scrollRef.current?.scrollTo(0, 0);
+    restoreIndexRef.current = null;
     setEditing(false);
     setGenerating(false);
     setGenStatus("");
-  }, [conversation?.id]);
+
+    if (virtuosoRef.current) {
+      virtuosoRef.current.scrollToIndex({ index: Math.max(loadedMessages.length - 1, 0), align: "end" });
+    }
+  }, [conversation?.id, loadedMessages.length]);
+
+  useEffect(() => {
+    if (restoreIndexRef.current === null || !virtuosoRef.current) return;
+    virtuosoRef.current.scrollToIndex({ index: restoreIndexRef.current, align: "start" });
+    restoreIndexRef.current = null;
+  }, [messageKeys]);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();
@@ -58,11 +89,11 @@ export function ConversationViewer({
     if (!conversation || !editValue.trim()) return;
     try {
       await updateTitle(conversation.id, editValue.trim());
-      onTitleChanged(conversation.id, editValue.trim());
-    } catch (e) {
-      console.error("保存标题失败:", e);
+      await onTitleChanged(conversation.id);
+      setEditing(false);
+    } catch (error) {
+      alert(`保存标题失败: ${getErrorMessage(error, "保存标题失败")}`);
     }
-    setEditing(false);
   };
 
   const handleGenerate = async () => {
@@ -73,17 +104,24 @@ export function ConversationViewer({
       const result = await generateAiTitle(conversation.id);
       if (result.success) {
         setGenStatus(`已通过 ${result.usedCli} 生成`);
-        onTitleChanged(conversation.id, result.title);
+        await onTitleChanged(conversation.id);
         setTimeout(() => setGenStatus(""), 3000);
       } else {
         setGenStatus(`失败: ${result.error}`);
         setTimeout(() => setGenStatus(""), 5000);
       }
-    } catch {
-      setGenStatus("生成失败");
+    } catch (error) {
+      setGenStatus(`失败: ${getErrorMessage(error, "生成失败")}`);
       setTimeout(() => setGenStatus(""), 3000);
     }
     setGenerating(false);
+  };
+
+  const handleLoadEarlier = () => {
+    if (!conversation || !conversation.hasMore || loadingEarlier) return;
+
+    restoreIndexRef.current = Math.min(hiddenCount, 200);
+    void onLoadEarlier();
   };
 
   if (loading) {
@@ -104,9 +142,25 @@ export function ConversationViewer({
     );
   }
 
+  const loadEarlierBar = conversation.hasMore ? (
+    <div className="border-b border-gray-200 bg-white/95 px-4 py-3 backdrop-blur dark:border-gray-700 dark:bg-gray-900/95">
+      <div className="mx-auto flex max-w-4xl items-center justify-between gap-3">
+        <div className="text-xs text-gray-500 dark:text-gray-400">
+          已加载最近 {loadedMessages.length} / {totalMessages} 条消息
+        </div>
+        <button
+          onClick={handleLoadEarlier}
+          disabled={loadingEarlier}
+          className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+        >
+          {loadingEarlier ? "正在加载..." : `加载更早的 ${Math.min(hiddenCount, 200)} 条`}
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div className="flex-1 flex flex-col h-full min-w-0 bg-white dark:bg-gray-900">
-      {/* 对话头部 */}
       <div className="border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-4 py-3 flex-shrink-0">
         <div className="flex items-center justify-between">
           <div className="min-w-0 flex-1">
@@ -157,15 +211,36 @@ export function ConversationViewer({
             )}
 
             <div className="flex items-center gap-3 mt-1 text-xs text-gray-500 dark:text-gray-400">
-              <span className="flex items-center gap-1">
+              <span
+                className="flex items-center gap-1"
+                title={getProjectPathHint(conversation.project, conversation.projectKey)}
+              >
                 <FolderOpen className="w-3.5 h-3.5" />
-                {conversation.project.split(/[/\\]/).pop() || conversation.project}
+                {getProjectName(conversation.project, conversation.projectKey)}
               </span>
               <span className="flex items-center gap-1">
                 <Clock className="w-3.5 h-3.5" />
                 {new Date(conversation.createdAt).toLocaleDateString("zh-CN")}
               </span>
-              <span>{conversation.messages.length} 条消息</span>
+              <span>{totalMessages} 条消息</span>
+              {conversation.provider === "codex" && conversation.modelProvider && (
+                <span className="flex items-center gap-1">
+                  <ArrowRightLeft className="w-3 h-3 text-gray-400" />
+                  <select
+                    value={conversation.modelProvider}
+                    onChange={(e) => onChangeModelProvider(conversation.id, e.target.value)}
+                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-50 text-green-600 border border-green-200 dark:bg-green-900/30 dark:text-green-400 dark:border-green-700 cursor-pointer focus:outline-none focus:ring-1 focus:ring-green-400 appearance-none pr-4"
+                    title="切换 Codex Model Provider"
+                    style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 24 24' fill='none' stroke='%2322c55e' stroke-width='3'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
+                  >
+                    {codexModelProviders.map((mp) => (
+                      <option key={mp.name} value={mp.name}>
+                        {mp.name}
+                      </option>
+                    ))}
+                  </select>
+                </span>
+              )}
               {genStatus && (
                 <span className="text-purple-500 animate-pulse">{genStatus}</span>
               )}
@@ -190,13 +265,24 @@ export function ConversationViewer({
         </div>
       </div>
 
-      {/* 消息列表 */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto overflow-x-hidden">
-        <div className="divide-y divide-gray-100 dark:divide-gray-800">
-          {conversation.messages.map((msg, i) => (
-            <MessageBubble key={i} message={msg} />
-          ))}
-        </div>
+      <div className="flex-1 min-h-0">
+        <Virtuoso
+          ref={virtuosoRef}
+          className="h-full"
+          data={loadedMessages}
+          alignToBottom
+          followOutput={false}
+          increaseViewportBy={{ top: 600, bottom: 1200 }}
+          computeItemKey={(index) => messageKeys[index]}
+          components={{
+            Header: () => loadEarlierBar,
+          }}
+          itemContent={(index, message) => (
+            <div className="border-b border-gray-100 dark:border-gray-800 last:border-b-0">
+              <MessageBubble message={message} />
+            </div>
+          )}
+        />
       </div>
     </div>
   );

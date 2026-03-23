@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { ConversationProvider, Conversation, Message } from "../providers/types.js";
+import { logProviderError } from "../utils/logger.js";
 
 export function createExportRoutes(providers: ConversationProvider[]) {
   const app = new Hono();
@@ -17,8 +18,8 @@ export function createExportRoutes(providers: ConversationProvider[]) {
       if (!provider) continue;
       try {
         conversations.push(await provider.read(id));
-      } catch {
-        // 跳过读取失败的
+      } catch (error) {
+        logProviderError(`export.read:${id}`, provider.name, error);
       }
     }
 
