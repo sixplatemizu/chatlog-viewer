@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 type Theme = "light" | "dark" | "system";
 
@@ -6,29 +6,35 @@ function getSystemTheme(): "light" | "dark" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function applyTheme(theme: Theme) {
-  const resolved = theme === "system" ? getSystemTheme() : theme;
+function resolveTheme(theme: Theme): "light" | "dark" {
+  return theme === "system" ? getSystemTheme() : theme;
+}
+
+function applyResolvedTheme(resolved: "light" | "dark") {
   document.documentElement.classList.toggle("dark", resolved === "dark");
+}
+
+function subscribeSystemTheme(callback: () => void) {
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  mq.addEventListener("change", callback);
+  return () => mq.removeEventListener("change", callback);
 }
 
 export function useTheme() {
   const [theme, setThemeState] = useState<Theme>(() => {
     return (localStorage.getItem("theme") as Theme) || "system";
   });
+  const systemTheme = useSyncExternalStore<"light" | "dark">(
+    subscribeSystemTheme,
+    getSystemTheme,
+    (): "light" | "dark" => "light"
+  );
+  const resolvedTheme = theme === "system" ? systemTheme : resolveTheme(theme);
 
   useEffect(() => {
-    applyTheme(theme);
+    applyResolvedTheme(resolvedTheme);
     localStorage.setItem("theme", theme);
-  }, [theme]);
+  }, [resolvedTheme, theme]);
 
-  // 监听系统主题变化
-  useEffect(() => {
-    if (theme !== "system") return;
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = () => applyTheme("system");
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, [theme]);
-
-  return { theme, setTheme: setThemeState };
+  return { theme, resolvedTheme, setTheme: setThemeState };
 }

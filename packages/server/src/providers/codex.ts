@@ -287,7 +287,18 @@ export class CodexProvider implements ConversationProvider {
     const title = userMessages[0]?.payload?.message?.slice(0, 100) || "未知对话";
 
     // 快速行计数
-    const messageCount = await countLines(filePath, ['"role":"user"', '"role":"assistant"']);
+    const messageCount = await countLines(
+      filePath,
+      (value) => {
+        if (!value || typeof value !== "object") return false;
+        const entry = value as CodexEntry;
+        return entry.type === "response_item"
+          && (entry.payload?.role === "user" || entry.payload?.role === "assistant");
+      },
+      {
+        fastIncludes: ['"type":"response_item"', '"role":"user"', '"role":"assistant"'],
+      }
+    );
     if (messageCount === 0 && userMessages.length === 0) return null;
 
     const firstTs = new Date(headEntries[0].timestamp).getTime();

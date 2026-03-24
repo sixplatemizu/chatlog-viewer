@@ -21,6 +21,7 @@ import { MessageBubble } from "./MessageBubble";
 
 interface Props {
   conversation: Conversation | null;
+  dark: boolean;
   loading: boolean;
   loadingEarlier: boolean;
   onLoadEarlier: () => void | Promise<void>;
@@ -36,6 +37,7 @@ const EMPTY_MESSAGES: NonNullable<Conversation["messages"]> = [];
 
 export function ConversationViewer({
   conversation,
+  dark,
   loading,
   loadingEarlier,
   onLoadEarlier,
@@ -297,7 +299,7 @@ export function ConversationViewer({
           }}
           itemContent={(index, message) => (
             <div className="border-b border-gray-100 dark:border-gray-800 last:border-b-0">
-              <MessageBubble message={message} />
+              <MessageBubble message={message} dark={dark} />
             </div>
           )}
         />

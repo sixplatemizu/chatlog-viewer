@@ -296,3 +296,32 @@ test("搜索请求会要求 provider 同步补齐搜索索引", async () => {
 
   invalidateListCache(cacheKey);
 });
+
+test("搜索降级到标题和目录匹配时会返回 partialSearch 提示", async () => {
+  const provider = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    list: async () => [
+      createConversationMeta({
+        id: "codex:fallback-only",
+        provider: "codex",
+        title: "仅标题命中",
+      }),
+    ],
+  });
+
+  const app = createConversationRoutes([provider]);
+  const res = await app.request("http://localhost/conversations?provider=codex&search=标题");
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as {
+    total: number;
+    conversations: ConversationMeta[];
+    partialSearch: boolean;
+    warnings: string[];
+  };
+  assert.equal(data.partialSearch, true);
+  assert.equal(data.warnings.length, 1);
+  assert.match(data.warnings[0] || "", /搜索索引尚未就绪/);
+  assert.equal(data.conversations[0]?.id, "codex:fallback-only");
+});

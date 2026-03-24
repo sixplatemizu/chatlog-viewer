@@ -308,7 +308,19 @@ export class IFlowProvider implements ConversationProvider {
     );
 
     if (headMessages.length === 0) {
-      const msgCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+      const msgCount = await countLines(
+        filePath,
+        (value) => {
+          if (!value || typeof value !== "object") return false;
+          const entry = value as IFlowEntry;
+          return !entry.isSidechain
+            && !!entry.message
+            && (entry.type === "user" || entry.type === "assistant");
+        },
+        {
+          fastIncludes: ['"type":"user"', '"type":"assistant"'],
+        }
+      );
       if (msgCount === 0) return null;
     }
 
@@ -335,7 +347,19 @@ export class IFlowProvider implements ConversationProvider {
       ? new Date(headMessages[0].timestamp).getTime()
       : fileStat.birthtimeMs;
 
-    const messageCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+    const messageCount = await countLines(
+      filePath,
+      (value) => {
+        if (!value || typeof value !== "object") return false;
+        const entry = value as IFlowEntry;
+        return !entry.isSidechain
+          && !!entry.message
+          && (entry.type === "user" || entry.type === "assistant");
+      },
+      {
+        fastIncludes: ['"type":"user"', '"type":"assistant"'],
+      }
+    );
 
     const meta: ConversationMeta = {
       id: `iflow:${sessionId}`,

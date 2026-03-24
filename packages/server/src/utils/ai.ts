@@ -1,7 +1,7 @@
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { promisify } from "util";
-import { writeFile, unlink, mkdir } from "fs/promises";
-import { homedir } from "os";
+import { mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
 import { join } from "path";
 import type { Message } from "../providers/types.js";
 
@@ -10,38 +10,36 @@ const execAsync = promisify(exec);
 interface CliTool {
   name: string;
   command: string;
-  buildCmd: (promptFile: string, continueSession: boolean) => string;
+  args: string[];
 }
 
 const CLI_TOOLS: CliTool[] = [
   {
     name: "iflow",
     command: "iflow",
-    buildCmd: (f, c) => `cat "${f}" | iflow${c ? " -c" : ""} -p ""`,
+    args: ["-p", ""],
   },
   {
     name: "claude",
     command: "claude",
-    buildCmd: (f, c) => `cat "${f}" | claude${c ? " -c" : ""} -p ""`,
+    args: ["-p", ""],
   },
   {
     name: "codex",
     command: "codex",
-    buildCmd: (f, _c) => `cat "${f}" | codex exec -`,
+    args: ["exec", "-"],
   },
 ];
 
-// 固定的工作目录，确保 -c 能续用同一会话
-const WORK_DIR = join(homedir(), ".chatlog-viewer", "ai-work");
-
-// 会话状态
-const activeSession = new Map<string, boolean>();
+function getLocateCommand(command: string): string {
+  return process.platform === "win32" ? `where ${command}` : `which ${command}`;
+}
 
 async function detectAvailableCli(): Promise<CliTool[]> {
   const available: CliTool[] = [];
   for (const tool of CLI_TOOLS) {
     try {
-      await execAsync(`where ${tool.command}`, { timeout: 5000 });
+      await execAsync(getLocateCommand(tool.command), { timeout: 5000 });
       available.push(tool);
     } catch {
       // 不可用
@@ -80,6 +78,56 @@ function extractCleanOutput(stdout: string): string {
 
 const INSTRUCTION = "请为以下AI对话生成一个简短的中文标题（10-20个字），准确概括对话主题，只输出标题本身，不要加引号或其他格式：\n\n";
 
+async function runCliTool(tool: CliTool, prompt: string): Promise<string> {
+  const workDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-ai-"));
+
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      const child = spawn(tool.command, tool.args, {
+        cwd: workDir,
+        env: { ...process.env },
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      let stdout = "";
+      let stderr = "";
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error(`${tool.name} 执行超时`));
+      }, 60_000);
+
+      child.stdout.setEncoding("utf-8");
+      child.stderr.setEncoding("utf-8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once("close", (code) => {
+        clearTimeout(timeout);
+        if (code !== 0) {
+          reject(new Error(stderr.trim() || `${tool.name} 执行失败 (${code ?? "unknown"})`));
+          return;
+        }
+        resolve(stdout);
+      });
+
+      child.stdin.on("error", () => {
+        // 某些 CLI 可能会提前结束 stdin，这里不额外中断主流程。
+      });
+      child.stdin.end(prompt, "utf-8");
+    });
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
 export async function generateTitle(messages: Message[]): Promise<{
   title: string;
   usedCli: string;
@@ -92,41 +140,17 @@ export async function generateTitle(messages: Message[]): Promise<{
   const context = buildContext(messages);
   const fullPrompt = INSTRUCTION + context;
 
-  // 使用固定工作目录，确保 -c 能在同一目录下找到最近会话
-  await mkdir(WORK_DIR, { recursive: true });
-  const promptFile = join(WORK_DIR, "prompt.txt").replace(/\\/g, "/");
-  await writeFile(promptFile, fullPrompt, "utf-8");
-
-  try {
-    for (const tool of tools) {
-      try {
-        const hasSession = activeSession.get(tool.name) || false;
-        const cmd = tool.buildCmd(promptFile, hasSession);
-        console.log(`[AI] 调用 ${tool.name}${hasSession ? " (续用会话)" : " (新建会话)"}`);
-
-        const { stdout } = await execAsync(cmd, {
-          timeout: 60000,
-          encoding: "utf-8",
-          env: { ...process.env },
-          cwd: WORK_DIR,  // 关键：固定 cwd 使 -c 能找到最近会话
-        });
-
-        const title = extractCleanOutput(stdout);
-        console.log(`[AI] ${tool.name} 输出: "${title}"`);
-        if (title && title.length > 0 && title.length < 100) {
-          activeSession.set(tool.name, true);
-          return { title, usedCli: tool.name };
-        }
-      } catch (e) {
-        console.error(`${tool.name} 生成标题失败:`, (e as Error).message);
-        activeSession.delete(tool.name);
-      }
-    }
-  } finally {
+  for (const tool of tools) {
     try {
-      await unlink(promptFile);
-    } catch {
-      void 0;
+      console.log(`[AI] 调用 ${tool.name} (独立会话)`);
+      const stdout = await runCliTool(tool, fullPrompt);
+      const title = extractCleanOutput(stdout);
+      console.log(`[AI] ${tool.name} 输出: "${title}"`);
+      if (title && title.length > 0 && title.length < 100) {
+        return { title, usedCli: tool.name };
+      }
+    } catch (e) {
+      console.error(`${tool.name} 生成标题失败:`, (e as Error).message);
     }
   }
 
@@ -134,17 +158,13 @@ export async function generateTitle(messages: Message[]): Promise<{
 }
 
 export function resetSession(toolName?: string) {
-  if (toolName) {
-    activeSession.delete(toolName);
-  } else {
-    activeSession.clear();
-  }
+  void toolName;
 }
 
 export async function getAvailableClis(): Promise<{ name: string; hasSession: boolean }[]> {
   const tools = await detectAvailableCli();
   return tools.map((t) => ({
     name: t.name,
-    hasSession: activeSession.get(t.name) || false,
+    hasSession: false,
   }));
 }

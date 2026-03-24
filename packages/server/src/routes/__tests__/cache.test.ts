@@ -62,10 +62,52 @@ test("conversation index 支持按消息内容搜索", () => {
   assert.equal(snapshot?.[0]?.searchText, `hello ${needle} world`);
 
   const matched = queryConversationIndex({
-    providers: ["codex"],
+    cacheKeys: [cacheKey],
     search: needle,
   });
   assert.equal(matched.some((item) => item.id === "codex:3"), true);
+
+  invalidateListCache(cacheKey);
+});
+
+test("conversation index 仅返回当前 cacheKey 的结果，避免旧路径索引串入", () => {
+  const oldCacheKey = `test-index-old-${Date.now()}`;
+  const newCacheKey = `test-index-new-${Date.now()}`;
+
+  setIndexedListCache(oldCacheKey, [{
+    meta: createConversationMeta("codex:old"),
+    searchText: "shared-needle",
+  }]);
+  setIndexedListCache(newCacheKey, [{
+    meta: createConversationMeta("codex:new"),
+    searchText: "shared-needle",
+  }]);
+
+  const matched = queryConversationIndex({
+    cacheKeys: [newCacheKey],
+    search: "shared-needle",
+  });
+
+  assert.deepEqual(matched.map((item) => item.id), ["codex:new"]);
+
+  invalidateListCache(oldCacheKey);
+  invalidateListCache(newCacheKey);
+});
+
+test("短词搜索会回退到 FTS LIKE 查询并保持可命中", () => {
+  const cacheKey = `test-index-short-${Date.now()}`;
+
+  setIndexedListCache(cacheKey, [{
+    meta: createConversationMeta("codex:short"),
+    searchText: "中文短词命中",
+  }]);
+
+  const matched = queryConversationIndex({
+    cacheKeys: [cacheKey],
+    search: "短词",
+  });
+
+  assert.equal(matched.some((item) => item.id === "codex:short"), true);
 
   invalidateListCache(cacheKey);
 });

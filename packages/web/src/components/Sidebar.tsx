@@ -37,6 +37,8 @@ interface SidebarProps {
   codexModelProviders: CodexModelProvider[];
   activeModelProviders: Set<string>;
   onToggleModelProvider: (name: string) => void;
+  partialSearch: boolean;
+  searchWarnings: string[];
 }
 
 export function Sidebar({
@@ -65,6 +67,8 @@ export function Sidebar({
   codexModelProviders,
   activeModelProviders,
   onToggleModelProvider,
+  partialSearch,
+  searchWarnings,
 }: SidebarProps) {
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
 
@@ -119,7 +123,7 @@ export function Sidebar({
           >
             <option value="updatedAt">最近更新</option>
             <option value="createdAt">创建时间</option>
-            <option value="provider">按工具分组</option>
+            <option value="provider">工具优先</option>
           </select>
           <div className="ml-auto flex items-center gap-1.5">
             <button
@@ -178,6 +182,17 @@ export function Sidebar({
                   {mp.name}
                   <span className="ml-0.5 opacity-60">{codexProviderCounts.get(mp.name) ?? 0}</span>
                 </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {partialSearch && searchWarnings.length > 0 && (
+          <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+            <div className="font-medium">当前搜索结果可能不完整</div>
+            <div className="mt-1 space-y-0.5">
+              {searchWarnings.map((warning) => (
+                <div key={warning}>{warning}</div>
               ))}
             </div>
           </div>

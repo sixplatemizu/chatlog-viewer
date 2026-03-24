@@ -119,6 +119,13 @@ export interface Conversation extends ConversationMeta {
   hasMore?: boolean;
 }
 
+export interface ConversationListResponse {
+  total: number;
+  conversations: ConversationMeta[];
+  partialSearch?: boolean;
+  warnings?: string[];
+}
+
 export async function fetchProviders(signal?: AbortSignal): Promise<ProviderInfo[]> {
   return requestJson<ProviderInfo[]>(`${BASE}/providers`, { signal });
 }
@@ -143,13 +150,13 @@ export async function fetchConversations(params: {
   sort?: string;
   modelProvider?: string;
   signal?: AbortSignal;
-}): Promise<{ total: number; conversations: ConversationMeta[] }> {
+}): Promise<ConversationListResponse> {
   const qs = new URLSearchParams();
   if (params.provider) qs.set("provider", params.provider);
   if (params.search) qs.set("search", params.search);
   if (params.sort) qs.set("sort", params.sort);
   if (params.modelProvider !== undefined) qs.set("modelProvider", params.modelProvider);
-  return requestJson<{ total: number; conversations: ConversationMeta[] }>(
+  return requestJson<ConversationListResponse>(
     `${BASE}/conversations?${qs}`,
     { signal: params.signal }
   );

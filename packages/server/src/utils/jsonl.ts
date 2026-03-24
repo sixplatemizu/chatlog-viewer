@@ -13,6 +13,10 @@ export interface ParseJsonlWindowOptions {
   sampleWindowCount?: number;
 }
 
+export interface CountJsonlLinesOptions {
+  fastIncludes?: string[];
+}
+
 export interface ParseJsonlTailContext {
   reachedStart: boolean;
   bytesRead: number;
@@ -274,10 +278,11 @@ export async function parseJsonlHead<T = unknown>(
   return results;
 }
 
-// 快速计算文件中匹配指定模式的行数（不做 JSON 解析）
+// 使用可选的快速字符串预筛后，按 JSON 结构准确计数，避免正文中的转义片段误命中。
 export async function countLines(
   filePath: string,
-  patterns: string[]
+  matcher: (value: unknown) => boolean,
+  options?: CountJsonlLinesOptions
 ): Promise<number> {
   let count = 0;
   const rl = createInterface({
@@ -286,11 +291,19 @@ export async function countLines(
   });
 
   for await (const line of rl) {
-    for (const p of patterns) {
-      if (line.includes(p)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (options?.fastIncludes && !options.fastIncludes.some((pattern) => trimmed.includes(pattern))) {
+      continue;
+    }
+
+    try {
+      if (matcher(JSON.parse(trimmed))) {
         count++;
-        break;
       }
+    } catch {
+      // 跳过无法解析的行
     }
   }
   return count;

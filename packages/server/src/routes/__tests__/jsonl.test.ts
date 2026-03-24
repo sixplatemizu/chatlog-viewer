@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  countLines,
   getAdaptiveSearchWindowOptions,
   parseJsonlTail,
   parseJsonlWindow,
@@ -80,4 +81,36 @@ test("自适应搜索窗口会在超大文件上增加采样点并缩小单窗�
     tailBytes: 48 * 1024,
     sampleWindowCount: 13,
   });
+});
+
+test("countLines 会基于 JSON 结构匹配，避免正文中的转义片段误计数", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chatlog-viewer-jsonl-count-"));
+  const filePath = join(dir, "count.jsonl");
+
+  try {
+    await writeFile(
+      filePath,
+      [
+        JSON.stringify({ type: "assistant", message: { content: "真实 assistant" } }),
+        JSON.stringify({ type: "user", message: { content: "正文里有 \\\"type\\\":\\\"assistant\\\" 字样" } }),
+      ].join("\n"),
+      "utf8"
+    );
+
+    const counted = await countLines(
+      filePath,
+      (value) => {
+        if (!value || typeof value !== "object") return false;
+        const entry = value as { type?: string };
+        return entry.type === "assistant";
+      },
+      {
+        fastIncludes: ['"type":"assistant"'],
+      }
+    );
+
+    assert.equal(counted, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

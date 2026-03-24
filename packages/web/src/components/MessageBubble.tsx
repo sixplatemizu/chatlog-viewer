@@ -6,15 +6,11 @@ import { CodeBlock } from "./CodeBlock";
 
 interface Props {
   message: Message;
+  dark: boolean;
 }
 
-function isDark() {
-  return document.documentElement.classList.contains("dark");
-}
-
-export const MessageBubble = memo(function MessageBubble({ message }: Props) {
+export const MessageBubble = memo(function MessageBubble({ message, dark }: Props) {
   const [expanded, setExpanded] = useState(false);
-  const dark = isDark();
 
   const ROLE_STYLES: Record<string, { bg: string; icon: React.ReactNode; label: string }> = {
     user: {
@@ -121,4 +117,3 @@ export const MessageBubble = memo(function MessageBubble({ message }: Props) {
     </div>
   );
 });
-

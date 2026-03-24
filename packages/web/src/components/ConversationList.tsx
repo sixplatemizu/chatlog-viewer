@@ -49,7 +49,6 @@ interface ConversationGroup {
   projectKey: string;
   conversations: ConversationMeta[];
   ids: string[];
-  latestUpdatedAt: number;
 }
 
 interface FlattenedListModel {
@@ -115,7 +114,6 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
         projectKey,
         conversations: [],
         ids: [],
-        latestUpdatedAt: conv.updatedAt,
       };
       groups.set(key, group);
     } else {
@@ -124,12 +122,9 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
 
     group.conversations.push(conv);
     group.ids.push(conv.id);
-    if (conv.updatedAt > group.latestUpdatedAt) {
-      group.latestUpdatedAt = conv.updatedAt;
-    }
   }
 
-  return [...groups.values()].sort((a, b) => b.latestUpdatedAt - a.latestUpdatedAt);
+  return [...groups.values()];
 }
 
 function buildFlattenedListModel(groups: ConversationGroup[], collapsedGroups: Set<string>): FlattenedListModel {

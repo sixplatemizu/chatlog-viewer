@@ -268,7 +268,20 @@ export class ClaudeCodeProvider implements ConversationProvider {
     // 如果头部完全没有消息，可能是空会话或只有系统消息
     // 用快速行计数确认
     if (headMessages.length === 0) {
-      const msgCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+      const msgCount = await countLines(
+        filePath,
+        (value) => {
+          if (!value || typeof value !== "object") return false;
+          const entry = value as ClaudeCodeEntry;
+          return !entry.isMeta
+            && !entry.isSidechain
+            && !!entry.message
+            && (entry.type === "user" || entry.type === "assistant");
+        },
+        {
+          fastIncludes: ['"type":"user"', '"type":"assistant"'],
+        }
+      );
       if (msgCount === 0) return null;
     }
 
@@ -300,7 +313,20 @@ export class ClaudeCodeProvider implements ConversationProvider {
       : fileStat.birthtimeMs;
 
     // 消息数：快速行计数
-    const messageCount = await countLines(filePath, ['"type":"user"', '"type":"assistant"']);
+    const messageCount = await countLines(
+      filePath,
+      (value) => {
+        if (!value || typeof value !== "object") return false;
+        const entry = value as ClaudeCodeEntry;
+        return !entry.isMeta
+          && !entry.isSidechain
+          && !!entry.message
+          && (entry.type === "user" || entry.type === "assistant");
+      },
+      {
+        fastIncludes: ['"type":"user"', '"type":"assistant"'],
+      }
+    );
 
     const meta: ConversationMeta = {
       id: `claude-code:${sessionId}`,

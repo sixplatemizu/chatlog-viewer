@@ -16,7 +16,6 @@ const VACUUM_INTERVAL_MS = 24 * 60 * 60_000;
 const META_CACHE_MAX_AGE_MS = 90 * 24 * 60 * 60_000;
 const LIST_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const KEEP_META_ROWS = 50_000;
-const KEEP_INDEX_ROWS = 100_000;
 
 interface CacheEntry {
   mtimeMs: number;
@@ -197,6 +196,10 @@ function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
 
 function buildLikePattern(search: string): string {
   return `%${search.toLowerCase()}%`;
+}
+
+function buildSubstringPattern(search: string): string {
+  return `%${search}%`;
 }
 
 function buildFtsSearchQuery(search: string): string | null {
@@ -555,10 +558,92 @@ export function setIndexedListCache(
            cache_key = excluded.cache_key,
            indexed_at = excluded.indexed_at`
       );
-      database.prepare("DELETE FROM conversation_index WHERE cache_key = ?").run(cacheKey);
+      const existingRows = database.prepare(
+        `SELECT
+           id,
+           provider,
+           title,
+           search_text,
+           project,
+           project_key,
+           created_at,
+           updated_at,
+           message_count,
+           file_size,
+           file_path,
+           model_provider
+         FROM conversation_index
+         WHERE cache_key = ?`
+      ).all(cacheKey) as Array<{
+        id: string;
+        provider: string;
+        title: string;
+        search_text: string | null;
+        project: string;
+        project_key: string;
+        created_at: number;
+        updated_at: number;
+        message_count: number;
+        file_size: number;
+        file_path: string;
+        model_provider: string | null;
+      }>;
+
+      const existingSignatureById = new Map(
+        existingRows.map((row) => [
+          row.id,
+          JSON.stringify([
+            row.provider,
+            row.title,
+            row.search_text ?? null,
+            row.project,
+            row.project_key,
+            row.created_at,
+            row.updated_at,
+            row.message_count,
+            row.file_size,
+            row.file_path,
+            row.model_provider ?? null,
+          ]),
+        ])
+      );
+      const nextIds = new Set(normalizedDetailedItems.map((item) => item.meta.id));
+      const staleIds = existingRows
+        .map((row) => row.id)
+        .filter((id) => !nextIds.has(id));
+
+      if (staleIds.length > 0) {
+        const chunkSize = 200;
+        for (let start = 0; start < staleIds.length; start += chunkSize) {
+          const chunk = staleIds.slice(start, start + chunkSize);
+          const placeholders = chunk.map(() => "?").join(", ");
+          database
+            .prepare(`DELETE FROM conversation_index WHERE id IN (${placeholders})`)
+            .run(...chunk);
+        }
+      }
+
       for (const item of normalizedDetailedItems) {
         const meta = item.meta;
         const searchText = item.searchText;
+        const nextSignature = JSON.stringify([
+          meta.provider,
+          meta.title,
+          searchText ?? null,
+          meta.project,
+          meta.projectKey,
+          meta.createdAt,
+          meta.updatedAt,
+          meta.messageCount,
+          meta.fileSize,
+          meta.filePath,
+          meta.modelProvider ?? null,
+        ]);
+
+        if (existingSignatureById.get(meta.id) === nextSignature) {
+          continue;
+        }
+
         upsert.run(
           meta.id,
           meta.provider,
@@ -584,12 +669,12 @@ export function setIndexedListCache(
 }
 
 export function queryConversationIndex(options: {
-  providers: string[];
+  cacheKeys: string[];
   search?: string;
   sort?: "updatedAt" | "createdAt" | "provider";
   modelProviders?: string[];
 }): ConversationMeta[] {
-  if (options.providers.length === 0) return [];
+  if (options.cacheKeys.length === 0) return [];
 
   try {
     const database = getDb();
@@ -597,9 +682,9 @@ export function queryConversationIndex(options: {
     const params: Array<string | number> = [];
     let joinClause = "";
 
-    const providerPlaceholders = options.providers.map(() => "?").join(", ");
-    whereClauses.push(`conversation_index.provider IN (${providerPlaceholders})`);
-    params.push(...options.providers);
+    const cacheKeyPlaceholders = options.cacheKeys.map(() => "?").join(", ");
+    whereClauses.push(`conversation_index.cache_key IN (${cacheKeyPlaceholders})`);
+    params.push(...options.cacheKeys);
 
     if (options.search) {
       const ftsQuery = supportsFtsSearch ? buildFtsSearchQuery(options.search) : null;
@@ -607,6 +692,11 @@ export function queryConversationIndex(options: {
         joinClause = "JOIN conversation_index_fts ON conversation_index_fts.rowid = conversation_index.rowid";
         whereClauses.push("conversation_index_fts MATCH ?");
         params.push(ftsQuery);
+      } else if (supportsFtsSearch) {
+        joinClause = "JOIN conversation_index_fts ON conversation_index_fts.rowid = conversation_index.rowid";
+        whereClauses.push("(conversation_index_fts.title LIKE ? OR conversation_index_fts.project LIKE ? OR conversation_index_fts.search_text LIKE ?)");
+        const pattern = buildSubstringPattern(options.search);
+        params.push(pattern, pattern, pattern);
       } else {
         whereClauses.push("(LOWER(conversation_index.title) LIKE ? OR LOWER(conversation_index.project) LIKE ? OR LOWER(COALESCE(conversation_index.search_text, '')) LIKE ?)");
         const pattern = buildLikePattern(options.search);
@@ -708,14 +798,6 @@ function pruneCacheStorage(database: BetterSqlite3.Database): void {
        SELECT cache_key FROM indexed_list_cache
      )`
   ).run();
-  database.prepare(
-    `DELETE FROM conversation_index
-     WHERE id IN (
-       SELECT id FROM conversation_index
-       ORDER BY indexed_at DESC, updated_at DESC
-       LIMIT -1 OFFSET ?
-     )`
-  ).run(KEEP_INDEX_ROWS);
 
   if (now - lastVacuumAt >= VACUUM_INTERVAL_MS) {
     lastVacuumAt = now;

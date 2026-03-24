@@ -9,6 +9,7 @@ import {
   type ProviderInfo,
   type ConversationMeta,
   type Conversation,
+  type ConversationListResponse,
   type CodexModelProvider,
 } from "../lib/api";
 import type { ToastPayload } from "../components/ToastViewport";
@@ -71,6 +72,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [codexModelProviders, setCodexModelProviders] = useState<CodexModelProvider[]>([]);
   const [activeModelProviders, setActiveModelProviders] = useState<Set<string>>(new Set());
+  const [partialSearch, setPartialSearch] = useState(false);
+  const [searchWarnings, setSearchWarnings] = useState<string[]>([]);
   const detailAbortRef = useRef<AbortController | null>(null);
   const activeProvidersRef = useRef(activeProviders);
   const activeModelProvidersRef = useRef(activeModelProviders);
@@ -166,8 +169,15 @@ export function useConversations(options: UseConversationsOptions = {}) {
     if (currentProviders.length > 0 && currentActiveProviders.size === 0) {
       setConversations([]);
       setTotal(0);
+      setPartialSearch(false);
+      setSearchWarnings([]);
       setLoading(false);
-      return { total: 0, conversations: [] as ConversationMeta[] };
+      return {
+        total: 0,
+        conversations: [] as ConversationMeta[],
+        partialSearch: false,
+        warnings: [],
+      } satisfies ConversationListResponse;
     }
 
     const providerParam =
@@ -188,11 +198,15 @@ export function useConversations(options: UseConversationsOptions = {}) {
       });
       setConversations(data.conversations);
       setTotal(data.total);
+      setPartialSearch(!!data.partialSearch);
+      setSearchWarnings(data.warnings ?? []);
       return data;
     } catch (error) {
       if (!isAbortError(error)) {
         notifyError("加载对话列表失败", error, "加载对话列表失败");
       }
+      setPartialSearch(false);
+      setSearchWarnings([]);
       return null;
     } finally {
       if (!signal?.aborted) {
@@ -214,6 +228,24 @@ export function useConversations(options: UseConversationsOptions = {}) {
     setSelectedId(null);
     setConversation(null);
   }, [conversations, selectedId]);
+
+  useEffect(() => {
+    const visibleIds = new Set(conversations.map((item) => item.id));
+    setSelectedIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+
+      for (const id of prev) {
+        if (visibleIds.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [conversations]);
 
   const loadConversationDetail = useCallback(
     async (id: string, options?: { appendEarlier?: boolean }) => {
@@ -375,6 +407,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
     codexModelProviders,
     activeModelProviders,
     toggleModelProvider,
+    partialSearch,
+    searchWarnings,
     reloadProviders: loadProviderData,
     reloadAllData,
   };

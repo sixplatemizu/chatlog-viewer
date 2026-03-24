@@ -68,10 +68,12 @@ export default function App() {
     codexModelProviders,
     activeModelProviders,
     toggleModelProvider,
+    partialSearch,
+    searchWarnings,
     reloadAllData,
   } = useConversations({ onNotify: pushToast });
 
-  const { theme, setTheme } = useTheme();
+  const { theme, resolvedTheme, setTheme } = useTheme();
 
   const [exportOpen, setExportOpen] = useState(false);
   const [providerPathsOpen, setProviderPathsOpen] = useState(false);
@@ -357,10 +359,13 @@ export default function App() {
           codexModelProviders={codexModelProviders}
           activeModelProviders={activeModelProviders}
           onToggleModelProvider={toggleModelProvider}
+          partialSearch={partialSearch}
+          searchWarnings={searchWarnings}
         />
         <ConversationViewer
           key={conversation?.id ?? "empty"}
           conversation={conversation}
+          dark={resolvedTheme === "dark"}
           loading={loadingDetail}
           loadingEarlier={loadingEarlier}
           onLoadEarlier={loadEarlierMessages}

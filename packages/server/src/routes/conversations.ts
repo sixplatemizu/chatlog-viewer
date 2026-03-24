@@ -143,40 +143,54 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     }
 
     const customTitles = await getAllTitles();
-    const indexedProviderNames: string[] = [];
+    const indexedCacheKeys: string[] = [];
     const refreshedByProvider = new Map<string, ConversationMeta[]>();
+    const searchWarnings = new Set<string>();
     const parsedModelProviders = modelProviderFilter !== undefined
       ? modelProviderFilter.split(",").map((name) => name.trim()).filter(Boolean)
       : undefined;
 
     for (const provider of activeProviders) {
       try {
-        if (!(await provider.detect())) continue;
         const cacheKey = getProviderListCacheKey(provider);
+        if (!(await provider.detect())) {
+          if (requireSearchReady) {
+            searchWarnings.add(`${provider.displayName} 当前不可用，搜索结果可能不完整`);
+          }
+          continue;
+        }
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady })) {
-          indexedProviderNames.push(provider.name);
+          indexedCacheKeys.push(cacheKey);
           continue;
         }
 
         const refreshedItems = await provider.list({ eagerSearchIndex: requireSearchReady });
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady })) {
-          indexedProviderNames.push(provider.name);
+          indexedCacheKeys.push(cacheKey);
         } else {
           refreshedByProvider.set(provider.name, refreshedItems);
+          if (requireSearchReady) {
+            searchWarnings.add(`${provider.displayName} 搜索索引尚未就绪，当前仅匹配标题和目录`);
+          }
         }
       } catch (error) {
         logProviderError("conversations.list", provider.name, error);
+        if (requireSearchReady) {
+          searchWarnings.add(`${provider.displayName} 刷新失败，搜索结果可能不完整`);
+        }
       }
     }
 
     const indexedConversations = queryConversationIndex({
-      providers: indexedProviderNames,
+      cacheKeys: indexedCacheKeys,
       search,
       sort: sort === "createdAt" || sort === "provider" ? sort : "updatedAt",
       modelProviders: parsedModelProviders,
     });
 
-    const indexedProviderSet = new Set(indexedProviderNames);
+    const indexedProviderSet = new Set(
+      indexedCacheKeys.map((cacheKey) => cacheKey.split("::")[0])
+    );
     let filteredRefreshed = [...refreshedByProvider.entries()].flatMap(([providerName, items]) => {
       if (indexedProviderSet.has(providerName)) {
         return [];
@@ -221,6 +235,8 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     return c.json({
       total: filtered.length,
       conversations: filtered,
+      partialSearch: requireSearchReady && searchWarnings.size > 0,
+      warnings: [...searchWarnings],
     });
   });
 

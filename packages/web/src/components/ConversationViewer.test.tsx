@@ -44,6 +44,7 @@ describe("ConversationViewer", () => {
     render(
       <ConversationViewer
         conversation={null}
+        dark={false}
         loading={false}
         loadingEarlier={false}
         onLoadEarlier={() => {}}
@@ -65,6 +66,7 @@ describe("ConversationViewer", () => {
     render(
       <ConversationViewer
         conversation={baseConversation}
+        dark={false}
         loading={false}
         loadingEarlier={false}
         onLoadEarlier={handleLoadEarlier}
