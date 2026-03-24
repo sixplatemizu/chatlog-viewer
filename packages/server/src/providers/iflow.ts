@@ -1,18 +1,26 @@
-import { homedir } from "os";
 import { join } from "path";
 import { stat, unlink, rename, mkdir, readdir } from "fs/promises";
 import { glob } from "glob";
-import { parseJsonl, parseJsonlHead, parseJsonlTail, countLines } from "../utils/jsonl.js";
-import { getCached, getListCache, setCache, setListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import {
+  parseJsonl,
+  parseJsonlHead,
+  parseJsonlTail,
+  parseJsonlWindow,
+  countLines,
+  getAdaptiveSearchWindowOptions,
+} from "../utils/jsonl.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import { logProviderError } from "../utils/logger.js";
+import { getProviderPaths } from "../utils/provider-paths.js";
+import { buildConversationSearchText } from "../utils/search-index.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
   Message,
   ConversationReadOptions,
+  ConversationListOptions,
 } from "./types.js";
-
-const IFLOW_LIST_CACHE_VERSION = "v2";
 
 interface IFlowEntry {
   uuid: string;
@@ -63,20 +71,7 @@ function getProjectSpecificity(project: string, projectKey: string): number {
 }
 
 function getListCacheKey(providerName: string, storagePath: string): string {
-  return `${providerName}::${storagePath}::${IFLOW_LIST_CACHE_VERSION}`;
-}
-
-async function buildListSignature(files: string[]): Promise<string> {
-  let mtimeSum = 0;
-  for (const file of files) {
-    try {
-      const fileStat = await stat(file);
-      mtimeSum += fileStat.mtimeMs;
-    } catch {
-      // 忽略单文件异常，签名仍然变化
-    }
-  }
-  return `${files.length}:${mtimeSum}`;
+  return `${providerName}::${storagePath}::indexed`;
 }
 
 function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
@@ -139,9 +134,10 @@ function buildMessages(entries: IFlowEntry[]): Message[] {
 export class IFlowProvider implements ConversationProvider {
   name = "iflow";
   displayName = "iFlow CLI";
+  private backgroundRefreshes = new Map<string, Promise<void>>();
 
   getStoragePath(): string {
-    return join(homedir(), ".iflow", "projects");
+    return getProviderPaths("iflow").storagePath;
   }
 
   async detect(): Promise<boolean> {
@@ -153,20 +149,85 @@ export class IFlowProvider implements ConversationProvider {
     }
   }
 
-  async list(): Promise<ConversationMeta[]> {
+  async list(options: ConversationListOptions = {}): Promise<ConversationMeta[]> {
+    return this.listInternal({
+      eagerSearchIndex: options.eagerSearchIndex ?? false,
+      allowBackground: true,
+    });
+  }
+
+  private scheduleBackgroundIndexRefresh(): void {
+    const cacheKey = getListCacheKey(this.name, this.getStoragePath());
+    if (this.backgroundRefreshes.has(cacheKey)) {
+      return;
+    }
+
+    const task = this.listInternal({
+      eagerSearchIndex: true,
+      allowBackground: false,
+    })
+      .then(() => undefined)
+      .catch((error) => {
+        logProviderError("conversations.index.background", this.name, error);
+      })
+      .finally(() => {
+        this.backgroundRefreshes.delete(cacheKey);
+      });
+
+    this.backgroundRefreshes.set(cacheKey, task);
+  }
+
+  private async listInternal(options: {
+    eagerSearchIndex: boolean;
+    allowBackground: boolean;
+  }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
-    const pattern = join(basePath, "*", "session-*.jsonl").replace(/\\/g, "/");
-    const files = await glob(pattern);
     const cacheKey = getListCacheKey(this.name, basePath);
-    const signature = await buildListSignature(files);
-    const cachedList = getListCache(cacheKey, signature);
+    const cachedList = getIndexedListCache(cacheKey, undefined, {
+      requireSearchReady: options.eagerSearchIndex,
+    });
     if (cachedList) {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    const results: ConversationMeta[] = [];
+    const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
+    const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
+    const pattern = join(basePath, "*", "session-*.jsonl").replace(/\\/g, "/");
+    const files = await glob(pattern);
+
+    const results: Array<{ meta: ConversationMeta; searchText?: string }> = [];
+    const filesToRefresh: string[] = [];
+
+    for (const filePath of files) {
+      const previousMeta = previousByFilePath.get(filePath);
+      if (!previousMeta) {
+        filesToRefresh.push(filePath);
+        continue;
+      }
+
+      try {
+        const fileStat = await stat(filePath);
+        if (fileStat.mtimeMs === previousMeta.meta.updatedAt && previousMeta.searchText !== undefined) {
+          setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
+          results.push(previousMeta);
+        } else {
+          filesToRefresh.push(filePath);
+        }
+      } catch {
+        filesToRefresh.push(filePath);
+      }
+    }
+
     const metas = await Promise.all(
-      files.map((f) => this.extractMeta(f).catch(() => null))
+      filesToRefresh.map(async (f) => {
+        const meta = await this.extractMeta(f);
+        if (!meta) return null;
+        if (!options.eagerSearchIndex) {
+          return { meta };
+        }
+        const searchText = await this.extractSearchText(f);
+        return { meta, searchText };
+      })
     );
     for (const m of metas) {
       if (m) results.push(m);
@@ -174,16 +235,24 @@ export class IFlowProvider implements ConversationProvider {
 
     const normalizedResults = this.applyProjectDisplayPathHints(results);
 
-    setListCache(cacheKey, signature, normalizedResults);
-    return normalizedResults.sort((a, b) => b.updatedAt - a.updatedAt);
+    const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
+    setIndexedListCache(cacheKey, normalizedResults, { searchReady });
+
+    if (!searchReady && options.allowBackground) {
+      this.scheduleBackgroundIndexRefresh();
+    }
+
+    return normalizedResults.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  private applyProjectDisplayPathHints(items: ConversationMeta[]): ConversationMeta[] {
+  private applyProjectDisplayPathHints(
+    items: Array<{ meta: ConversationMeta; searchText?: string }>
+  ): Array<{ meta: ConversationMeta; searchText?: string }> {
     const bestProjectByKey = new Map<string, string>();
 
     for (const item of items) {
-      const projectKey = item.projectKey || item.project || "";
-      const candidate = item.project || projectKey;
+      const projectKey = item.meta.projectKey || item.meta.project || "";
+      const candidate = item.meta.project || projectKey;
       const current = bestProjectByKey.get(projectKey);
       const candidateScore = getProjectSpecificity(candidate, projectKey);
       const currentScore = current ? getProjectSpecificity(current, projectKey) : -1;
@@ -198,21 +267,32 @@ export class IFlowProvider implements ConversationProvider {
     }
 
     return items.map((item) => {
-      const projectKey = item.projectKey || item.project || "";
+      const projectKey = item.meta.projectKey || item.meta.project || "";
       const preferredProject = bestProjectByKey.get(projectKey);
       if (!preferredProject) return item;
 
-      const currentScore = getProjectSpecificity(item.project, projectKey);
+      const currentScore = getProjectSpecificity(item.meta.project, projectKey);
       const preferredScore = getProjectSpecificity(preferredProject, projectKey);
       if (preferredScore <= currentScore) return item;
 
       const updatedMeta = {
-        ...item,
+        ...item.meta,
         project: preferredProject,
       };
-      setCache(item.filePath, item.updatedAt, updatedMeta);
-      return updatedMeta;
+      setCache(item.meta.filePath, item.meta.updatedAt, updatedMeta);
+      return {
+        ...item,
+        meta: updatedMeta,
+      };
     });
+  }
+
+  private async extractSearchText(filePath: string): Promise<string | undefined> {
+    const fileStat = await stat(filePath);
+    const entries = fileStat.size > 512 * 1024
+      ? await parseJsonlWindow<IFlowEntry>(filePath, getAdaptiveSearchWindowOptions(fileStat.size))
+      : await parseJsonl<IFlowEntry>(filePath);
+    return buildConversationSearchText(buildMessages(entries));
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {

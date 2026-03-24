@@ -5,11 +5,15 @@ export interface ConversationReadOptions {
   limit?: number;
 }
 
+export interface ConversationListOptions {
+  eagerSearchIndex?: boolean;
+}
+
 export interface ConversationProvider {
   name: string;
   displayName: string;
   detect(): Promise<boolean>;
-  list(): Promise<ConversationMeta[]>;
+  list(options?: ConversationListOptions): Promise<ConversationMeta[]>;
   read(id: string, options?: ConversationReadOptions): Promise<Conversation>;
   delete(id: string): Promise<void>;
   move?(id: string, targetProjectKey: string): Promise<void>;

@@ -50,6 +50,7 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
+        onNotify={() => {}}
         codexModelProviders={[]}
         onChangeModelProvider={() => {}}
       />
@@ -70,6 +71,7 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
+        onNotify={() => {}}
         codexModelProviders={[{ name: "openai", count: 1 }]}
         onChangeModelProvider={() => {}}
       />

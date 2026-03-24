@@ -1,7 +1,13 @@
 import { memo, useMemo, useState } from "react";
+import { GroupedVirtuoso } from "react-virtuoso";
 import { MessageSquare, FolderOpen, ChevronDown, ChevronRight } from "lucide-react";
 import type { ConversationMeta } from "../lib/api";
-import { getDisambiguatedProjectName, getProjectPathHint, normalizeProjectPath } from "../lib/project";
+import {
+  canonicalizeProjectPath,
+  getDisambiguatedProjectName,
+  getProjectPathHint,
+  normalizeProjectPath,
+} from "../lib/project";
 
 const PROVIDER_BADGE: Record<string, string> = {
   "claude-code": "bg-orange-500",
@@ -11,7 +17,6 @@ const PROVIDER_BADGE: Record<string, string> = {
   opencode: "bg-cyan-500",
 };
 
-// 文件夹图标颜色跟随 provider
 const FOLDER_COLOR: Record<string, string> = {
   "claude-code": "text-orange-400",
   codex: "text-green-400",
@@ -47,6 +52,13 @@ interface ConversationGroup {
   latestUpdatedAt: number;
 }
 
+interface FlattenedListModel {
+  groups: ConversationGroup[];
+  groupCounts: number[];
+  visibleConversations: ConversationMeta[];
+  startIndexByGroup: number[];
+}
+
 function formatTime(ts: number): string {
   const d = new Date(ts);
   const now = new Date();
@@ -63,7 +75,7 @@ function formatTime(ts: number): string {
 }
 
 function getProjectDisplayScore(project: string, projectKey: string): number {
-  const normalized = normalizeProjectPath(project || "");
+  const normalized = canonicalizeProjectPath(project || "");
   if (!normalized || normalized === projectKey) return 0;
 
   const parts = normalized.split("/").filter(Boolean);
@@ -90,14 +102,15 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
   const groups = new Map<string, ConversationGroup>();
 
   for (const conv of conversations) {
-    const projectKey = conv.projectKey || conv.project || "未知目录";
+    const rawProjectKey = conv.projectKey || conv.project || "未知目录";
+    const projectKey = canonicalizeProjectPath(rawProjectKey) || rawProjectKey;
     const key = `${conv.provider}::${projectKey}`;
     let group = groups.get(key);
 
     if (!group) {
       group = {
         key,
-        displayPath: conv.project || projectKey,
+        displayPath: normalizeProjectPath(conv.project || rawProjectKey),
         provider: conv.provider,
         projectKey,
         conversations: [],
@@ -117,6 +130,30 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
   }
 
   return [...groups.values()].sort((a, b) => b.latestUpdatedAt - a.latestUpdatedAt);
+}
+
+function buildFlattenedListModel(groups: ConversationGroup[], collapsedGroups: Set<string>): FlattenedListModel {
+  const groupCounts: number[] = [];
+  const visibleConversations: ConversationMeta[] = [];
+  const startIndexByGroup: number[] = [];
+  let cursor = 0;
+
+  for (const group of groups) {
+    startIndexByGroup.push(cursor);
+    const count = collapsedGroups.has(group.key) ? 0 : group.conversations.length;
+    groupCounts.push(count);
+    if (count > 0) {
+      visibleConversations.push(...group.conversations);
+      cursor += count;
+    }
+  }
+
+  return {
+    groups,
+    groupCounts,
+    visibleConversations,
+    startIndexByGroup,
+  };
 }
 
 const ConversationRow = memo(function ConversationRow({
@@ -219,6 +256,10 @@ export const ConversationList = memo(function ConversationList({
 
     return selectedCountByGroup;
   }, [groups, selectedIds]);
+  const listModel = useMemo(
+    () => buildFlattenedListModel(groups, collapsedGroups),
+    [groups, collapsedGroups]
+  );
 
   if (loading) {
     return (
@@ -265,8 +306,12 @@ export const ConversationList = memo(function ConversationList({
   };
 
   return (
-    <div>
-      {groups.map((group) => {
+    <GroupedVirtuoso
+      className="h-full"
+      groupCounts={listModel.groupCounts}
+      increaseViewportBy={{ top: 400, bottom: 800 }}
+      groupContent={(groupIndex) => {
+        const group = listModel.groups[groupIndex];
         const collapsed = collapsedGroups.has(group.key);
         const displayName = getDisambiguatedProjectName(
           group.displayPath,
@@ -282,62 +327,61 @@ export const ConversationList = memo(function ConversationList({
         const isDragTarget = dragOverKey === group.key;
 
         return (
-          <div key={group.key}>
-            <div
-              className={`flex items-center gap-1 px-3 py-1.5 bg-gray-100/80 dark:bg-gray-700/60 border-b border-gray-200 dark:border-gray-600 sticky top-0 z-10 transition-colors ${
-                hasSelected && collapsed ? "!bg-blue-50 dark:!bg-blue-900/20" : ""
-              } ${isDragTarget ? "!bg-blue-100 dark:!bg-blue-800/40 ring-2 ring-blue-400 ring-inset" : ""}`}
-              onDragOver={(e) => handleDragOver(e, group.key)}
-              onDragLeave={handleDragLeave}
-              onDrop={(e) => handleDrop(e, group.key, group.provider, group.projectKey)}
+          <div
+            className={`flex items-center gap-1 px-3 py-1.5 bg-gray-100/80 dark:bg-gray-700/60 border-b border-gray-200 dark:border-gray-600 sticky top-0 z-10 transition-colors ${
+              hasSelected && collapsed ? "!bg-blue-50 dark:!bg-blue-900/20" : ""
+            } ${isDragTarget ? "!bg-blue-100 dark:!bg-blue-800/40 ring-2 ring-blue-400 ring-inset" : ""}`}
+            onDragOver={(e) => handleDragOver(e, group.key)}
+            onDragLeave={handleDragLeave}
+            onDrop={(e) => handleDrop(e, group.key, group.provider, group.projectKey)}
+          >
+            <input
+              type="checkbox"
+              checked={allChecked}
+              ref={(el) => {
+                if (el) el.indeterminate = someChecked;
+              }}
+              onChange={() => onToggleSelectGroup(group.ids)}
+              className="w-3.5 h-3.5 rounded accent-blue-500 cursor-pointer flex-shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            />
+            <button
+              onClick={() => toggleGroup(group.key)}
+              className="flex items-center gap-1 flex-1 min-w-0 hover:bg-gray-100 dark:hover:bg-gray-700 rounded px-1 transition-colors"
+              title={getProjectPathHint(group.displayPath, group.projectKey)}
             >
-              <input
-                type="checkbox"
-                checked={allChecked}
-                ref={(el) => {
-                  if (el) el.indeterminate = someChecked;
-                }}
-                onChange={() => onToggleSelectGroup(group.ids)}
-                className="w-3.5 h-3.5 rounded accent-blue-500 cursor-pointer flex-shrink-0"
-                onClick={(e) => e.stopPropagation()}
-              />
-              <button
-                onClick={() => toggleGroup(group.key)}
-                className="flex items-center gap-1 flex-1 min-w-0 hover:bg-gray-100 dark:hover:bg-gray-700 rounded px-1 transition-colors"
-                title={getProjectPathHint(group.displayPath, group.projectKey)}
-              >
-                {collapsed ? (
-                  <ChevronRight className="w-3 h-3 text-gray-400 flex-shrink-0" />
-                ) : (
-                  <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
-                )}
-                <FolderOpen className={`w-3.5 h-3.5 flex-shrink-0 ${FOLDER_COLOR[group.provider] || "text-amber-500"}`} />
-                <span className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">
-                  {displayName}
-                </span>
-                <span className="text-xs text-gray-400 ml-auto flex-shrink-0">
-                  {group.conversations.length}
-                </span>
-              </button>
-            </div>
-
-            {!collapsed && (
-              <div className="divide-y divide-gray-50 dark:divide-gray-700/50">
-                {group.conversations.map((conv) => (
-                  <ConversationRow
-                    key={conv.id}
-                    conv={conv}
-                    checked={selectedIds.has(conv.id)}
-                    selected={selectedId === conv.id}
-                    onSelect={onSelect}
-                    onToggleSelect={onToggleSelect}
-                  />
-                ))}
-              </div>
-            )}
+              {collapsed ? (
+                <ChevronRight className="w-3 h-3 text-gray-400 flex-shrink-0" />
+              ) : (
+                <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
+              )}
+              <FolderOpen className={`w-3.5 h-3.5 flex-shrink-0 ${FOLDER_COLOR[group.provider] || "text-amber-500"}`} />
+              <span className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">
+                {displayName}
+              </span>
+              <span className="text-xs text-gray-400 ml-auto flex-shrink-0">
+                {group.conversations.length}
+              </span>
+            </button>
           </div>
         );
-      })}
-    </div>
+      }}
+      itemContent={(index) => {
+        const conv = listModel.visibleConversations[index];
+        if (!conv) return null;
+
+        return (
+          <div className="border-b border-gray-50 dark:border-gray-700/50">
+            <ConversationRow
+              conv={conv}
+              checked={selectedIds.has(conv.id)}
+              selected={selectedId === conv.id}
+              onSelect={onSelect}
+              onToggleSelect={onToggleSelect}
+            />
+          </div>
+        );
+      }}
+    />
   );
 });

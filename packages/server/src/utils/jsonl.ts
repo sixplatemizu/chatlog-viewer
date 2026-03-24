@@ -3,6 +3,15 @@ import { stat } from "fs/promises";
 import { createInterface } from "readline";
 
 const MIN_TAIL_READ_BYTES = 8 * 1024;
+const DEFAULT_WINDOW_READ_BYTES = 128 * 1024;
+const DEFAULT_SAMPLE_WINDOW_COUNT = 5;
+
+export interface ParseJsonlWindowOptions {
+  headBytes?: number;
+  middleBytes?: number;
+  tailBytes?: number;
+  sampleWindowCount?: number;
+}
 
 export interface ParseJsonlTailContext {
   reachedStart: boolean;
@@ -128,6 +137,114 @@ export async function parseJsonlTail<T = unknown>(
 
     bytesRead = Math.min(maxBytes, Math.max(bytesRead * 2, bytesRead + baseBytesHint));
   }
+}
+
+export async function parseJsonlWindow<T = unknown>(
+  filePath: string,
+  options?: ParseJsonlWindowOptions
+): Promise<T[]> {
+  const fileStat = await stat(filePath);
+  const fileSize = fileStat.size;
+  if (fileSize <= 0) return [];
+
+  const headBytes = Math.max(options?.headBytes ?? DEFAULT_WINDOW_READ_BYTES, MIN_TAIL_READ_BYTES);
+  const middleBytes = Math.max(options?.middleBytes ?? headBytes, MIN_TAIL_READ_BYTES);
+  const tailBytes = Math.max(options?.tailBytes ?? DEFAULT_WINDOW_READ_BYTES, MIN_TAIL_READ_BYTES);
+  const sampleWindowCount = Math.max(options?.sampleWindowCount ?? DEFAULT_SAMPLE_WINDOW_COUNT, 2);
+
+  const readWindow = (start: number, end: number): Promise<string> => new Promise((resolve, reject) => {
+    let content = "";
+    const stream = createReadStream(filePath, {
+      encoding: "utf-8",
+      start,
+      end,
+    });
+
+    stream.on("data", (chunk) => {
+      content += chunk;
+    });
+    stream.on("end", () => {
+      let normalized = content;
+      if (start > 0) {
+        const firstNewline = normalized.indexOf("\n");
+        if (firstNewline >= 0) normalized = normalized.slice(firstNewline + 1);
+      }
+      if (end < fileSize - 1) {
+        const lastNewline = normalized.lastIndexOf("\n");
+        if (lastNewline >= 0) normalized = normalized.slice(0, lastNewline);
+      }
+      resolve(normalized);
+    });
+    stream.on("error", reject);
+  });
+
+  if (fileSize <= headBytes + tailBytes) {
+    return parseJsonl<T>(filePath);
+  }
+
+  const ranges: Array<{ start: number; end: number }> = [];
+  ranges.push({ start: 0, end: Math.min(fileSize - 1, headBytes - 1) });
+
+  const middleWindowCount = Math.max(sampleWindowCount - 2, 0);
+  const middleStartFloor = headBytes;
+  const middleStartCeiling = Math.max(
+    middleStartFloor,
+    fileSize - tailBytes - middleBytes
+  );
+  for (let index = 0; index < middleWindowCount; index++) {
+    const ratio = (index + 1) / (middleWindowCount + 1);
+    const start = Math.min(
+      Math.max(middleStartFloor, Math.floor((fileSize - middleBytes) * ratio)),
+      middleStartCeiling
+    );
+    const end = Math.min(fileSize - 1, start + middleBytes - 1);
+    if (start < end) {
+      ranges.push({ start, end });
+    }
+  }
+
+  ranges.push({ start: Math.max(0, fileSize - tailBytes), end: fileSize - 1 });
+
+  const chunks = await Promise.all(
+    ranges.map((range) => readWindow(range.start, range.end))
+  );
+  return chunks.flatMap((chunk) => parseJsonlText<T>(chunk));
+}
+
+export function getAdaptiveSearchWindowOptions(fileSize: number): Required<ParseJsonlWindowOptions> {
+  if (fileSize <= 2 * 1024 * 1024) {
+    return {
+      headBytes: 96 * 1024,
+      middleBytes: 64 * 1024,
+      tailBytes: 96 * 1024,
+      sampleWindowCount: 5,
+    };
+  }
+
+  if (fileSize <= 8 * 1024 * 1024) {
+    return {
+      headBytes: 80 * 1024,
+      middleBytes: 48 * 1024,
+      tailBytes: 80 * 1024,
+      sampleWindowCount: 7,
+    };
+  }
+
+  if (fileSize <= 32 * 1024 * 1024) {
+    return {
+      headBytes: 64 * 1024,
+      middleBytes: 32 * 1024,
+      tailBytes: 64 * 1024,
+      sampleWindowCount: 9,
+    };
+  }
+
+  return {
+    headBytes: 48 * 1024,
+    middleBytes: 24 * 1024,
+    tailBytes: 48 * 1024,
+    sampleWindowCount: 13,
+  };
 }
 
 // 只读前 N 行并解析（用于 extractMeta，避免全量读取大文件）

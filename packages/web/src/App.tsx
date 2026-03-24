@@ -4,6 +4,9 @@ import { useTheme } from "./hooks/useTheme";
 import { Sidebar } from "./components/Sidebar";
 import { ConversationViewer } from "./components/ConversationViewer";
 import { ExportDialog } from "./components/ExportDialog";
+import { ProviderPathsDialog } from "./components/ProviderPathsDialog";
+import { ToastViewport, type ToastItem, type ToastPayload } from "./components/ToastViewport";
+import { isSameProjectPath } from "./lib/project";
 import {
   exportConversations,
   deleteConversation,
@@ -12,7 +15,7 @@ import {
   changeModelProvider,
   getErrorMessage,
 } from "./lib/api";
-import { Sun, Moon, Monitor, X, Sparkles, Loader2, CheckCircle2, XCircle } from "lucide-react";
+import { Sun, Moon, Monitor, Settings2, X, Sparkles, Loader2, CheckCircle2, XCircle } from "lucide-react";
 
 interface GenProgress {
   total: number;
@@ -22,6 +25,23 @@ interface GenProgress {
 }
 
 export default function App() {
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const toastIdRef = useRef(1);
+
+  const pushToast = useCallback((payload: ToastPayload) => {
+    setToasts((prev) => [
+      ...prev.slice(-3),
+      {
+        id: toastIdRef.current++,
+        ...payload,
+      },
+    ]);
+  }, []);
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((prev) => prev.filter((toast) => toast.id !== id));
+  }, []);
+
   const {
     providers,
     conversations,
@@ -48,11 +68,13 @@ export default function App() {
     codexModelProviders,
     activeModelProviders,
     toggleModelProvider,
-  } = useConversations();
+    reloadAllData,
+  } = useConversations({ onNotify: pushToast });
 
   const { theme, setTheme } = useTheme();
 
   const [exportOpen, setExportOpen] = useState(false);
+  const [providerPathsOpen, setProviderPathsOpen] = useState(false);
   const [exportIds, setExportIds] = useState<string[]>([]);
   const [deleteConfirmIds, setDeleteConfirmIds] = useState<string[]>([]);
 
@@ -78,7 +100,7 @@ export default function App() {
     async (format: "json" | "markdown") => {
       if (exportIds.length === 0) return;
       try {
-        const blob = await exportConversations(exportIds, format);
+        const { blob, meta } = await exportConversations(exportIds, format);
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
@@ -86,11 +108,28 @@ export default function App() {
         a.click();
         URL.revokeObjectURL(url);
         setExportOpen(false);
+
+        if (meta && meta.failed > 0) {
+          const failurePreview = meta.failures
+            .slice(0, 3)
+            .map((item) => item.error)
+            .join("\n");
+          pushToast({
+            variant: "warning",
+            title: `导出部分成功：成功 ${meta.exported} 条，失败 ${meta.failed} 条`,
+            description: failurePreview ? `失败示例：\n${failurePreview}` : undefined,
+            duration: 8000,
+          });
+        }
       } catch (error) {
-        alert(`导出失败: ${getErrorMessage(error, "导出失败")}`);
+        pushToast({
+          variant: "error",
+          title: "导出失败",
+          description: getErrorMessage(error, "导出失败"),
+        });
       }
     },
-    [exportIds]
+    [exportIds, pushToast]
   );
 
   // 单条删除
@@ -114,9 +153,13 @@ export default function App() {
       setDeleteConfirmIds([]);
       refresh();
     } catch (error) {
-      alert(`删除失败: ${getErrorMessage(error, "删除失败")}`);
+      pushToast({
+        variant: "error",
+        title: "删除失败",
+        description: getErrorMessage(error, "删除失败"),
+      });
     }
-  }, [deleteConfirmIds, refresh, deselectAll]);
+  }, [deleteConfirmIds, refresh, deselectAll, pushToast]);
 
   // 标题更新后同步刷新列表和详情
   const handleTitleChanged = useCallback(
@@ -134,26 +177,38 @@ export default function App() {
     async (convId: string, targetProjectKey: string, srcProvider: string, targetProvider: string) => {
       // 只允许同 provider 内移动
       if (srcProvider !== targetProvider) {
-        alert(`不支持跨工具移动（${srcProvider} → ${targetProvider}）`);
+        pushToast({
+          variant: "warning",
+          title: "不支持跨工具移动",
+          description: `${srcProvider} → ${targetProvider}`,
+        });
         return;
       }
 
       // 检查是否是同一个文件夹
       const conv = conversations.find((c) => c.id === convId);
-      if (!conv || conv.projectKey === targetProjectKey) return;
+      if (!conv || isSameProjectPath(conv.projectKey, targetProjectKey)) return;
 
       try {
         const res = await moveConversation(convId, targetProjectKey);
         if (res.success) {
           refresh();
         } else {
-          alert(`移动失败: ${res.error}`);
+          pushToast({
+            variant: "error",
+            title: "移动失败",
+            description: res.error,
+          });
         }
       } catch (error) {
-        alert(`移动失败: ${getErrorMessage(error, "移动失败")}`);
+        pushToast({
+          variant: "error",
+          title: "移动失败",
+          description: getErrorMessage(error, "移动失败"),
+        });
       }
     },
-    [conversations, refresh]
+    [conversations, refresh, pushToast]
   );
 
   // 修改 Codex 对话的 model_provider
@@ -168,13 +223,21 @@ export default function App() {
             await selectConversation(id);
           }
         } else {
-          alert(`迁移失败: ${res.error}`);
+          pushToast({
+            variant: "error",
+            title: "迁移失败",
+            description: res.error,
+          });
         }
       } catch (error) {
-        alert(`迁移失败: ${getErrorMessage(error, "迁移失败")}`);
+        pushToast({
+          variant: "error",
+          title: "迁移失败",
+          description: getErrorMessage(error, "迁移失败"),
+        });
       }
     },
-    [refresh, selectedId, selectConversation]
+    [refresh, selectedId, selectConversation, pushToast]
   );
 
   // 批量 AI 生成标题
@@ -222,6 +285,10 @@ export default function App() {
     setGenProgress(null);
   }, []);
 
+  const handleProviderPathsSaved = useCallback(async () => {
+    await reloadAllData();
+  }, [reloadAllData]);
+
   return (
     <div className="h-screen flex flex-col">
       {/* 顶部标题栏 */}
@@ -231,6 +298,14 @@ export default function App() {
         </h1>
         <div className="flex items-center gap-3">
           <span className="text-xs text-gray-400 dark:text-gray-500">AI CLI 对话记录管理器</span>
+          <button
+            type="button"
+            onClick={() => setProviderPathsOpen(true)}
+            className="rounded-lg border border-gray-200 bg-white p-1.5 text-gray-500 transition hover:border-blue-300 hover:text-blue-600 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-300 dark:hover:border-blue-500 dark:hover:text-blue-300"
+            title="Provider 路径设置"
+          >
+            <Settings2 className="h-3.5 w-3.5" />
+          </button>
           <div className="flex items-center gap-0.5 bg-gray-100 dark:bg-gray-700 rounded-lg p-0.5">
             {([
               { key: "light" as const, icon: <Sun className="w-3.5 h-3.5" /> },
@@ -284,6 +359,7 @@ export default function App() {
           onToggleModelProvider={toggleModelProvider}
         />
         <ConversationViewer
+          key={conversation?.id ?? "empty"}
           conversation={conversation}
           loading={loadingDetail}
           loadingEarlier={loadingEarlier}
@@ -293,6 +369,7 @@ export default function App() {
           onTitleChanged={handleTitleChanged}
           codexModelProviders={codexModelProviders}
           onChangeModelProvider={handleChangeModelProvider}
+          onNotify={pushToast}
         />
       </div>
 
@@ -301,6 +378,13 @@ export default function App() {
         open={exportOpen}
         onClose={() => setExportOpen(false)}
         onConfirm={handleExportConfirm}
+      />
+
+      <ProviderPathsDialog
+        open={providerPathsOpen}
+        onClose={() => setProviderPathsOpen(false)}
+        onSaved={handleProviderPathsSaved}
+        onNotify={pushToast}
       />
 
       {/* 删除确认弹窗 */}
@@ -410,6 +494,8 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <ToastViewport toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }

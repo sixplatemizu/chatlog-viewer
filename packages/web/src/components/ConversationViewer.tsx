@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import type { Conversation, CodexModelProvider } from "../lib/api";
 import { updateTitle, generateAiTitle, getErrorMessage } from "../lib/api";
+import type { ToastPayload } from "./ToastViewport";
 import { getProjectName, getProjectPathHint } from "../lib/project";
 import { MessageBubble } from "./MessageBubble";
 
@@ -26,9 +27,12 @@ interface Props {
   onExport: (id: string) => void;
   onDelete: (id: string) => void;
   onTitleChanged: (id: string) => void | Promise<void>;
+  onNotify: (toast: ToastPayload) => void;
   codexModelProviders: CodexModelProvider[];
   onChangeModelProvider: (id: string, newProvider: string) => void;
 }
+
+const EMPTY_MESSAGES: NonNullable<Conversation["messages"]> = [];
 
 export function ConversationViewer({
   conversation,
@@ -38,19 +42,21 @@ export function ConversationViewer({
   onExport,
   onDelete,
   onTitleChanged,
+  onNotify,
   codexModelProviders,
   onChangeModelProvider,
 }: Props) {
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const restoreIndexRef = useRef<number | null>(null);
+  const lastConversationIdRef = useRef<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
   const [generating, setGenerating] = useState(false);
   const [genStatus, setGenStatus] = useState("");
 
   const totalMessages = conversation?.messageCount ?? conversation?.messages.length ?? 0;
-  const loadedMessages = conversation?.messages ?? [];
+  const loadedMessages = conversation?.messages ?? EMPTY_MESSAGES;
   const hiddenCount = Math.max(0, totalMessages - loadedMessages.length);
 
   const messageKeys = useMemo(
@@ -59,10 +65,18 @@ export function ConversationViewer({
   );
 
   useEffect(() => {
+    if (!conversation?.id) {
+      lastConversationIdRef.current = null;
+      restoreIndexRef.current = null;
+      return;
+    }
+
+    if (lastConversationIdRef.current === conversation.id) {
+      return;
+    }
+
+    lastConversationIdRef.current = conversation.id;
     restoreIndexRef.current = null;
-    setEditing(false);
-    setGenerating(false);
-    setGenStatus("");
 
     if (virtuosoRef.current) {
       virtuosoRef.current.scrollToIndex({ index: Math.max(loadedMessages.length - 1, 0), align: "end" });
@@ -92,7 +106,11 @@ export function ConversationViewer({
       await onTitleChanged(conversation.id);
       setEditing(false);
     } catch (error) {
-      alert(`保存标题失败: ${getErrorMessage(error, "保存标题失败")}`);
+      onNotify({
+        variant: "error",
+        title: "保存标题失败",
+        description: getErrorMessage(error, "保存标题失败"),
+      });
     }
   };
 

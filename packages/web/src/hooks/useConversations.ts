@@ -11,11 +11,52 @@ import {
   type Conversation,
   type CodexModelProvider,
 } from "../lib/api";
+import type { ToastPayload } from "../components/ToastViewport";
 
 const SEARCH_DEBOUNCE_MS = 350;
 const DETAIL_PAGE_SIZE = 200;
 
-export function useConversations() {
+interface UseConversationsOptions {
+  onNotify?: (toast: ToastPayload) => void;
+}
+
+function resolveActiveProviders(current: Set<string>, providerList: ProviderInfo[]): Set<string> {
+  const available = providerList.filter((p) => p.available).map((p) => p.name);
+  if (current.size === 0) return new Set(available);
+
+  const preserved = available.filter((name) => current.has(name));
+  return new Set(preserved.length > 0 ? preserved : available);
+}
+
+function resolveActiveModelProviders(
+  current: Set<string>,
+  modelProviders: CodexModelProvider[]
+): Set<string> {
+  const availableNames = modelProviders.map((provider) => provider.name);
+  if (current.size === 0) return new Set(availableNames);
+
+  const preserved = availableNames.filter((name) => current.has(name));
+  return new Set(preserved.length > 0 ? preserved : availableNames);
+}
+
+function getModelProviderParam(
+  activeProviders: Set<string>,
+  activeModelProviders: Set<string>,
+  modelProviders: CodexModelProvider[]
+): string | undefined {
+  if (!activeProviders.has("codex") || modelProviders.length === 0) {
+    return undefined;
+  }
+
+  if (activeModelProviders.size >= modelProviders.length) {
+    return undefined;
+  }
+
+  return Array.from(activeModelProviders).join(",");
+}
+
+export function useConversations(options: UseConversationsOptions = {}) {
+  const { onNotify } = options;
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [total, setTotal] = useState(0);
@@ -31,7 +72,57 @@ export function useConversations() {
   const [codexModelProviders, setCodexModelProviders] = useState<CodexModelProvider[]>([]);
   const [activeModelProviders, setActiveModelProviders] = useState<Set<string>>(new Set());
   const detailAbortRef = useRef<AbortController | null>(null);
+  const activeProvidersRef = useRef(activeProviders);
+  const activeModelProvidersRef = useRef(activeModelProviders);
   const [debouncedSearch, setDebouncedSearch] = useState("");
+
+  useEffect(() => {
+    activeProvidersRef.current = activeProviders;
+  }, [activeProviders]);
+
+  useEffect(() => {
+    activeModelProvidersRef.current = activeModelProviders;
+  }, [activeModelProviders]);
+
+  const notifyError = useCallback(
+    (title: string, error: unknown, fallback: string) => {
+      const message = getErrorMessage(error, fallback);
+      console.error(`${title}:`, message);
+      onNotify?.({
+        variant: "error",
+        title,
+        description: message,
+      });
+    },
+    [onNotify]
+  );
+
+  const loadProviderData = useCallback(async (signal?: AbortSignal) => {
+    const [providerList, modelProviders] = await Promise.all([
+      fetchProviders(signal),
+      fetchCodexProviders(signal),
+    ]);
+
+    const nextActiveProviders = resolveActiveProviders(activeProvidersRef.current, providerList);
+    const nextActiveModelProviders = resolveActiveModelProviders(
+      activeModelProvidersRef.current,
+      modelProviders
+    );
+
+    setProviders(providerList);
+    setActiveProviders(nextActiveProviders);
+    setCodexModelProviders(modelProviders);
+    setActiveModelProviders(nextActiveModelProviders);
+    activeProvidersRef.current = nextActiveProviders;
+    activeModelProvidersRef.current = nextActiveModelProviders;
+
+    return {
+      providerList,
+      modelProviders,
+      nextActiveProviders,
+      nextActiveModelProviders,
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -45,46 +136,47 @@ export function useConversations() {
   useEffect(() => {
     const abortController = new AbortController();
 
-    Promise.all([
-      fetchProviders(abortController.signal),
-      fetchCodexProviders(abortController.signal),
-    ])
-      .then(([providerList, modelProviders]) => {
-        setProviders(providerList);
-        const available = providerList.filter((p) => p.available).map((p) => p.name);
-        setActiveProviders(new Set(available));
-        setCodexModelProviders(modelProviders);
-        setActiveModelProviders(new Set(modelProviders.map((m) => m.name)));
-      })
+    loadProviderData(abortController.signal)
       .catch((error) => {
         if (!isAbortError(error)) {
-          console.error("初始化数据加载失败:", getErrorMessage(error, "初始化数据加载失败"));
+          notifyError("初始化数据加载失败", error, "初始化数据加载失败");
         }
       });
 
     return () => abortController.abort();
-  }, []);
+  }, [loadProviderData, notifyError]);
 
   // 加载对话列表
-  const loadConversations = useCallback(async (signal?: AbortSignal) => {
+  const loadConversations = useCallback(async (
+    signal?: AbortSignal,
+    overrides?: {
+      providerList?: ProviderInfo[];
+      activeProviderSet?: Set<string>;
+      modelProviders?: CodexModelProvider[];
+      activeModelProviderSet?: Set<string>;
+    }
+  ) => {
     setLoading(true);
 
-    if (providers.length > 0 && activeProviders.size === 0) {
+    const currentProviders = overrides?.providerList ?? providers;
+    const currentActiveProviders = overrides?.activeProviderSet ?? activeProviders;
+    const currentModelProviders = overrides?.modelProviders ?? codexModelProviders;
+    const currentActiveModelProviders = overrides?.activeModelProviderSet ?? activeModelProviders;
+
+    if (currentProviders.length > 0 && currentActiveProviders.size === 0) {
       setConversations([]);
       setTotal(0);
       setLoading(false);
-      return;
+      return { total: 0, conversations: [] as ConversationMeta[] };
     }
 
     const providerParam =
-      providers.length > 0 ? Array.from(activeProviders).join(",") : undefined;
-
-    let modelProviderParam: string | undefined;
-    if (activeProviders.has("codex") && codexModelProviders.length > 0) {
-      if (activeModelProviders.size < codexModelProviders.length) {
-        modelProviderParam = Array.from(activeModelProviders).join(",");
-      }
-    }
+      currentProviders.length > 0 ? Array.from(currentActiveProviders).join(",") : undefined;
+    const modelProviderParam = getModelProviderParam(
+      currentActiveProviders,
+      currentActiveModelProviders,
+      currentModelProviders
+    );
 
     try {
       const data = await fetchConversations({
@@ -96,16 +188,18 @@ export function useConversations() {
       });
       setConversations(data.conversations);
       setTotal(data.total);
+      return data;
     } catch (error) {
       if (!isAbortError(error)) {
-        console.error("加载对话列表失败:", getErrorMessage(error, "加载对话列表失败"));
+        notifyError("加载对话列表失败", error, "加载对话列表失败");
       }
+      return null;
     } finally {
       if (!signal?.aborted) {
         setLoading(false);
       }
     }
-  }, [activeModelProviders, activeProviders, codexModelProviders.length, debouncedSearch, providers.length, sort]);
+  }, [activeModelProviders, activeProviders, codexModelProviders, debouncedSearch, notifyError, providers, sort]);
 
   useEffect(() => {
     const abortController = new AbortController();
@@ -155,7 +249,7 @@ export function useConversations() {
         }
       } catch (error) {
         if (!isAbortError(error)) {
-          console.error("加载对话详情失败:", getErrorMessage(error, "加载对话详情失败"));
+          notifyError("加载对话详情失败", error, "加载对话详情失败");
           setConversation(null);
         }
       } finally {
@@ -168,8 +262,27 @@ export function useConversations() {
         }
       }
     },
-    [conversation]
+    [conversation, notifyError]
   );
+
+  const reloadAllData = useCallback(async () => {
+    const providerState = await loadProviderData();
+    const listData = await loadConversations(undefined, {
+      providerList: providerState.providerList,
+      activeProviderSet: providerState.nextActiveProviders,
+      modelProviders: providerState.modelProviders,
+      activeModelProviderSet: providerState.nextActiveModelProviders,
+    });
+
+    if (!selectedId) return;
+
+    if (listData?.conversations.some((item) => item.id === selectedId)) {
+      await loadConversationDetail(selectedId);
+    } else {
+      setSelectedId(null);
+      setConversation(null);
+    }
+  }, [loadConversationDetail, loadConversations, loadProviderData, selectedId]);
 
   // 选择对话
   const selectConversation = useCallback(async (id: string) => {
@@ -262,5 +375,7 @@ export function useConversations() {
     codexModelProviders,
     activeModelProviders,
     toggleModelProvider,
+    reloadProviders: loadProviderData,
+    reloadAllData,
   };
 }

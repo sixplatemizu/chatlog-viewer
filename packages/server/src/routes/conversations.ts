@@ -3,10 +3,60 @@ import type { ConversationProvider, ConversationMeta } from "../providers/types.
 import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
 import { generateTitle, getAvailableClis } from "../utils/ai.js";
+import { hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
+import { getErrorMessage, getErrorStatus } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
+import {
+  getAppConfig,
+  getProviderConfigPath,
+  getProviderPaths,
+  updateProviderConfigs,
+  type ProviderPathConfig,
+  type ResolvedProviderName,
+} from "../utils/provider-paths.js";
+
+const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "iflow"]);
+
+function isResolvedProviderName(name: string): name is ResolvedProviderName {
+  return RESOLVED_PROVIDER_NAMES.has(name as ResolvedProviderName);
+}
+
+function normalizeOptionalPathInput(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw new Error("路径必须是字符串");
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function buildProviderPathSettings(providers: ConversationProvider[]) {
+  const loadedConfig = getAppConfig();
+  const configuredProviders = loadedConfig.config.providers ?? {};
+
+  return providers.flatMap((provider) => {
+    if (!isResolvedProviderName(provider.name)) return [];
+
+    const resolvedProviderName = provider.name;
+    const resolved = getProviderPaths(resolvedProviderName);
+    const configured = configuredProviders[resolvedProviderName];
+
+    return [{
+      name: resolvedProviderName,
+      displayName: provider.displayName,
+      configuredStoragePath: configured?.storagePath,
+      configuredStateDbPath: configured?.stateDbPath,
+      ...resolved,
+    }];
+  });
+}
 
 export function createConversationRoutes(providers: ConversationProvider[]) {
   const app = new Hono();
+
+  function getProviderListCacheKey(provider: ConversationProvider): string {
+    return `${provider.name}::${provider.getStoragePath()}::indexed`;
+  }
 
   // 可用 provider 列表
   app.get("/providers", async (c) => {
@@ -21,12 +71,65 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     return c.json(list);
   });
 
+  app.get("/settings/provider-paths", async (c) => {
+    return c.json({
+      configPath: getProviderConfigPath(),
+      providers: buildProviderPathSettings(providers),
+    });
+  });
+
+  app.put("/settings/provider-paths", async (c) => {
+    const body = await c.req.json<{
+      providers?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
+    }>();
+
+    if (!body || typeof body !== "object" || !body.providers || typeof body.providers !== "object") {
+      return c.json({ error: "providers 配置不能为空" }, 400);
+    }
+
+    const updates: Partial<Record<ResolvedProviderName, ProviderPathConfig>> = {};
+
+    try {
+      for (const [providerName, value] of Object.entries(body.providers)) {
+        if (!isResolvedProviderName(providerName)) continue;
+        if (!value || typeof value !== "object") {
+          return c.json({ error: `${providerName} 配置格式错误` }, 400);
+        }
+
+        const nextConfig: ProviderPathConfig = {};
+
+        if ("storagePath" in value) {
+          nextConfig.storagePath = normalizeOptionalPathInput(value.storagePath);
+        }
+
+        if ("stateDbPath" in value) {
+          if (providerName !== "codex" && value.stateDbPath !== null && value.stateDbPath !== undefined) {
+            return c.json({ error: `${providerName} 不支持 state db 路径配置` }, 400);
+          }
+          nextConfig.stateDbPath = normalizeOptionalPathInput(value.stateDbPath);
+        }
+
+        updates[providerName] = nextConfig;
+      }
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
+    }
+
+    await updateProviderConfigs(updates);
+
+    return c.json({
+      configPath: getProviderConfigPath(),
+      providers: buildProviderPathSettings(providers),
+    });
+  });
+
   // 对话列表
   app.get("/conversations", async (c) => {
     const providerFilter = c.req.query("provider");
     const search = c.req.query("search")?.toLowerCase();
     const sort = c.req.query("sort") || "updatedAt";
     const modelProviderFilter = c.req.query("modelProvider");
+    const requireSearchReady = !!search;
 
     let activeProviders = providers;
     if (providerFilter !== undefined) {
@@ -39,56 +142,81 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         : [];
     }
 
-    const allConversations: ConversationMeta[] = [];
     const customTitles = await getAllTitles();
+    const indexedProviderNames: string[] = [];
+    const refreshedByProvider = new Map<string, ConversationMeta[]>();
+    const parsedModelProviders = modelProviderFilter !== undefined
+      ? modelProviderFilter.split(",").map((name) => name.trim()).filter(Boolean)
+      : undefined;
+
     for (const provider of activeProviders) {
       try {
         if (!(await provider.detect())) continue;
-        const convos = await provider.list();
-        allConversations.push(
-          ...convos.map((conv) => ({
-            ...conv,
-            title: customTitles[conv.id] ?? conv.title,
-          }))
-        );
+        const cacheKey = getProviderListCacheKey(provider);
+        if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady })) {
+          indexedProviderNames.push(provider.name);
+          continue;
+        }
+
+        const refreshedItems = await provider.list({ eagerSearchIndex: requireSearchReady });
+        if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady })) {
+          indexedProviderNames.push(provider.name);
+        } else {
+          refreshedByProvider.set(provider.name, refreshedItems);
+        }
       } catch (error) {
         logProviderError("conversations.list", provider.name, error);
       }
     }
 
-    let filtered = allConversations;
+    const indexedConversations = queryConversationIndex({
+      providers: indexedProviderNames,
+      search,
+      sort: sort === "createdAt" || sort === "provider" ? sort : "updatedAt",
+      modelProviders: parsedModelProviders,
+    });
 
-    // 按 modelProvider 筛选（仅 Codex）
+    const indexedProviderSet = new Set(indexedProviderNames);
+    let filteredRefreshed = [...refreshedByProvider.entries()].flatMap(([providerName, items]) => {
+      if (indexedProviderSet.has(providerName)) {
+        return [];
+      }
+      return items;
+    });
+
     if (modelProviderFilter !== undefined) {
-      const mpSet = new Set(
-        modelProviderFilter
-          .split(",")
-          .map((name) => name.trim())
-          .filter(Boolean)
-      );
-      filtered = filtered.filter((c) => {
-        if (c.provider !== "codex") return true;
-        if (!c.modelProvider) return true;
-        return mpSet.has(c.modelProvider);
-      });
+      if (parsedModelProviders && parsedModelProviders.length > 0) {
+        const mpSet = new Set(parsedModelProviders);
+        filteredRefreshed = filteredRefreshed.filter((item) => {
+          if (item.provider !== "codex") return true;
+          if (!item.modelProvider) return true;
+          return mpSet.has(item.modelProvider);
+        });
+      } else {
+        filteredRefreshed = filteredRefreshed.filter((item) => item.provider !== "codex" || !item.modelProvider);
+      }
     }
 
     if (search) {
-      filtered = filtered.filter(
-        (c) =>
-          c.title.toLowerCase().includes(search) ||
-          c.project.toLowerCase().includes(search)
+      filteredRefreshed = filteredRefreshed.filter(
+        (item) =>
+          item.title.toLowerCase().includes(search) ||
+          item.project.toLowerCase().includes(search)
       );
     }
 
-    // 排序
-    if (sort === "createdAt") {
-      filtered.sort((a, b) => b.createdAt - a.createdAt);
-    } else if (sort === "provider") {
-      filtered.sort((a, b) => a.provider.localeCompare(b.provider));
-    } else {
-      filtered.sort((a, b) => b.updatedAt - a.updatedAt);
-    }
+    const filtered = [...indexedConversations, ...filteredRefreshed]
+      .map((conv) => ({
+        ...conv,
+        title: customTitles[conv.id] ?? conv.title,
+      }))
+      .sort((a, b) => {
+        if (sort === "createdAt") return b.createdAt - a.createdAt;
+        if (sort === "provider") {
+          return a.provider.localeCompare(b.provider) || b.updatedAt - a.updatedAt;
+        }
+        return b.updatedAt - a.updatedAt;
+      });
 
     return c.json({
       total: filtered.length,
@@ -117,7 +245,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       if (customTitle) conversation.title = customTitle;
       return c.json(conversation);
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 404);
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
   });
 
@@ -133,7 +261,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       await deleteTitle(id);
       return c.json({ success: true });
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 500);
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
   });
 
@@ -161,7 +289,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       await setTitle(id, result.title);
       return c.json({ success: true, title: result.title, usedCli: result.usedCli });
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 500);
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
   });
 
@@ -180,7 +308,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       await provider.move(id, body.targetProjectKey.trim());
       return c.json({ success: true });
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 500);
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
   });
 
@@ -240,7 +368,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       await codex.changeModelProvider(id, body.modelProvider.trim());
       return c.json({ success: true });
     } catch (e) {
-      return c.json({ error: (e as Error).message }, 500);
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
   });
 

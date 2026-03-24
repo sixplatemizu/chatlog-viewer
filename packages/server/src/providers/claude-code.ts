@@ -1,15 +1,25 @@
-import { homedir } from "os";
 import { join } from "path";
 import { stat, readdir, unlink, rename, mkdir } from "fs/promises";
 import { glob } from "glob";
-import { parseJsonl, parseJsonlHead, parseJsonlTail, countLines } from "../utils/jsonl.js";
-import { getCached, getListCache, setCache, setListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import {
+  parseJsonl,
+  parseJsonlHead,
+  parseJsonlTail,
+  parseJsonlWindow,
+  countLines,
+  getAdaptiveSearchWindowOptions,
+} from "../utils/jsonl.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import { logProviderError } from "../utils/logger.js";
+import { getProviderPaths } from "../utils/provider-paths.js";
+import { buildConversationSearchText } from "../utils/search-index.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
   Message,
   ConversationReadOptions,
+  ConversationListOptions,
 } from "./types.js";
 
 interface ClaudeCodeEntry {
@@ -60,20 +70,7 @@ function normalizePath(p: string): string {
 }
 
 function getListCacheKey(providerName: string, storagePath: string): string {
-  return `${providerName}::${storagePath}`;
-}
-
-async function buildListSignature(files: string[]): Promise<string> {
-  let mtimeSum = 0;
-  for (const file of files) {
-    try {
-      const fileStat = await stat(file);
-      mtimeSum += fileStat.mtimeMs;
-    } catch {
-      // 忽略单文件异常，签名仍然变化
-    }
-  }
-  return `${files.length}:${mtimeSum}`;
+  return `${providerName}::${storagePath}::indexed`;
 }
 
 function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
@@ -132,9 +129,10 @@ function buildMessages(entries: ClaudeCodeEntry[]): Message[] {
 export class ClaudeCodeProvider implements ConversationProvider {
   name = "claude-code";
   displayName = "Claude Code";
+  private backgroundRefreshes = new Map<string, Promise<void>>();
 
   getStoragePath(): string {
-    return join(homedir(), ".claude", "projects");
+    return getProviderPaths("claude-code").storagePath;
   }
 
   async detect(): Promise<boolean> {
@@ -146,32 +144,110 @@ export class ClaudeCodeProvider implements ConversationProvider {
     }
   }
 
-  async list(): Promise<ConversationMeta[]> {
+  async list(options: ConversationListOptions = {}): Promise<ConversationMeta[]> {
+    return this.listInternal({
+      eagerSearchIndex: options.eagerSearchIndex ?? false,
+      allowBackground: true,
+    });
+  }
+
+  private scheduleBackgroundIndexRefresh(): void {
+    const cacheKey = getListCacheKey(this.name, this.getStoragePath());
+    if (this.backgroundRefreshes.has(cacheKey)) {
+      return;
+    }
+
+    const task = this.listInternal({
+      eagerSearchIndex: true,
+      allowBackground: false,
+    })
+      .then(() => undefined)
+      .catch((error) => {
+        logProviderError("conversations.index.background", this.name, error);
+      })
+      .finally(() => {
+        this.backgroundRefreshes.delete(cacheKey);
+      });
+
+    this.backgroundRefreshes.set(cacheKey, task);
+  }
+
+  private async listInternal(options: {
+    eagerSearchIndex: boolean;
+    allowBackground: boolean;
+  }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
-    const pattern = join(basePath, "*", "*.jsonl").replace(/\\/g, "/");
-    const files = await glob(pattern);
     const cacheKey = getListCacheKey(this.name, basePath);
-    const signature = await buildListSignature(files);
-    const cachedList = getListCache(cacheKey, signature);
+    const cachedList = getIndexedListCache(cacheKey, undefined, {
+      requireSearchReady: options.eagerSearchIndex,
+    });
     if (cachedList) {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    // 并发提取元数据（限制并发数）
-    const results: ConversationMeta[] = [];
+    const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
+    const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
+    const pattern = join(basePath, "*", "*.jsonl").replace(/\\/g, "/");
+    const files = await glob(pattern);
+
+    const results: Array<{ meta: ConversationMeta; searchText?: string }> = [];
+    const filesToRefresh: string[] = [];
+
+    for (const filePath of files) {
+      const previousMeta = previousByFilePath.get(filePath);
+      if (!previousMeta) {
+        filesToRefresh.push(filePath);
+        continue;
+      }
+
+      try {
+        const fileStat = await stat(filePath);
+        if (fileStat.mtimeMs === previousMeta.meta.updatedAt && previousMeta.searchText !== undefined) {
+          setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
+          results.push(previousMeta);
+        } else {
+          filesToRefresh.push(filePath);
+        }
+      } catch {
+        filesToRefresh.push(filePath);
+      }
+    }
+
     const batchSize = 20;
-    for (let i = 0; i < files.length; i += batchSize) {
-      const batch = files.slice(i, i + batchSize);
+    for (let i = 0; i < filesToRefresh.length; i += batchSize) {
+      const batch = filesToRefresh.slice(i, i + batchSize);
       const metas = await Promise.all(
-        batch.map((f) => this.extractMeta(f).catch(() => null))
+        batch.map(async (f) => {
+          const meta = await this.extractMeta(f);
+          if (!meta) return null;
+          if (!options.eagerSearchIndex) {
+            return { meta };
+          }
+          const searchText = await this.extractSearchText(f);
+          return { meta, searchText };
+        })
       );
       for (const m of metas) {
         if (m) results.push(m);
       }
     }
 
-    setListCache(cacheKey, signature, results);
-    return results.sort((a, b) => b.updatedAt - a.updatedAt);
+    const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
+    setIndexedListCache(cacheKey, results, { searchReady });
+
+    if (!searchReady && options.allowBackground) {
+      this.scheduleBackgroundIndexRefresh();
+    }
+
+    return results.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  private async extractSearchText(filePath: string): Promise<string | undefined> {
+    const fileStat = await stat(filePath);
+    const entries = fileStat.size > 512 * 1024
+      ? await parseJsonlWindow<ClaudeCodeEntry>(filePath, getAdaptiveSearchWindowOptions(fileStat.size))
+      : await parseJsonl<ClaudeCodeEntry>(filePath);
+    return buildConversationSearchText(buildMessages(entries));
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {

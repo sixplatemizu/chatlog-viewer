@@ -1,17 +1,27 @@
-import { homedir } from "os";
 import { join } from "path";
 import { stat, unlink, readFile, writeFile } from "fs/promises";
 import { createRequire } from "module";
 import { glob } from "glob";
 import type BetterSqlite3 from "better-sqlite3";
-import { parseJsonl, parseJsonlHead, parseJsonlTail, countLines } from "../utils/jsonl.js";
-import { getCached, getListCache, setCache, setListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import {
+  parseJsonl,
+  parseJsonlHead,
+  parseJsonlTail,
+  parseJsonlWindow,
+  countLines,
+  getAdaptiveSearchWindowOptions,
+} from "../utils/jsonl.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import { logProviderError } from "../utils/logger.js";
+import { getProviderPaths } from "../utils/provider-paths.js";
+import { buildConversationSearchText } from "../utils/search-index.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
   Message,
   ConversationReadOptions,
+  ConversationListOptions,
 } from "./types.js";
 
 const require = createRequire(import.meta.url);
@@ -40,6 +50,16 @@ function extractContent(content: Array<{ type: string; text?: string }>): string
     .join("\n");
 }
 
+function normalizePath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
+}
+
+function canonicalizeProjectPath(value: string): string {
+  const normalized = normalizePath(value);
+  if (!normalized) return "";
+  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
 function buildMessages(entries: CodexEntry[]): Message[] {
   const messages: Message[] = [];
 
@@ -66,20 +86,7 @@ function buildMessages(entries: CodexEntry[]): Message[] {
 }
 
 function getListCacheKey(providerName: string, storagePath: string): string {
-  return `${providerName}::${storagePath}`;
-}
-
-async function buildListSignature(files: string[]): Promise<string> {
-  let mtimeSum = 0;
-  for (const file of files) {
-    try {
-      const fileStat = await stat(file);
-      mtimeSum += fileStat.mtimeMs;
-    } catch {
-      // 忽略单文件异常，签名仍然变化
-    }
-  }
-  return `${files.length}:${mtimeSum}`;
+  return `${providerName}::${storagePath}::indexed`;
 }
 
 function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
@@ -103,14 +110,28 @@ export class CodexProvider implements ConversationProvider {
   displayName = "Codex";
 
   private db: BetterSqlite3.Database | null = null;
+  private dbPath: string | null = null;
+  private backgroundRefreshes = new Map<string, Promise<void>>();
+
+  private getStateDbPath(): string {
+    return getProviderPaths("codex").stateDbPath || join(this.getStoragePath(), "..", "state_5.sqlite");
+  }
 
   private getDb(): BetterSqlite3.Database | null {
-    if (this.db) return this.db;
+    const dbPath = this.getStateDbPath();
+    if (this.db && this.dbPath === dbPath) return this.db;
+
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+
     try {
-      const dbPath = join(homedir(), ".codex", "state_5.sqlite");
       this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
+      this.dbPath = dbPath;
       return this.db;
     } catch {
+      this.dbPath = null;
       return null;
     }
   }
@@ -128,7 +149,7 @@ export class CodexProvider implements ConversationProvider {
   }
 
   getStoragePath(): string {
-    return join(homedir(), ".codex", "sessions");
+    return getProviderPaths("codex").storagePath;
   }
 
   async detect(): Promise<boolean> {
@@ -140,31 +161,110 @@ export class CodexProvider implements ConversationProvider {
     }
   }
 
-  async list(): Promise<ConversationMeta[]> {
+  async list(options: ConversationListOptions = {}): Promise<ConversationMeta[]> {
+    return this.listInternal({
+      eagerSearchIndex: options.eagerSearchIndex ?? false,
+      allowBackground: true,
+    });
+  }
+
+  private scheduleBackgroundIndexRefresh(): void {
+    const cacheKey = getListCacheKey(this.name, this.getStoragePath());
+    if (this.backgroundRefreshes.has(cacheKey)) {
+      return;
+    }
+
+    const task = this.listInternal({
+      eagerSearchIndex: true,
+      allowBackground: false,
+    })
+      .then(() => undefined)
+      .catch((error) => {
+        logProviderError("conversations.index.background", this.name, error);
+      })
+      .finally(() => {
+        this.backgroundRefreshes.delete(cacheKey);
+      });
+
+    this.backgroundRefreshes.set(cacheKey, task);
+  }
+
+  private async listInternal(options: {
+    eagerSearchIndex: boolean;
+    allowBackground: boolean;
+  }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
-    const pattern = join(basePath, "**", "*.jsonl").replace(/\\/g, "/");
-    const files = await glob(pattern);
     const cacheKey = getListCacheKey(this.name, basePath);
-    const signature = await buildListSignature(files);
-    const cachedList = getListCache(cacheKey, signature);
+    const cachedList = getIndexedListCache(cacheKey, undefined, {
+      requireSearchReady: options.eagerSearchIndex,
+    });
     if (cachedList) {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    const results: ConversationMeta[] = [];
+    const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
+    const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
+    const pattern = join(basePath, "**", "*.jsonl").replace(/\\/g, "/");
+    const files = await glob(pattern);
+
+    const results: Array<{ meta: ConversationMeta; searchText?: string }> = [];
+    const filesToRefresh: string[] = [];
+
+    for (const filePath of files) {
+      const previousMeta = previousByFilePath.get(filePath);
+      if (!previousMeta) {
+        filesToRefresh.push(filePath);
+        continue;
+      }
+
+      try {
+        const fileStat = await stat(filePath);
+        if (fileStat.mtimeMs === previousMeta.meta.updatedAt && previousMeta.searchText !== undefined) {
+          setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
+          results.push(previousMeta);
+        } else {
+          filesToRefresh.push(filePath);
+        }
+      } catch {
+        filesToRefresh.push(filePath);
+      }
+    }
+
     const batchSize = 20;
-    for (let i = 0; i < files.length; i += batchSize) {
-      const batch = files.slice(i, i + batchSize);
+    for (let i = 0; i < filesToRefresh.length; i += batchSize) {
+      const batch = filesToRefresh.slice(i, i + batchSize);
       const metas = await Promise.all(
-        batch.map((f) => this.extractMeta(f).catch(() => null))
+        batch.map(async (f) => {
+          const meta = await this.extractMeta(f);
+          if (!meta) return null;
+          if (!options.eagerSearchIndex) {
+            return { meta };
+          }
+          const searchText = await this.extractSearchText(f);
+          return { meta, searchText };
+        })
       );
       for (const m of metas) {
         if (m) results.push(m);
       }
     }
 
-    setListCache(cacheKey, signature, results);
-    return results.sort((a, b) => b.updatedAt - a.updatedAt);
+    const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
+    setIndexedListCache(cacheKey, results, { searchReady });
+
+    if (!searchReady && options.allowBackground) {
+      this.scheduleBackgroundIndexRefresh();
+    }
+
+    return results.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  private async extractSearchText(filePath: string): Promise<string | undefined> {
+    const fileStat = await stat(filePath);
+    const entries = fileStat.size > 512 * 1024
+      ? await parseJsonlWindow<CodexEntry>(filePath, getAdaptiveSearchWindowOptions(fileStat.size))
+      : await parseJsonl<CodexEntry>(filePath);
+    return buildConversationSearchText(buildMessages(entries));
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {
@@ -191,7 +291,7 @@ export class CodexProvider implements ConversationProvider {
     if (messageCount === 0 && userMessages.length === 0) return null;
 
     const firstTs = new Date(headEntries[0].timestamp).getTime();
-    const normalizedCwd = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+    const normalizedCwd = canonicalizeProjectPath(cwd);
 
     // 从 SQLite 查询 model_provider
     const modelProvider = this.getModelProvider(sessionId);
@@ -298,7 +398,7 @@ export class CodexProvider implements ConversationProvider {
         const head = await parseJsonlHead<CodexEntry>(filePath, 5);
         const meta = head.find((e) => e.type === "session_meta");
         const cwd = meta?.payload?.cwd;
-        if (cwd) cwds.add(cwd.replace(/\\/g, "/").replace(/\/+$/, ""));
+        if (cwd) cwds.add(canonicalizeProjectPath(cwd));
       } catch {
         // 跳过
       }
@@ -321,7 +421,12 @@ export class CodexProvider implements ConversationProvider {
   // 修改对话的 model_provider
   async changeModelProvider(id: string, newProvider: string): Promise<void> {
     const sessionId = id.replace("codex:", "");
-    const dbPath = join(homedir(), ".codex", "state_5.sqlite");
+    const dbPath = this.getStateDbPath();
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+      this.dbPath = null;
+    }
     // 写操作需要新开一个可写连接
     const db = new Database(dbPath);
     try {

@@ -7,8 +7,6 @@ import { createExportRoutes } from "./routes/export.js";
 import { ClaudeCodeProvider } from "./providers/claude-code.js";
 import { CodexProvider } from "./providers/codex.js";
 import { IFlowProvider } from "./providers/iflow.js";
-import { GeminiProvider } from "./providers/gemini-cli.js";
-import { OpenCodeProvider } from "./providers/opencode.js";
 
 const app = new Hono();
 
@@ -20,8 +18,6 @@ const providers = [
   new ClaudeCodeProvider(),
   new CodexProvider(),
   new IFlowProvider(),
-  new GeminiProvider(),
-  new OpenCodeProvider(),
 ];
 
 // 挂载路由

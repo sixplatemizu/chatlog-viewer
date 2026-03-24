@@ -48,10 +48,10 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function requestBlob(url: string, init?: RequestInit): Promise<Blob> {
+async function requestBlob(url: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(url, init);
   if (!res.ok) throw await createApiError(res);
-  return res.blob();
+  return res;
 }
 
 export function getErrorMessage(error: unknown, fallback = "请求失败"): string {
@@ -69,6 +69,26 @@ export interface ProviderInfo {
   displayName: string;
   available: boolean;
   storagePath: string;
+}
+
+export type ProviderPathSource = "env" | "config" | "auto" | "default";
+
+export interface ProviderPathInfo {
+  name: string;
+  displayName: string;
+  configuredStoragePath?: string;
+  configuredStateDbPath?: string;
+  storagePath: string;
+  storageExists: boolean;
+  storageSource: ProviderPathSource;
+  stateDbPath?: string;
+  stateDbExists?: boolean;
+  stateDbSource?: ProviderPathSource;
+}
+
+export interface ProviderPathSettings {
+  configPath: string;
+  providers: ProviderPathInfo[];
 }
 
 export interface ConversationMeta {
@@ -101,6 +121,20 @@ export interface Conversation extends ConversationMeta {
 
 export async function fetchProviders(signal?: AbortSignal): Promise<ProviderInfo[]> {
   return requestJson<ProviderInfo[]>(`${BASE}/providers`, { signal });
+}
+
+export async function fetchProviderPathSettings(signal?: AbortSignal): Promise<ProviderPathSettings> {
+  return requestJson<ProviderPathSettings>(`${BASE}/settings/provider-paths`, { signal });
+}
+
+export async function updateProviderPathSettings(payload: {
+  providers: Record<string, { storagePath?: string | null; stateDbPath?: string | null }>;
+}): Promise<ProviderPathSettings> {
+  return requestJson<ProviderPathSettings>(`${BASE}/settings/provider-paths`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function fetchConversations(params: {
@@ -145,15 +179,49 @@ export async function deleteConversation(id: string): Promise<void> {
   });
 }
 
+export interface ExportFailure {
+  id: string;
+  error: string;
+}
+
+export interface ExportMeta {
+  requested: number;
+  exported: number;
+  failed: number;
+  failures: ExportFailure[];
+}
+
+export interface ExportResult {
+  blob: Blob;
+  meta?: ExportMeta;
+}
+
 export async function exportConversations(
   ids: string[],
   format: "json" | "markdown"
-): Promise<Blob> {
-  return requestBlob(`${BASE}/export`, {
+): Promise<ExportResult> {
+  const res = await requestBlob(`${BASE}/export`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids, format }),
   });
+
+  const blob = await res.blob();
+  const metaHeader = res.headers.get("X-Export-Meta");
+  let meta: ExportMeta | undefined;
+
+  if (metaHeader) {
+    try {
+      const decoded = typeof atob === "function"
+        ? atob(metaHeader.replace(/-/g, "+").replace(/_/g, "/"))
+        : "";
+      meta = decoded ? JSON.parse(decoded) as ExportMeta : undefined;
+    } catch {
+      meta = undefined;
+    }
+  }
+
+  return { blob, meta };
 }
 
 export async function updateTitle(

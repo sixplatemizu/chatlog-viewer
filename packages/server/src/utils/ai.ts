@@ -70,8 +70,9 @@ function buildContext(messages: Message[], maxChars = 2000): string {
 }
 
 function extractCleanOutput(stdout: string): string {
+  const ansiEscape = String.fromCharCode(27);
   let clean = stdout.replace(/<Execution Info>[\s\S]*/m, "").trim();
-  clean = clean.replace(/\x1b\[[0-9;]*m/g, "");
+  clean = clean.replace(new RegExp(`${ansiEscape}\\[[0-9;]*m`, "g"), "");
   clean = clean.replace(/^["'「]|["'」]$/g, "");
   const firstLine = clean.split("\n")[0]?.trim() || clean;
   return firstLine;
@@ -122,7 +123,11 @@ export async function generateTitle(messages: Message[]): Promise<{
       }
     }
   } finally {
-    try { await unlink(promptFile); } catch {}
+    try {
+      await unlink(promptFile);
+    } catch {
+      void 0;
+    }
   }
 
   throw new Error("所有 AI CLI 工具均未能生成有效标题");
