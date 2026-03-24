@@ -7,14 +7,18 @@ import {
   parseJsonl,
   parseJsonlHead,
   parseJsonlTail,
-  parseJsonlWindow,
   countLines,
-  getAdaptiveSearchWindowOptions,
+  visitJsonl,
 } from "../utils/jsonl.js";
-import { getCached, getIndexedCacheSnapshot, getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
-import { buildConversationSearchText } from "../utils/search-index.js";
+import { collectIndexedCacheItemsInBatches } from "../utils/provider-indexing.js";
+import {
+  createConversationSearchIndexBuilder,
+  type ConversationSearchIndex,
+  type ConversationSearchIndexBuilder,
+} from "../utils/search-index.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -83,6 +87,28 @@ function buildMessages(entries: CodexEntry[]): Message[] {
   }
 
   return messages;
+}
+
+function appendSearchIndexEntry(
+  builder: ConversationSearchIndexBuilder,
+  entry: CodexEntry
+): void {
+  if (entry.type !== "response_item" || !entry.payload?.role) return;
+
+  const role = entry.payload.role as "user" | "assistant";
+  if (role !== "user" && role !== "assistant") return;
+
+  const content = entry.payload.content
+    ? extractContent(entry.payload.content)
+    : "";
+  if (content.includes("<environment_context>")) return;
+  if (!content.trim()) return;
+
+  builder.addMessage({
+    role,
+    content,
+    timestamp: new Date(entry.timestamp).getTime(),
+  });
 }
 
 function getListCacheKey(providerName: string, storagePath: string): string {
@@ -207,7 +233,7 @@ export class CodexProvider implements ConversationProvider {
     const pattern = join(basePath, "**", "*.jsonl").replace(/\\/g, "/");
     const files = await glob(pattern);
 
-    const results: Array<{ meta: ConversationMeta; searchText?: string }> = [];
+    const results: IndexedCacheItem[] = [];
     const filesToRefresh: string[] = [];
 
     for (const filePath of files) {
@@ -219,7 +245,10 @@ export class CodexProvider implements ConversationProvider {
 
       try {
         const fileStat = await stat(filePath);
-        if (fileStat.mtimeMs === previousMeta.meta.updatedAt && previousMeta.searchText !== undefined) {
+        if (
+          fileStat.mtimeMs === previousMeta.meta.updatedAt
+          && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
+        ) {
           setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
           results.push(previousMeta);
         } else {
@@ -230,24 +259,17 @@ export class CodexProvider implements ConversationProvider {
       }
     }
 
-    const batchSize = 20;
-    for (let i = 0; i < filesToRefresh.length; i += batchSize) {
-      const batch = filesToRefresh.slice(i, i + batchSize);
-      const metas = await Promise.all(
-        batch.map(async (f) => {
-          const meta = await this.extractMeta(f);
-          if (!meta) return null;
-          if (!options.eagerSearchIndex) {
-            return { meta };
-          }
-          const searchText = await this.extractSearchText(f);
-          return { meta, searchText };
-        })
-      );
-      for (const m of metas) {
-        if (m) results.push(m);
+    results.push(...await collectIndexedCacheItemsInBatches(filesToRefresh, 20, async (filePath) => {
+      const meta = await this.extractMeta(filePath);
+      if (!meta) return null;
+      if (!options.eagerSearchIndex) {
+        return { meta };
       }
-    }
+      return {
+        meta,
+        ...(await this.extractSearchIndex(filePath)),
+      };
+    }));
 
     const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
     setIndexedListCache(cacheKey, results, { searchReady });
@@ -259,12 +281,12 @@ export class CodexProvider implements ConversationProvider {
     return results.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  private async extractSearchText(filePath: string): Promise<string | undefined> {
-    const fileStat = await stat(filePath);
-    const entries = fileStat.size > 512 * 1024
-      ? await parseJsonlWindow<CodexEntry>(filePath, getAdaptiveSearchWindowOptions(fileStat.size))
-      : await parseJsonl<CodexEntry>(filePath);
-    return buildConversationSearchText(buildMessages(entries));
+  private async extractSearchIndex(filePath: string): Promise<ConversationSearchIndex> {
+    const builder = createConversationSearchIndexBuilder();
+    await visitJsonl<CodexEntry>(filePath, (entry) => {
+      appendSearchIndexEntry(builder, entry);
+    });
+    return builder.build();
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {

@@ -8,6 +8,7 @@ import {
   getAdaptiveSearchWindowOptions,
   parseJsonlTail,
   parseJsonlWindow,
+  visitJsonl,
 } from "../../utils/jsonl.js";
 
 test("parseJsonlTail 会在 bytesHint 不足时自动扩容直到读够目标消息", async () => {
@@ -110,6 +111,33 @@ test("countLines 会基于 JSON 结构匹配，避免正文中的转义片段误
     );
 
     assert.equal(counted, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("visitJsonl 会顺序遍历有效行并跳过坏行", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chatlog-viewer-jsonl-visit-"));
+  const filePath = join(dir, "visit.jsonl");
+
+  try {
+    await writeFile(
+      filePath,
+      [
+        JSON.stringify({ id: 1 }),
+        "{bad json",
+        "",
+        JSON.stringify({ id: 2 }),
+      ].join("\n"),
+      "utf8"
+    );
+
+    const visited: number[] = [];
+    await visitJsonl<{ id: number }>(filePath, async (value) => {
+      visited.push(value.id);
+    });
+
+    assert.deepEqual(visited, [1, 2]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

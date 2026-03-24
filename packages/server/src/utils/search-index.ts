@@ -1,25 +1,43 @@
 import type { Message } from "../providers/types.js";
 
+export const SEARCH_INDEX_VERSION = 3;
+
 const SEARCH_TEXT_MAX_LENGTH = 256 * 1024;
 const SEARCH_PART_MAX_LENGTH = 12 * 1024;
 const SEARCH_PART_SAMPLE_WINDOW_COUNT = 3;
 const SEARCH_PART_DISTRIBUTION_LIMIT = 48;
-const LARGE_MESSAGE_TEXT_THRESHOLD = 512 * 1024;
 const SEARCH_WINDOW_SEPARATOR = "\n\n...\n\n";
 const SEARCH_PRIORITY_RATIOS = [0, 0.5, 1, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875];
+const SEARCH_CHUNK_MAX_LENGTH = 4096;
+const SEARCH_CHUNK_OVERLAP = 256;
+
+export interface ConversationSearchIndex {
+  searchText?: string;
+  searchChunks?: string[];
+}
+
+export interface ConversationSearchIndexBuilder {
+  addMessage(message: Message): void;
+  build(): ConversationSearchIndex;
+}
+
+function appendUniqueMessagePart(parts: string[], seen: Set<string>, message: Message): void {
+  const content = message.content.trim();
+  if (!content) return;
+
+  const key = `${message.role}:${message.timestamp ?? ""}:${content}`;
+  if (seen.has(key)) return;
+
+  seen.add(key);
+  parts.push(content);
+}
 
 function collectUniqueParts(messages: Message[]): string[] {
   const seen = new Set<string>();
   const parts: string[] = [];
 
   for (const message of messages) {
-    const content = message.content.trim();
-    if (!content) continue;
-
-    const key = `${message.role}:${message.timestamp ?? ""}:${content}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    parts.push(content);
+    appendUniqueMessagePart(parts, seen, message);
   }
 
   return parts;
@@ -32,7 +50,7 @@ function clampWindowLength(text: string, maxLength: number): string {
 
   const headLength = Math.floor(maxLength / 2);
   const tailLength = maxLength - headLength;
-  return `${text.slice(0, headLength)}\n\n...\n\n${text.slice(-tailLength)}`;
+  return `${text.slice(0, headLength)}${SEARCH_WINDOW_SEPARATOR}${text.slice(-tailLength)}`;
 }
 
 function sampleTextWindows(text: string, maxLength: number, windowCount: number): string {
@@ -139,20 +157,89 @@ function buildBudgetedSearchText(parts: string[]): string {
   return clampWindowLength(selectedParts.join("\n\n").trim() || fullText, SEARCH_TEXT_MAX_LENGTH);
 }
 
-export function buildConversationSearchText(messages: Message[]): string | undefined {
-  const parts = collectUniqueParts(messages);
+function splitIntoChunks(text: string, maxLength: number, overlap: number): string[] {
+  const normalized = text.trim();
+  if (!normalized) {
+    return [];
+  }
+
+  if (normalized.length <= maxLength) {
+    return [normalized];
+  }
+
+  const chunks: string[] = [];
+  const step = Math.max(1, maxLength - overlap);
+  for (let start = 0; start < normalized.length; start += step) {
+    const chunk = normalized.slice(start, start + maxLength).trim();
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    if (start + maxLength >= normalized.length) {
+      break;
+    }
+  }
+
+  return chunks;
+}
+
+function buildConversationSearchChunksFromParts(parts: string[]): string[] {
   if (parts.length === 0) {
-    return undefined;
+    return [];
   }
 
-  const text = parts.join("\n\n").trim();
-  if (!text) {
-    return undefined;
+  const seen = new Set<string>();
+  const chunks: string[] = [];
+
+  for (const part of parts) {
+    for (const chunk of splitIntoChunks(part, SEARCH_CHUNK_MAX_LENGTH, SEARCH_CHUNK_OVERLAP)) {
+      if (seen.has(chunk)) continue;
+      seen.add(chunk);
+      chunks.push(chunk);
+    }
   }
 
-  if (text.length <= LARGE_MESSAGE_TEXT_THRESHOLD) {
-    return buildBudgetedSearchText(parts);
+  return chunks;
+}
+
+export function buildConversationSearchChunks(messages: Message[]): string[] {
+  return buildConversationSearchChunksFromParts(collectUniqueParts(messages));
+}
+
+class SearchIndexBuilderImpl implements ConversationSearchIndexBuilder {
+  private readonly seen = new Set<string>();
+  private readonly parts: string[] = [];
+
+  addMessage(message: Message): void {
+    appendUniqueMessagePart(this.parts, this.seen, message);
   }
 
-  return buildBudgetedSearchText(parts);
+  build(): ConversationSearchIndex {
+    if (this.parts.length === 0) {
+      return {};
+    }
+
+    const searchText = buildBudgetedSearchText(this.parts).trim() || undefined;
+    const searchChunks = buildConversationSearchChunksFromParts(this.parts);
+
+    return {
+      searchText,
+      searchChunks: searchChunks.length > 0 ? searchChunks : undefined,
+    };
+  }
+}
+
+export function createConversationSearchIndexBuilder(): ConversationSearchIndexBuilder {
+  return new SearchIndexBuilderImpl();
+}
+
+export function buildConversationSearchIndex(messages: Message[]): ConversationSearchIndex {
+  const builder = createConversationSearchIndexBuilder();
+  for (const message of messages) {
+    builder.addMessage(message);
+  }
+  return builder.build();
+}
+
+export function buildConversationSearchText(messages: Message[]): string | undefined {
+  return buildConversationSearchIndex(messages).searchText;
 }

@@ -6,7 +6,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "tsx --test src/**/*.test.ts",
+    "bench:search-index": "tsx src/bench/search-index.ts"
   },
   "dependencies": {
     "hono": "^4.7.5",

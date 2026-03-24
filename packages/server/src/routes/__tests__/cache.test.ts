@@ -8,6 +8,7 @@ import {
   setIndexedListCache,
   invalidateListCache,
 } from "../../utils/cache.js";
+import { SEARCH_INDEX_VERSION } from "../../utils/search-index.js";
 import type { ConversationMeta } from "../../providers/types.js";
 
 function createConversationMeta(id: string): ConversationMeta {
@@ -70,6 +71,22 @@ test("conversation index 支持按消息内容搜索", () => {
   invalidateListCache(cacheKey);
 });
 
+test("indexed cache snapshot 会保留并读回 searchChunks", () => {
+  const cacheKey = `test-index-chunks-${Date.now()}`;
+
+  setIndexedListCache(cacheKey, [{
+    meta: createConversationMeta("codex:chunks"),
+    searchText: "摘要文本",
+    searchChunks: ["chunk-1", "chunk-2"],
+  }]);
+
+  const snapshot = getIndexedCacheSnapshot(cacheKey);
+
+  assert.deepEqual(snapshot?.[0]?.searchChunks, ["chunk-1", "chunk-2"]);
+
+  invalidateListCache(cacheKey);
+});
+
 test("conversation index 仅返回当前 cacheKey 的结果，避免旧路径索引串入", () => {
   const oldCacheKey = `test-index-old-${Date.now()}`;
   const newCacheKey = `test-index-new-${Date.now()}`;
@@ -112,6 +129,29 @@ test("短词搜索会回退到 FTS LIKE 查询并保持可命中", () => {
   invalidateListCache(cacheKey);
 });
 
+test("conversation index 可以仅依赖 searchChunks 命中深层消息内容", () => {
+  const cacheKey = `test-index-chunk-search-${Date.now()}`;
+  const needle = `deep-needle-${Date.now()}`;
+
+  setIndexedListCache(cacheKey, [{
+    meta: createConversationMeta("codex:chunk-only"),
+    searchText: "only summary text",
+    searchChunks: [
+      `head-${Date.now()}`,
+      `${"x".repeat(8_000)}${needle}${"y".repeat(8_000)}`,
+    ],
+  }]);
+
+  const matched = queryConversationIndex({
+    cacheKeys: [cacheKey],
+    search: needle,
+  });
+
+  assert.equal(matched.some((item) => item.id === "codex:chunk-only"), true);
+
+  invalidateListCache(cacheKey);
+});
+
 test("partial indexed list cache 在需要完整搜索索引时不会命中", () => {
   const cacheKey = `test-index-partial-${Date.now()}`;
   const items = [createConversationMeta("codex:4")];
@@ -121,6 +161,28 @@ test("partial indexed list cache 在需要完整搜索索引时不会命中", ()
   assert.deepEqual(getIndexedListCache(cacheKey, 60_000), items);
   assert.equal(getIndexedListCache(cacheKey, 60_000, { requireSearchReady: true }), null);
   assert.equal(hasFreshIndexedListCache(cacheKey, 60_000, { requireSearchReady: true }), false);
+
+  invalidateListCache(cacheKey);
+});
+
+test("旧版本搜索索引不会被当成当前可搜索缓存", () => {
+  const cacheKey = `test-index-version-${Date.now()}`;
+  const needle = `legacy-needle-${Date.now()}`;
+
+  setIndexedListCache(cacheKey, [{
+    meta: createConversationMeta("codex:legacy"),
+    searchText: needle,
+  }], {
+    searchVersion: SEARCH_INDEX_VERSION - 1,
+  });
+
+  assert.deepEqual(getIndexedListCache(cacheKey, 60_000), [createConversationMeta("codex:legacy")]);
+  assert.equal(getIndexedListCache(cacheKey, 60_000, { requireSearchReady: true }), null);
+  assert.equal(hasFreshIndexedListCache(cacheKey, 60_000, { requireSearchReady: true }), false);
+  assert.deepEqual(queryConversationIndex({
+    cacheKeys: [cacheKey],
+    search: needle,
+  }), []);
 
   invalidateListCache(cacheKey);
 });

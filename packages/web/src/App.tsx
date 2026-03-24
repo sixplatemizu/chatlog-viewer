@@ -99,17 +99,29 @@ export default function App() {
   }, [selectedIds]);
 
   const handleExportConfirm = useCallback(
-    async (format: "json" | "markdown") => {
+    async (format: "json" | "markdown", mode: "full" | "partial") => {
       if (exportIds.length === 0) return;
       try {
-        const { blob, meta } = await exportConversations(exportIds, format);
+        const { blob, meta } = await exportConversations(exportIds, format, mode);
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = `chatlog-export-${exportIds.length === 1 ? "1" : exportIds.length + "条"}.${format === "markdown" ? "md" : "json"}`;
+        const exportKind = mode === "partial" ? "partial" : "full";
+        a.download = `chatlog-export-${exportKind}-${exportIds.length === 1 ? "1" : exportIds.length + "条"}.${format === "markdown" ? "md" : "json"}`;
         a.click();
         URL.revokeObjectURL(url);
         setExportOpen(false);
+
+        if (meta?.mode === "partial") {
+          pushToast({
+            variant: meta.truncated > 0 ? "warning" : "info",
+            title: `已完成 partial export：${meta.exported} 条`,
+            description: meta.truncated > 0
+              ? `仅导出最近 ${meta.messageLimit ?? 500} 条消息，其中 ${meta.truncated} 条对话被截断。`
+              : `仅导出最近 ${meta.messageLimit ?? 500} 条消息，本次没有对话发生截断。`,
+            duration: 7000,
+          });
+        }
 
         if (meta && meta.failed > 0) {
           const failurePreview = meta.failures
@@ -382,6 +394,7 @@ export default function App() {
       <ExportDialog
         open={exportOpen}
         onClose={() => setExportOpen(false)}
+        count={exportIds.length}
         onConfirm={handleExportConfirm}
       />
 

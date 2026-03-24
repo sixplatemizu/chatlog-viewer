@@ -29,9 +29,10 @@ export interface ParseJsonlTailOptions<T> {
   isEnough?: (items: T[], context: ParseJsonlTailContext) => boolean;
 }
 
-// 全量解析 JSONL（仅用于 read 详情时）
-export async function parseJsonl<T = unknown>(filePath: string): Promise<T[]> {
-  const results: T[] = [];
+export async function visitJsonl<T = unknown>(
+  filePath: string,
+  visitor: (value: T) => void | Promise<void>
+): Promise<void> {
   const rl = createInterface({
     input: createReadStream(filePath, { encoding: "utf-8" }),
     crlfDelay: Infinity,
@@ -40,12 +41,24 @@ export async function parseJsonl<T = unknown>(filePath: string): Promise<T[]> {
   for await (const line of rl) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+
+    let value: T;
     try {
-      results.push(JSON.parse(trimmed) as T);
+      value = JSON.parse(trimmed) as T;
     } catch {
-      // 跳过无法解析的行
+      continue;
     }
+
+    await visitor(value);
   }
+}
+
+// 全量解析 JSONL（仅用于 read 详情时）
+export async function parseJsonl<T = unknown>(filePath: string): Promise<T[]> {
+  const results: T[] = [];
+  await visitJsonl<T>(filePath, (value) => {
+    results.push(value);
+  });
   return results;
 }
 

@@ -5,14 +5,18 @@ import {
   parseJsonl,
   parseJsonlHead,
   parseJsonlTail,
-  parseJsonlWindow,
   countLines,
-  getAdaptiveSearchWindowOptions,
+  visitJsonl,
 } from "../utils/jsonl.js";
-import { getCached, getIndexedCacheSnapshot, getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache } from "../utils/cache.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
-import { buildConversationSearchText } from "../utils/search-index.js";
+import { collectIndexedCacheItemsInBatches } from "../utils/provider-indexing.js";
+import {
+  createConversationSearchIndexBuilder,
+  type ConversationSearchIndex,
+  type ConversationSearchIndexBuilder,
+} from "../utils/search-index.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -131,6 +135,36 @@ function buildMessages(entries: IFlowEntry[]): Message[] {
   return messages;
 }
 
+function appendSearchIndexEntry(
+  builder: ConversationSearchIndexBuilder,
+  entry: IFlowEntry
+): void {
+  if (entry.isSidechain || !entry.message) return;
+
+  if (entry.type === "user") {
+    const text = extractTextContent(entry.message.content);
+    if (!text.trim()) return;
+
+    builder.addMessage({
+      role: "user",
+      content: text,
+      timestamp: new Date(entry.timestamp).getTime(),
+    });
+    return;
+  }
+
+  if (entry.type === "assistant") {
+    const text = extractTextContent(entry.message.content);
+    if (!text.trim()) return;
+
+    builder.addMessage({
+      role: "assistant",
+      content: text,
+      timestamp: new Date(entry.timestamp).getTime(),
+    });
+  }
+}
+
 export class IFlowProvider implements ConversationProvider {
   name = "iflow";
   displayName = "iFlow CLI";
@@ -195,7 +229,7 @@ export class IFlowProvider implements ConversationProvider {
     const pattern = join(basePath, "*", "session-*.jsonl").replace(/\\/g, "/");
     const files = await glob(pattern);
 
-    const results: Array<{ meta: ConversationMeta; searchText?: string }> = [];
+    const results: IndexedCacheItem[] = [];
     const filesToRefresh: string[] = [];
 
     for (const filePath of files) {
@@ -207,7 +241,10 @@ export class IFlowProvider implements ConversationProvider {
 
       try {
         const fileStat = await stat(filePath);
-        if (fileStat.mtimeMs === previousMeta.meta.updatedAt && previousMeta.searchText !== undefined) {
+        if (
+          fileStat.mtimeMs === previousMeta.meta.updatedAt
+          && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
+        ) {
           setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
           results.push(previousMeta);
         } else {
@@ -218,20 +255,17 @@ export class IFlowProvider implements ConversationProvider {
       }
     }
 
-    const metas = await Promise.all(
-      filesToRefresh.map(async (f) => {
-        const meta = await this.extractMeta(f);
-        if (!meta) return null;
-        if (!options.eagerSearchIndex) {
-          return { meta };
-        }
-        const searchText = await this.extractSearchText(f);
-        return { meta, searchText };
-      })
-    );
-    for (const m of metas) {
-      if (m) results.push(m);
-    }
+    results.push(...await collectIndexedCacheItemsInBatches(filesToRefresh, 20, async (filePath) => {
+      const meta = await this.extractMeta(filePath);
+      if (!meta) return null;
+      if (!options.eagerSearchIndex) {
+        return { meta };
+      }
+      return {
+        meta,
+        ...(await this.extractSearchIndex(filePath)),
+      };
+    }));
 
     const normalizedResults = this.applyProjectDisplayPathHints(results);
 
@@ -246,8 +280,8 @@ export class IFlowProvider implements ConversationProvider {
   }
 
   private applyProjectDisplayPathHints(
-    items: Array<{ meta: ConversationMeta; searchText?: string }>
-  ): Array<{ meta: ConversationMeta; searchText?: string }> {
+    items: Array<{ meta: ConversationMeta; searchText?: string; searchChunks?: string[] }>
+  ): Array<{ meta: ConversationMeta; searchText?: string; searchChunks?: string[] }> {
     const bestProjectByKey = new Map<string, string>();
 
     for (const item of items) {
@@ -287,12 +321,12 @@ export class IFlowProvider implements ConversationProvider {
     });
   }
 
-  private async extractSearchText(filePath: string): Promise<string | undefined> {
-    const fileStat = await stat(filePath);
-    const entries = fileStat.size > 512 * 1024
-      ? await parseJsonlWindow<IFlowEntry>(filePath, getAdaptiveSearchWindowOptions(fileStat.size))
-      : await parseJsonl<IFlowEntry>(filePath);
-    return buildConversationSearchText(buildMessages(entries));
+  private async extractSearchIndex(filePath: string): Promise<ConversationSearchIndex> {
+    const builder = createConversationSearchIndexBuilder();
+    await visitJsonl<IFlowEntry>(filePath, (entry) => {
+      appendSearchIndexEntry(builder, entry);
+    });
+    return builder.build();
   }
 
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {

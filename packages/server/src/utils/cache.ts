@@ -4,6 +4,7 @@ import { join } from "path";
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
 import type { ConversationMeta } from "../providers/types.js";
+import { SEARCH_INDEX_VERSION } from "./search-index.js";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
@@ -31,12 +32,14 @@ interface IndexedListCacheEntry {
   items: ConversationMeta[];
   updatedAt: number;
   searchReady: boolean;
+  searchVersion: number;
   detailedItems?: IndexedCacheItem[];
 }
 
 export interface IndexedCacheItem {
   meta: ConversationMeta;
   searchText?: string;
+  searchChunks?: string[];
 }
 
 interface IndexedListCacheReadOptions {
@@ -45,6 +48,7 @@ interface IndexedListCacheReadOptions {
 
 interface IndexedListCacheWriteOptions {
   searchReady?: boolean;
+  searchVersion?: number;
 }
 
 // 基于文件 mtime 的元数据缓存
@@ -54,7 +58,8 @@ const memoryIndexedListCache = new Map<string, IndexedListCacheEntry>();
 let db: BetterSqlite3.Database | null = null;
 let lastPruneAt = 0;
 let lastVacuumAt = 0;
-let supportsFtsSearch = false;
+let supportsConversationFtsSearch = false;
+let supportsChunkFtsSearch = false;
 
 export function getIndexedListCacheKey(providerName: string, storagePath: string): string {
   return `${providerName}::${storagePath}::indexed`;
@@ -87,7 +92,8 @@ function getDb(): BetterSqlite3.Database {
       cache_key TEXT PRIMARY KEY,
       list_json TEXT NOT NULL,
       updated_at INTEGER NOT NULL,
-      search_ready INTEGER NOT NULL DEFAULT 1
+      search_ready INTEGER NOT NULL DEFAULT 1,
+      search_version INTEGER NOT NULL DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS conversation_index (
@@ -104,12 +110,24 @@ function getDb(): BetterSqlite3.Database {
       file_path TEXT NOT NULL,
       model_provider TEXT,
       cache_key TEXT NOT NULL,
-      indexed_at INTEGER NOT NULL
+      indexed_at INTEGER NOT NULL,
+      search_version INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_search_chunk (
+      conversation_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      cache_key TEXT NOT NULL,
+      indexed_at INTEGER NOT NULL,
+      search_version INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (conversation_id, chunk_index)
     )
   `);
 
   ensureIndexedListCacheSchema(db);
   ensureConversationIndexSchema(db);
+  ensureConversationSearchChunkSchema(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_conversation_index_provider_updated_at
@@ -120,6 +138,12 @@ function getDb(): BetterSqlite3.Database {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_index_cache_key
     ON conversation_index (cache_key);
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_search_chunk_cache_key
+    ON conversation_search_chunk (cache_key);
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_search_chunk_conversation_id
+    ON conversation_search_chunk (conversation_id);
   `);
 
   return db;
@@ -135,6 +159,12 @@ function ensureIndexedListCacheSchema(database: BetterSqlite3.Database): void {
       "ALTER TABLE indexed_list_cache ADD COLUMN search_ready INTEGER NOT NULL DEFAULT 1"
     );
   }
+
+  if (!columns.some((column) => column.name === "search_version")) {
+    database.exec(
+      "ALTER TABLE indexed_list_cache ADD COLUMN search_version INTEGER NOT NULL DEFAULT 1"
+    );
+  }
 }
 
 function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
@@ -146,7 +176,11 @@ function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
     database.exec("ALTER TABLE conversation_index ADD COLUMN search_text TEXT");
   }
 
-  supportsFtsSearch = false;
+  if (!columns.some((column) => column.name === "search_version")) {
+    database.exec("ALTER TABLE conversation_index ADD COLUMN search_version INTEGER NOT NULL DEFAULT 1");
+  }
+
+  supportsConversationFtsSearch = false;
 
   try {
     database.exec(`
@@ -188,18 +222,69 @@ function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
       database.prepare("INSERT INTO conversation_index_fts(conversation_index_fts) VALUES ('rebuild')").run();
     }
 
-    supportsFtsSearch = true;
+    supportsConversationFtsSearch = true;
   } catch {
-    supportsFtsSearch = false;
+    supportsConversationFtsSearch = false;
+  }
+}
+
+function ensureConversationSearchChunkSchema(database: BetterSqlite3.Database): void {
+  const columns = database
+    .prepare("PRAGMA table_info(conversation_search_chunk)")
+    .all() as Array<{ name: string }>;
+
+  if (!columns.some((column) => column.name === "search_version")) {
+    database.exec("ALTER TABLE conversation_search_chunk ADD COLUMN search_version INTEGER NOT NULL DEFAULT 1");
+  }
+
+  supportsChunkFtsSearch = false;
+
+  try {
+    database.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS conversation_search_chunk_fts USING fts5(
+        content,
+        content='conversation_search_chunk',
+        content_rowid='rowid',
+        tokenize='trigram'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS conversation_search_chunk_ai AFTER INSERT ON conversation_search_chunk BEGIN
+        INSERT INTO conversation_search_chunk_fts(rowid, content)
+        VALUES (new.rowid, new.content);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS conversation_search_chunk_ad AFTER DELETE ON conversation_search_chunk BEGIN
+        INSERT INTO conversation_search_chunk_fts(conversation_search_chunk_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS conversation_search_chunk_au AFTER UPDATE ON conversation_search_chunk BEGIN
+        INSERT INTO conversation_search_chunk_fts(conversation_search_chunk_fts, rowid, content)
+        VALUES ('delete', old.rowid, old.content);
+        INSERT INTO conversation_search_chunk_fts(rowid, content)
+        VALUES (new.rowid, new.content);
+      END;
+    `);
+
+    const chunkCount = database
+      .prepare("SELECT COUNT(*) as count FROM conversation_search_chunk")
+      .get() as { count: number };
+    const chunkFtsCount = database
+      .prepare("SELECT COUNT(*) as count FROM conversation_search_chunk_fts")
+      .get() as { count: number };
+
+    if (chunkCount.count !== chunkFtsCount.count) {
+      database.prepare("INSERT INTO conversation_search_chunk_fts(conversation_search_chunk_fts) VALUES ('rebuild')").run();
+    }
+
+    supportsChunkFtsSearch = true;
+  } catch {
+    supportsChunkFtsSearch = false;
   }
 }
 
 function buildLikePattern(search: string): string {
   return `%${search.toLowerCase()}%`;
-}
-
-function buildSubstringPattern(search: string): string {
-  return `%${search}%`;
 }
 
 function buildFtsSearchQuery(search: string): string | null {
@@ -220,6 +305,33 @@ function buildFtsSearchQuery(search: string): string | null {
   return terms
     .map((term) => `"${term.replace(/"/g, '""')}"`)
     .join(" AND ");
+}
+
+export function hasIndexedSearchData(item: IndexedCacheItem): boolean {
+  return item.searchText !== undefined || (item.searchChunks?.length ?? 0) > 0;
+}
+
+function createIndexedItemSignature(item: {
+  meta: ConversationMeta;
+  searchText?: string;
+  searchChunks?: string[];
+  searchVersion: number;
+}): string {
+  return JSON.stringify([
+    item.searchVersion,
+    item.meta.provider,
+    item.meta.title,
+    item.searchText ?? null,
+    item.searchChunks ?? [],
+    item.meta.project,
+    item.meta.projectKey,
+    item.meta.createdAt,
+    item.meta.updatedAt,
+    item.meta.messageCount,
+    item.meta.fileSize,
+    item.meta.filePath,
+    item.meta.modelProvider ?? null,
+  ]);
 }
 
 export function getCached(filePath: string, mtimeMs: number): ConversationMeta | null {
@@ -311,6 +423,7 @@ function isUsableIndexedListCache(
   updatedAt: number,
   ttlMs: number,
   searchReady: boolean,
+  searchVersion: number,
   options?: IndexedListCacheReadOptions
 ): boolean {
   if (now - updatedAt > ttlMs) {
@@ -318,6 +431,10 @@ function isUsableIndexedListCache(
   }
 
   if (options?.requireSearchReady && !searchReady) {
+    return false;
+  }
+
+  if (options?.requireSearchReady && searchVersion !== SEARCH_INDEX_VERSION) {
     return false;
   }
 
@@ -333,21 +450,35 @@ export function getIndexedListCache(
   const memoryEntry = memoryIndexedListCache.get(cacheKey);
   if (
     memoryEntry &&
-    isUsableIndexedListCache(now, memoryEntry.updatedAt, ttlMs, memoryEntry.searchReady, options)
+    isUsableIndexedListCache(
+      now,
+      memoryEntry.updatedAt,
+      ttlMs,
+      memoryEntry.searchReady,
+      memoryEntry.searchVersion,
+      options
+    )
   ) {
     return memoryEntry.items;
   }
 
   try {
     const row = getDb()
-      .prepare("SELECT list_json, updated_at, search_ready FROM indexed_list_cache WHERE cache_key = ?")
+      .prepare("SELECT list_json, updated_at, search_ready, search_version FROM indexed_list_cache WHERE cache_key = ?")
       .get(cacheKey) as
-      | { list_json: string; updated_at: number; search_ready: number }
+      | { list_json: string; updated_at: number; search_ready: number; search_version: number }
       | undefined;
 
     if (
       !row ||
-      !isUsableIndexedListCache(now, row.updated_at, ttlMs, !!row.search_ready, options)
+      !isUsableIndexedListCache(
+        now,
+        row.updated_at,
+        ttlMs,
+        !!row.search_ready,
+        row.search_version,
+        options
+      )
     ) {
       return null;
     }
@@ -357,6 +488,7 @@ export function getIndexedListCache(
       items,
       updatedAt: row.updated_at,
       searchReady: !!row.search_ready,
+      searchVersion: row.search_version,
     });
     return items;
   } catch {
@@ -372,9 +504,9 @@ export function getIndexedListSnapshot(cacheKey: string): ConversationMeta[] | n
 
   try {
     const row = getDb()
-      .prepare("SELECT list_json, updated_at, search_ready FROM indexed_list_cache WHERE cache_key = ?")
+      .prepare("SELECT list_json, updated_at, search_ready, search_version FROM indexed_list_cache WHERE cache_key = ?")
       .get(cacheKey) as
-      | { list_json: string; updated_at: number; search_ready: number }
+      | { list_json: string; updated_at: number; search_ready: number; search_version: number }
       | undefined;
 
     if (!row) {
@@ -386,6 +518,7 @@ export function getIndexedListSnapshot(cacheKey: string): ConversationMeta[] | n
       items,
       updatedAt: row.updated_at,
       searchReady: !!row.search_ready,
+      searchVersion: row.search_version,
     });
     return items;
   } catch {
@@ -395,14 +528,15 @@ export function getIndexedListSnapshot(cacheKey: string): ConversationMeta[] | n
 
 export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | null {
   const memoryEntry = memoryIndexedListCache.get(cacheKey);
-  if (memoryEntry?.detailedItems) {
+  if (memoryEntry?.detailedItems && memoryEntry.searchVersion === SEARCH_INDEX_VERSION) {
     return memoryEntry.detailedItems;
   }
 
   const baseItems = getIndexedListSnapshot(cacheKey);
 
   try {
-    const rows = getDb()
+    const database = getDb();
+    const rows = database
       .prepare(`
         SELECT
           id,
@@ -416,12 +550,14 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
           message_count,
           file_size,
           file_path,
-          model_provider
+          model_provider,
+          search_version
         FROM conversation_index
         WHERE cache_key = ?
+          AND search_version = ?
         ORDER BY updated_at DESC
       `)
-      .all(cacheKey) as Array<{
+      .all(cacheKey, SEARCH_INDEX_VERSION) as Array<{
       id: string;
       provider: string;
       title: string;
@@ -434,10 +570,34 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
       file_size: number;
       file_path: string;
       model_provider: string | null;
+      search_version: number;
+    }>;
+    const chunkRows = database
+      .prepare(`
+        SELECT
+          conversation_id,
+          chunk_index,
+          content
+        FROM conversation_search_chunk
+        WHERE cache_key = ?
+          AND search_version = ?
+        ORDER BY conversation_id ASC, chunk_index ASC
+      `)
+      .all(cacheKey, SEARCH_INDEX_VERSION) as Array<{
+      conversation_id: string;
+      chunk_index: number;
+      content: string;
     }>;
 
     if (rows.length === 0) {
       return baseItems?.map((meta) => ({ meta })) ?? null;
+    }
+
+    const chunksByConversationId = new Map<string, string[]>();
+    for (const row of chunkRows) {
+      const chunks = chunksByConversationId.get(row.conversation_id) ?? [];
+      chunks.push(row.content);
+      chunksByConversationId.set(row.conversation_id, chunks);
     }
 
     const detailedItems = rows.map((row) => ({
@@ -455,6 +615,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
         modelProvider: row.model_provider ?? undefined,
       },
       searchText: row.search_text ?? undefined,
+      searchChunks: chunksByConversationId.get(row.id),
     }));
 
     const refreshedEntry = memoryIndexedListCache.get(cacheKey);
@@ -480,17 +641,31 @@ export function hasFreshIndexedListCache(
   const memoryEntry = memoryIndexedListCache.get(cacheKey);
   if (
     memoryEntry &&
-    isUsableIndexedListCache(now, memoryEntry.updatedAt, ttlMs, memoryEntry.searchReady, options)
+    isUsableIndexedListCache(
+      now,
+      memoryEntry.updatedAt,
+      ttlMs,
+      memoryEntry.searchReady,
+      memoryEntry.searchVersion,
+      options
+    )
   ) {
     return true;
   }
 
   try {
     const row = getDb()
-      .prepare("SELECT updated_at, search_ready FROM indexed_list_cache WHERE cache_key = ?")
-      .get(cacheKey) as { updated_at: number; search_ready: number } | undefined;
+      .prepare("SELECT updated_at, search_ready, search_version FROM indexed_list_cache WHERE cache_key = ?")
+      .get(cacheKey) as { updated_at: number; search_ready: number; search_version: number } | undefined;
 
-    return !!row && isUsableIndexedListCache(now, row.updated_at, ttlMs, !!row.search_ready, options);
+    return !!row && isUsableIndexedListCache(
+      now,
+      row.updated_at,
+      ttlMs,
+      !!row.search_ready,
+      row.search_version,
+      options
+    );
   } catch {
     return false;
   }
@@ -503,12 +678,14 @@ export function setIndexedListCache(
 ): void {
   const updatedAt = Date.now();
   const searchReady = options?.searchReady ?? true;
+  const searchVersion = options?.searchVersion ?? SEARCH_INDEX_VERSION;
   const normalizedDetailedItems = items.map((item) => ("meta" in item ? item : { meta: item }));
   const normalizedItems = normalizedDetailedItems.map((item) => item.meta);
   memoryIndexedListCache.set(cacheKey, {
     items: normalizedItems,
     updatedAt,
     searchReady,
+    searchVersion,
     detailedItems: normalizedDetailedItems,
   });
 
@@ -517,16 +694,17 @@ export function setIndexedListCache(
     database.transaction(() => {
       database
         .prepare(
-          `INSERT INTO indexed_list_cache (cache_key, list_json, updated_at, search_ready)
-           VALUES (?, ?, ?, ?)
+          `INSERT INTO indexed_list_cache (cache_key, list_json, updated_at, search_ready, search_version)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(cache_key) DO UPDATE SET
              list_json = excluded.list_json,
              updated_at = excluded.updated_at,
-             search_ready = excluded.search_ready`
+             search_ready = excluded.search_ready,
+             search_version = excluded.search_version`
         )
-        .run(cacheKey, JSON.stringify(normalizedItems), updatedAt, searchReady ? 1 : 0);
+        .run(cacheKey, JSON.stringify(normalizedItems), updatedAt, searchReady ? 1 : 0, searchVersion);
 
-      const upsert = database.prepare(
+      const upsertConversation = database.prepare(
         `INSERT INTO conversation_index (
            id,
            provider,
@@ -541,8 +719,9 @@ export function setIndexedListCache(
            file_path,
            model_provider,
            cache_key,
-           indexed_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           indexed_at,
+           search_version
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            title = excluded.title,
@@ -556,8 +735,28 @@ export function setIndexedListCache(
            file_path = excluded.file_path,
            model_provider = excluded.model_provider,
            cache_key = excluded.cache_key,
-           indexed_at = excluded.indexed_at`
+           indexed_at = excluded.indexed_at,
+           search_version = excluded.search_version`
       );
+      const deleteConversationChunks = database.prepare(
+        "DELETE FROM conversation_search_chunk WHERE conversation_id = ?"
+      );
+      const upsertSearchChunk = database.prepare(
+        `INSERT INTO conversation_search_chunk (
+           conversation_id,
+           chunk_index,
+           content,
+           cache_key,
+           indexed_at,
+           search_version
+         ) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(conversation_id, chunk_index) DO UPDATE SET
+           content = excluded.content,
+           cache_key = excluded.cache_key,
+           indexed_at = excluded.indexed_at,
+           search_version = excluded.search_version`
+      );
+
       const existingRows = database.prepare(
         `SELECT
            id,
@@ -571,7 +770,8 @@ export function setIndexedListCache(
            message_count,
            file_size,
            file_path,
-           model_provider
+           model_provider,
+           search_version
          FROM conversation_index
          WHERE cache_key = ?`
       ).all(cacheKey) as Array<{
@@ -587,24 +787,52 @@ export function setIndexedListCache(
         file_size: number;
         file_path: string;
         model_provider: string | null;
+        search_version: number;
       }>;
+      const existingChunkRows = database.prepare(
+        `SELECT
+           conversation_id,
+           chunk_index,
+           content,
+           search_version
+         FROM conversation_search_chunk
+         WHERE cache_key = ?
+         ORDER BY conversation_id ASC, chunk_index ASC`
+      ).all(cacheKey) as Array<{
+        conversation_id: string;
+        chunk_index: number;
+        content: string;
+        search_version: number;
+      }>;
+
+      const existingChunksById = new Map<string, string[]>();
+      for (const row of existingChunkRows) {
+        const chunks = existingChunksById.get(row.conversation_id) ?? [];
+        chunks.push(row.content);
+        existingChunksById.set(row.conversation_id, chunks);
+      }
 
       const existingSignatureById = new Map(
         existingRows.map((row) => [
           row.id,
-          JSON.stringify([
-            row.provider,
-            row.title,
-            row.search_text ?? null,
-            row.project,
-            row.project_key,
-            row.created_at,
-            row.updated_at,
-            row.message_count,
-            row.file_size,
-            row.file_path,
-            row.model_provider ?? null,
-          ]),
+          createIndexedItemSignature({
+            meta: {
+              id: row.id,
+              provider: row.provider,
+              title: row.title,
+              project: row.project,
+              projectKey: row.project_key,
+              createdAt: row.created_at,
+              updatedAt: row.updated_at,
+              messageCount: row.message_count,
+              fileSize: row.file_size,
+              filePath: row.file_path,
+              modelProvider: row.model_provider ?? undefined,
+            },
+            searchText: row.search_text ?? undefined,
+            searchChunks: existingChunksById.get(row.id),
+            searchVersion: row.search_version,
+          }),
         ])
       );
       const nextIds = new Set(normalizedDetailedItems.map((item) => item.meta.id));
@@ -620,35 +848,28 @@ export function setIndexedListCache(
           database
             .prepare(`DELETE FROM conversation_index WHERE id IN (${placeholders})`)
             .run(...chunk);
+          database
+            .prepare(`DELETE FROM conversation_search_chunk WHERE conversation_id IN (${placeholders})`)
+            .run(...chunk);
         }
       }
 
       for (const item of normalizedDetailedItems) {
         const meta = item.meta;
-        const searchText = item.searchText;
-        const nextSignature = JSON.stringify([
-          meta.provider,
-          meta.title,
-          searchText ?? null,
-          meta.project,
-          meta.projectKey,
-          meta.createdAt,
-          meta.updatedAt,
-          meta.messageCount,
-          meta.fileSize,
-          meta.filePath,
-          meta.modelProvider ?? null,
-        ]);
+        const nextSignature = createIndexedItemSignature({
+          ...item,
+          searchVersion,
+        });
 
         if (existingSignatureById.get(meta.id) === nextSignature) {
           continue;
         }
 
-        upsert.run(
+        upsertConversation.run(
           meta.id,
           meta.provider,
           meta.title,
-          searchText ?? null,
+          item.searchText ?? null,
           meta.project,
           meta.projectKey,
           meta.createdAt,
@@ -658,8 +879,21 @@ export function setIndexedListCache(
           meta.filePath,
           meta.modelProvider ?? null,
           cacheKey,
-          updatedAt
+          updatedAt,
+          searchVersion
         );
+
+        deleteConversationChunks.run(meta.id);
+        item.searchChunks?.forEach((chunk, index) => {
+          upsertSearchChunk.run(
+            meta.id,
+            index,
+            chunk,
+            cacheKey,
+            updatedAt,
+            searchVersion
+          );
+        });
       }
     })();
     pruneCacheStorage(database);
@@ -680,27 +914,64 @@ export function queryConversationIndex(options: {
     const database = getDb();
     const whereClauses: string[] = [];
     const params: Array<string | number> = [];
-    let joinClause = "";
 
     const cacheKeyPlaceholders = options.cacheKeys.map(() => "?").join(", ");
     whereClauses.push(`conversation_index.cache_key IN (${cacheKeyPlaceholders})`);
     params.push(...options.cacheKeys);
 
     if (options.search) {
-      const ftsQuery = supportsFtsSearch ? buildFtsSearchQuery(options.search) : null;
-      if (ftsQuery) {
-        joinClause = "JOIN conversation_index_fts ON conversation_index_fts.rowid = conversation_index.rowid";
-        whereClauses.push("conversation_index_fts MATCH ?");
-        params.push(ftsQuery);
-      } else if (supportsFtsSearch) {
-        joinClause = "JOIN conversation_index_fts ON conversation_index_fts.rowid = conversation_index.rowid";
-        whereClauses.push("(conversation_index_fts.title LIKE ? OR conversation_index_fts.project LIKE ? OR conversation_index_fts.search_text LIKE ?)");
-        const pattern = buildSubstringPattern(options.search);
-        params.push(pattern, pattern, pattern);
+      whereClauses.push("conversation_index.search_version = ?");
+      params.push(SEARCH_INDEX_VERSION);
+
+      const ftsQuery = buildFtsSearchQuery(options.search);
+      if (ftsQuery && (supportsConversationFtsSearch || supportsChunkFtsSearch)) {
+        const searchClauses: string[] = [];
+        if (supportsConversationFtsSearch) {
+          searchClauses.push(`
+            EXISTS (
+              SELECT 1
+              FROM conversation_index_fts
+              WHERE conversation_index_fts.rowid = conversation_index.rowid
+                AND conversation_index_fts MATCH ?
+            )
+          `);
+          params.push(ftsQuery);
+        }
+        if (supportsChunkFtsSearch) {
+          searchClauses.push(`
+            EXISTS (
+              SELECT 1
+              FROM conversation_search_chunk_fts
+              JOIN conversation_search_chunk
+                ON conversation_search_chunk.rowid = conversation_search_chunk_fts.rowid
+              WHERE conversation_search_chunk.conversation_id = conversation_index.id
+                AND conversation_search_chunk.cache_key = conversation_index.cache_key
+                AND conversation_search_chunk.search_version = conversation_index.search_version
+                AND conversation_search_chunk_fts MATCH ?
+            )
+          `);
+          params.push(ftsQuery);
+        }
+
+        whereClauses.push(`(${searchClauses.join(" OR ")})`);
       } else {
-        whereClauses.push("(LOWER(conversation_index.title) LIKE ? OR LOWER(conversation_index.project) LIKE ? OR LOWER(COALESCE(conversation_index.search_text, '')) LIKE ?)");
-        const pattern = buildLikePattern(options.search);
-        params.push(pattern, pattern, pattern);
+        const lowerPattern = buildLikePattern(options.search);
+        whereClauses.push(`
+          (
+            LOWER(conversation_index.title) LIKE ?
+            OR LOWER(conversation_index.project) LIKE ?
+            OR LOWER(COALESCE(conversation_index.search_text, '')) LIKE ?
+            OR EXISTS (
+              SELECT 1
+              FROM conversation_search_chunk
+              WHERE conversation_search_chunk.conversation_id = conversation_index.id
+                AND conversation_search_chunk.cache_key = conversation_index.cache_key
+                AND conversation_search_chunk.search_version = conversation_index.search_version
+                AND LOWER(conversation_search_chunk.content) LIKE ?
+            )
+          )
+        `);
+        params.push(lowerPattern, lowerPattern, lowerPattern, lowerPattern);
       }
     }
 
@@ -736,7 +1007,6 @@ export function queryConversationIndex(options: {
         conversation_index.file_path,
         conversation_index.model_provider
       FROM conversation_index
-      ${joinClause}
       WHERE ${whereClauses.join(" AND ")}
       ORDER BY ${orderBy}
     `;
@@ -798,6 +1068,12 @@ function pruneCacheStorage(database: BetterSqlite3.Database): void {
        SELECT cache_key FROM indexed_list_cache
      )`
   ).run();
+  database.prepare(
+    `DELETE FROM conversation_search_chunk
+     WHERE cache_key NOT IN (
+       SELECT cache_key FROM indexed_list_cache
+     )`
+  ).run();
 
   if (now - lastVacuumAt >= VACUUM_INTERVAL_MS) {
     lastVacuumAt = now;
@@ -829,6 +1105,7 @@ export function invalidateListCache(cacheKey: string): void {
     database.prepare("DELETE FROM list_cache WHERE cache_key = ?").run(cacheKey);
     database.prepare("DELETE FROM indexed_list_cache WHERE cache_key = ?").run(cacheKey);
     database.prepare("DELETE FROM conversation_index WHERE cache_key = ?").run(cacheKey);
+    database.prepare("DELETE FROM conversation_search_chunk WHERE cache_key = ?").run(cacheKey);
   } catch {
     // 忽略持久化层失败
   }

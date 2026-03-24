@@ -196,6 +196,9 @@ export interface ExportMeta {
   exported: number;
   failed: number;
   failures: ExportFailure[];
+  mode: "full" | "partial";
+  truncated: number;
+  messageLimit?: number;
 }
 
 export interface ExportResult {
@@ -205,12 +208,13 @@ export interface ExportResult {
 
 export async function exportConversations(
   ids: string[],
-  format: "json" | "markdown"
+  format: "json" | "markdown",
+  mode: "full" | "partial"
 ): Promise<ExportResult> {
   const res = await requestBlob(`${BASE}/export`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ids, format }),
+    body: JSON.stringify({ ids, format, mode }),
   });
 
   const blob = await res.blob();

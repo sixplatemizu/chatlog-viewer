@@ -84,13 +84,61 @@ test("export 部分失败时返回成功内容和 meta 头", async () => {
     exported: number;
     failed: number;
     failures: Array<{ id: string; error: string }>;
+    mode: "full" | "partial";
+    truncated: number;
+    messageLimit?: number;
   };
   assert.equal(meta.requested, 2);
   assert.equal(meta.exported, 1);
   assert.equal(meta.failed, 1);
+  assert.equal(meta.mode, "full");
+  assert.equal(meta.truncated, 0);
   assert.equal(meta.failures[0]?.id, "codex:missing");
 
   const data = await res.json() as Conversation[];
   assert.equal(data.length, 1);
   assert.equal(data[0]?.id, "codex:ok");
+});
+
+test("partial export 会使用 limit 读取并在 meta 中标记截断信息", async () => {
+  let capturedOptions: unknown;
+
+  const app = createExportRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      read: async (id: string, options) => {
+        capturedOptions = options;
+        return {
+          ...createConversationMeta({ id, provider: "codex", title: "partial 导出" }),
+          messages: [{ role: "assistant", content: "latest" }],
+          hasMore: true,
+        } as Conversation;
+      },
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/export", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: ["codex:ok"], format: "markdown", mode: "partial" }),
+  });
+
+  assert.deepEqual(capturedOptions, { limit: 500 });
+  assert.equal(res.status, 200);
+
+  const metaHeader = res.headers.get("X-Export-Meta");
+  assert.ok(metaHeader);
+  const meta = JSON.parse(Buffer.from(metaHeader!, "base64url").toString("utf-8")) as {
+    mode: "full" | "partial";
+    truncated: number;
+    messageLimit?: number;
+  };
+  assert.equal(meta.mode, "partial");
+  assert.equal(meta.truncated, 1);
+  assert.equal(meta.messageLimit, 500);
+
+  const body = await res.text();
+  assert.match(body, /partial export/);
+  assert.match(body, /已截断/);
 });
