@@ -105,7 +105,7 @@ function extractCleanOutput(stdout: string): string {
   let clean = stdout.replace(/<Execution Info>[\s\S]*/m, "").trim();
   clean = clean.replace(new RegExp(`${ansiEscape}\\[[0-9;]*m`, "g"), "");
   clean = clean.replace(/^标题[:：]\s*/m, "");
-  clean = clean.replace(/^[\"'「]|[\"'」]$/g, "");
+  clean = clean.replace(/^["'「]|["'」]$/g, "");
   const firstLine = clean.split("\n")[0]?.trim() || clean;
   return firstLine;
 }
