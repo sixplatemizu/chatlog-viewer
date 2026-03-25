@@ -248,8 +248,13 @@ export function useConversations(options: UseConversationsOptions = {}) {
   }, [conversations]);
 
   const loadConversationDetail = useCallback(
-    async (id: string, options?: { appendEarlier?: boolean }) => {
+    async (id: string, options?: {
+      appendEarlier?: boolean;
+      limitOverride?: number;
+      preserveView?: boolean;
+    }) => {
       const appendEarlier = options?.appendEarlier ?? false;
+      const preserveView = options?.preserveView ?? false;
 
       detailAbortRef.current?.abort();
       const abortController = new AbortController();
@@ -260,13 +265,16 @@ export function useConversations(options: UseConversationsOptions = {}) {
       } else {
         setSelectedId(id);
         setLoadingDetail(true);
-        setConversation(null);
+        if (!preserveView) {
+          setConversation(null);
+        }
       }
 
       try {
         const before = appendEarlier ? conversation?.messages.length ?? 0 : 0;
+        const limit = Math.max(DETAIL_PAGE_SIZE, options?.limitOverride ?? DETAIL_PAGE_SIZE);
         const conv = await fetchConversation(id, {
-          limit: DETAIL_PAGE_SIZE,
+          limit,
           before,
           signal: abortController.signal,
         });
@@ -282,7 +290,9 @@ export function useConversations(options: UseConversationsOptions = {}) {
       } catch (error) {
         if (!isAbortError(error)) {
           notifyError("加载对话详情失败", error, "加载对话详情失败");
-          setConversation(null);
+          if (!preserveView) {
+            setConversation(null);
+          }
         }
       } finally {
         if (!abortController.signal.aborted) {
@@ -297,6 +307,33 @@ export function useConversations(options: UseConversationsOptions = {}) {
     [conversation, notifyError]
   );
 
+  const refreshConversation = useCallback(
+    async (
+      id: string,
+      options?: {
+        keepLoadedWindow?: boolean;
+        syncList?: boolean;
+      }
+    ) => {
+      const loadedCount = conversation?.id === id ? conversation.messages.length : DETAIL_PAGE_SIZE;
+
+      if (options?.syncList) {
+        const listData = await loadConversations();
+        if (listData && !listData.conversations.some((item) => item.id === id)) {
+          setSelectedId(null);
+          setConversation(null);
+          return;
+        }
+      }
+
+      await loadConversationDetail(id, {
+        limitOverride: options?.keepLoadedWindow ? loadedCount : DETAIL_PAGE_SIZE,
+        preserveView: true,
+      });
+    },
+    [conversation, loadConversationDetail, loadConversations]
+  );
+
   const reloadAllData = useCallback(async () => {
     const providerState = await loadProviderData();
     const listData = await loadConversations(undefined, {
@@ -309,12 +346,18 @@ export function useConversations(options: UseConversationsOptions = {}) {
     if (!selectedId) return;
 
     if (listData?.conversations.some((item) => item.id === selectedId)) {
-      await loadConversationDetail(selectedId);
+      const loadedCount = conversation?.id === selectedId
+        ? conversation.messages.length
+        : DETAIL_PAGE_SIZE;
+      await loadConversationDetail(selectedId, {
+        limitOverride: loadedCount,
+        preserveView: true,
+      });
     } else {
       setSelectedId(null);
       setConversation(null);
     }
-  }, [loadConversationDetail, loadConversations, loadProviderData, selectedId]);
+  }, [conversation, loadConversationDetail, loadConversations, loadProviderData, selectedId]);
 
   // 选择对话
   const selectConversation = useCallback(async (id: string) => {
@@ -411,5 +454,6 @@ export function useConversations(options: UseConversationsOptions = {}) {
     searchWarnings,
     reloadProviders: loadProviderData,
     reloadAllData,
+    refreshConversation,
   };
 }

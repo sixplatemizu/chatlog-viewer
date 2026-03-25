@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles, ArrowRightLeft } from "lucide-react";
 import type { ProviderInfo, ConversationMeta, CodexModelProvider } from "../lib/api";
 import { ConversationList } from "./ConversationList";
 
@@ -32,6 +32,7 @@ interface SidebarProps {
   onBatchExport: () => void;
   onBatchDelete: () => void;
   onBatchGenerate: () => void;
+  onBatchChangeModelProvider: (modelProvider: string) => void;
   batchGenerating: boolean;
   onMoveConversation: (convId: string, targetProjectKey: string, srcProvider: string, targetProvider: string) => void;
   codexModelProviders: CodexModelProvider[];
@@ -62,6 +63,7 @@ export function Sidebar({
   onBatchExport,
   onBatchDelete,
   onBatchGenerate,
+  onBatchChangeModelProvider,
   batchGenerating,
   onMoveConversation,
   codexModelProviders,
@@ -71,6 +73,7 @@ export function Sidebar({
   searchWarnings,
 }: SidebarProps) {
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
+  const [batchModelProviderOverride, setBatchModelProviderOverride] = useState("");
 
   const providerCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -100,6 +103,55 @@ export function Sidebar({
 
     return parts.length > 0 ? `共 ${total} 条对话 | ${parts.join(" | ")}` : `共 ${total} 条对话`;
   }, [activeProviders, providerCounts, providers, total]);
+
+  const selectedConversations = useMemo(
+    () => conversations.filter((item) => selectedIds.has(item.id)),
+    [conversations, selectedIds]
+  );
+
+  const hasSelectedNonCodexConversation = useMemo(
+    () => selectedConversations.some((item) => item.provider !== "codex"),
+    [selectedConversations]
+  );
+
+  const selectedCodexModelProviders = useMemo(
+    () => [...new Set(
+      selectedConversations
+        .filter((item) => item.provider === "codex")
+        .map((item) => item.modelProvider)
+        .filter((item): item is string => !!item)
+    )],
+    [selectedConversations]
+  );
+
+  const batchModelProviderSupported = selectedConversations.length > 0
+    && !hasSelectedNonCodexConversation
+    && codexModelProviders.length > 0;
+
+  const preferredBatchModelProvider = useMemo(() => {
+    if (codexModelProviders.length === 0) return "";
+    if (selectedCodexModelProviders.length === 1) {
+      const currentProvider = selectedCodexModelProviders[0];
+      return codexModelProviders.find((item) => item.name !== currentProvider)?.name ?? currentProvider;
+    }
+    return codexModelProviders[0]?.name ?? "";
+  }, [codexModelProviders, selectedCodexModelProviders]);
+
+  const batchModelProvider = useMemo(() => {
+    if (!batchModelProviderSupported) return "";
+    if (
+      batchModelProviderOverride
+      && codexModelProviders.some((item) => item.name === batchModelProviderOverride)
+    ) {
+      return batchModelProviderOverride;
+    }
+    return preferredBatchModelProvider;
+  }, [
+    batchModelProviderOverride,
+    batchModelProviderSupported,
+    codexModelProviders,
+    preferredBatchModelProvider,
+  ]);
 
   return (
     <div className="w-80 border-r border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col h-full">
@@ -213,40 +265,73 @@ export function Sidebar({
       </div>
 
       {selectedIds.size > 0 ? (
-        <div className="p-2 border-t border-gray-200 dark:border-gray-700 bg-blue-50 dark:bg-blue-900/30 flex items-center justify-between">
-          <span className="text-xs text-blue-700 dark:text-blue-300 font-medium">
-            已选 {selectedIds.size} 条
-          </span>
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={onBatchGenerate}
-              disabled={batchGenerating}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-500 text-white rounded hover:bg-purple-600 disabled:opacity-50 transition-colors"
-            >
-              <Sparkles className="w-3 h-3" />
-              AI 标题
-            </button>
-            <button
-              onClick={onBatchExport}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
-            >
-              <Download className="w-3 h-3" />
-              导出
-            </button>
-            <button
-              onClick={onBatchDelete}
-              className="flex items-center gap-1 px-2.5 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
-            >
-              <Trash2 className="w-3 h-3" />
-              删除
-            </button>
-            <button
-              onClick={onDeselectAll}
-              className="px-2 py-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
-            >
-              取消
-            </button>
+        <div className="p-2 border-t border-gray-200 dark:border-gray-700 bg-blue-50 dark:bg-blue-900/30">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-blue-700 dark:text-blue-300 font-medium">
+              已选 {selectedIds.size} 条
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={onBatchGenerate}
+                disabled={batchGenerating}
+                className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-500 text-white rounded hover:bg-purple-600 disabled:opacity-50 transition-colors"
+              >
+                <Sparkles className="w-3 h-3" />
+                AI 标题
+              </button>
+              <button
+                onClick={onBatchExport}
+                className="flex items-center gap-1 px-2.5 py-1 text-xs bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors"
+              >
+                <Download className="w-3 h-3" />
+                导出
+              </button>
+              <button
+                onClick={onBatchDelete}
+                className="flex items-center gap-1 px-2.5 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
+              >
+                <Trash2 className="w-3 h-3" />
+                删除
+              </button>
+              <button
+                onClick={onDeselectAll}
+                className="px-2 py-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
+              >
+                取消
+              </button>
+            </div>
           </div>
+
+          {batchModelProviderSupported && (
+            <div className="mt-2 flex items-center gap-1.5 rounded-lg border border-blue-200 bg-white/80 px-2 py-2 dark:border-blue-800 dark:bg-gray-800/80">
+              <ArrowRightLeft className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+              <select
+                aria-label="批量切换 Codex provider"
+                value={batchModelProvider}
+                onChange={(e) => setBatchModelProviderOverride(e.target.value)}
+                className="min-w-0 flex-1 rounded-md border border-green-200 bg-green-50 px-2 py-1 text-xs text-green-700 outline-none transition focus:ring-2 focus:ring-green-400 dark:border-green-700 dark:bg-green-900/30 dark:text-green-300"
+              >
+                {codexModelProviders.map((item) => (
+                  <option key={item.name} value={item.name}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={() => onBatchChangeModelProvider(batchModelProvider)}
+                disabled={!batchModelProvider}
+                className="rounded-md bg-green-600 px-2.5 py-1 text-xs text-white transition hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                切换 Provider
+              </button>
+            </div>
+          )}
+
+          {!batchModelProviderSupported && hasSelectedNonCodexConversation && (
+            <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              批量 provider 切换目前仅支持 Codex 对话
+            </div>
+          )}
         </div>
       ) : (
         <div className="p-2 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">

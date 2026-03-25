@@ -70,7 +70,7 @@ export function createApp(providers: ConversationProvider[] = createDefaultProvi
 
   app.use("/api/*", cors({
     origin: (origin) => (origin && isAllowedOrigin(origin) ? origin : ""),
-    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type"],
   }));
 

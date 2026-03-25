@@ -13,6 +13,7 @@ import {
   generateAiTitle,
   moveConversation,
   changeModelProvider,
+  changeModelProviders,
   getErrorMessage,
 } from "./lib/api";
 import { Sun, Moon, Monitor, Settings2, X, Sparkles, Loader2, CheckCircle2, XCircle } from "lucide-react";
@@ -71,6 +72,7 @@ export default function App() {
     partialSearch,
     searchWarnings,
     reloadAllData,
+    refreshConversation,
   } = useConversations({ onNotify: pushToast });
 
   const { theme, resolvedTheme, setTheme } = useTheme();
@@ -178,12 +180,12 @@ export default function App() {
   // 标题更新后同步刷新列表和详情
   const handleTitleChanged = useCallback(
     async (id: string) => {
-      await refresh();
-      if (selectedId === id) {
-        await selectConversation(id);
-      }
+      await refreshConversation(id, {
+        keepLoadedWindow: true,
+        syncList: true,
+      });
     },
-    [refresh, selectedId, selectConversation]
+    [refreshConversation]
   );
 
   // 拖拽移动对话到另一个文件夹
@@ -231,27 +233,89 @@ export default function App() {
       try {
         const res = await changeModelProvider(id, newProvider);
         if (res.success) {
-          await refresh();
-          // 重新加载当前对话详情以更新 modelProvider
-          if (selectedId === id) {
-            await selectConversation(id);
-          }
+          await reloadAllData();
         } else {
           pushToast({
             variant: "error",
-            title: "迁移失败",
+            title: "切换 provider 失败",
             description: res.error,
           });
         }
       } catch (error) {
         pushToast({
           variant: "error",
-          title: "迁移失败",
-          description: getErrorMessage(error, "迁移失败"),
+          title: "切换 provider 失败",
+          description: getErrorMessage(error, "切换 provider 失败"),
         });
       }
     },
-    [refresh, selectedId, selectConversation, pushToast]
+    [pushToast, reloadAllData]
+  );
+
+  const handleBatchChangeModelProvider = useCallback(
+    async (newProvider: string) => {
+      const targetProvider = newProvider.trim();
+      if (!targetProvider || selectedIds.size === 0) return;
+
+      const selectedConversations = conversations.filter((item) => selectedIds.has(item.id));
+      if (selectedConversations.length === 0) return;
+
+      if (selectedConversations.some((item) => item.provider !== "codex")) {
+        pushToast({
+          variant: "warning",
+          title: "不支持批量切换",
+          description: "批量 provider 切换目前仅支持 Codex 对话",
+        });
+        return;
+      }
+
+      if (selectedConversations.every((item) => item.modelProvider === targetProvider)) {
+        pushToast({
+          variant: "info",
+          title: "无需切换",
+          description: `已选对话当前都已使用 ${targetProvider}`,
+        });
+        return;
+      }
+
+      try {
+        const res = await changeModelProviders(
+          selectedConversations.map((item) => item.id),
+          targetProvider
+        );
+        if (res.success) {
+          await reloadAllData();
+          pushToast({
+            variant: "info",
+            title: "批量切换完成",
+            description: `已更新 ${res.updated} 条 Codex 对话`,
+          });
+        } else {
+          pushToast({
+            variant: "error",
+            title: "批量切换失败",
+            description: res.error,
+          });
+        }
+      } catch (error) {
+        pushToast({
+          variant: "error",
+          title: "批量切换失败",
+          description: getErrorMessage(error, "批量切换失败"),
+        });
+      }
+    },
+    [conversations, pushToast, reloadAllData, selectedIds]
+  );
+
+  const handleConversationChanged = useCallback(
+    async (id: string) => {
+      await refreshConversation(id, {
+        keepLoadedWindow: true,
+        syncList: true,
+      });
+    },
+    [refreshConversation]
   );
 
   // 批量 AI 生成标题
@@ -366,6 +430,7 @@ export default function App() {
           onBatchExport={handleBatchExport}
           onBatchDelete={handleBatchDelete}
           onBatchGenerate={handleBatchGenerate}
+          onBatchChangeModelProvider={handleBatchChangeModelProvider}
           batchGenerating={batchGenerating}
           onMoveConversation={handleMoveConversation}
           codexModelProviders={codexModelProviders}
@@ -384,6 +449,7 @@ export default function App() {
           onExport={handleExport}
           onDelete={handleDelete}
           onTitleChanged={handleTitleChanged}
+          onConversationChanged={handleConversationChanged}
           codexModelProviders={codexModelProviders}
           onChangeModelProvider={handleChangeModelProvider}
           onNotify={pushToast}

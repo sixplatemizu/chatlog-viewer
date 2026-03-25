@@ -3,6 +3,7 @@ type ErrorStatusCode = 400 | 404 | 500;
 const NOT_FOUND_PATTERNS = [
   "对话不存在",
   "未找到对话",
+  "消息不存在",
   "SQLite 中未找到对话",
   "未知的 provider",
   "provider 不可用",

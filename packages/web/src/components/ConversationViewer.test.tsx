@@ -1,7 +1,19 @@
-import { render, screen, fireEvent } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationViewer } from "./ConversationViewer";
 import type { Conversation } from "../lib/api";
+
+const { mockDeleteConversationMessages } = vi.hoisted(() => ({
+  mockDeleteConversationMessages: vi.fn(),
+}));
+
+vi.mock("../lib/api", async () => {
+  const actual = await vi.importActual<typeof import("../lib/api")>("../lib/api");
+  return {
+    ...actual,
+    deleteConversationMessages: mockDeleteConversationMessages,
+  };
+});
 
 vi.mock("react-virtuoso", () => {
   return {
@@ -34,12 +46,54 @@ const baseConversation: Conversation = {
   modelProvider: "openai",
   hasMore: true,
   messages: [
-    { role: "user", content: "hello", timestamp: 1 },
-    { role: "assistant", content: "world", timestamp: 2 },
+    { messageId: "text:1", role: "user", content: "hello", timestamp: 1, deletable: true },
+    { messageId: "text:2", role: "assistant", content: "world", timestamp: 2, deletable: true },
   ],
 };
 
 describe("ConversationViewer", () => {
+  beforeEach(() => {
+    mockDeleteConversationMessages.mockReset();
+  });
+
+  it("批量删除模式会选择已加载消息并触发批量删除", async () => {
+    const onConversationChanged = vi.fn().mockResolvedValue(undefined);
+    const onNotify = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    mockDeleteConversationMessages.mockResolvedValue({ success: true, deleted: 2 });
+
+    render(
+      <ConversationViewer
+        conversation={baseConversation}
+        dark={false}
+        loading={false}
+        loadingEarlier={false}
+        onLoadEarlier={() => {}}
+        onExport={() => {}}
+        onDelete={() => {}}
+        onTitleChanged={() => {}}
+        onConversationChanged={onConversationChanged}
+        onNotify={onNotify}
+        codexModelProviders={[{ name: "openai", count: 1 }]}
+        onChangeModelProvider={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /批量删除消息/i }));
+    fireEvent.click(screen.getByRole("button", { name: /全选已加载/i }));
+    fireEvent.click(screen.getByRole("button", { name: /删除选中 \(2\)/i }));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(mockDeleteConversationMessages).toHaveBeenCalledWith("codex:test-1", ["text:1", "text:2"]);
+    });
+    await waitFor(() => {
+      expect(onConversationChanged).toHaveBeenCalledWith("codex:test-1");
+    });
+
+    confirmSpy.mockRestore();
+  });
+
   it("没有会话时显示空态", () => {
     render(
       <ConversationViewer
@@ -51,6 +105,7 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
+        onConversationChanged={() => {}}
         onNotify={() => {}}
         codexModelProviders={[]}
         onChangeModelProvider={() => {}}
@@ -73,6 +128,7 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
+        onConversationChanged={() => {}}
         onNotify={() => {}}
         codexModelProviders={[{ name: "openai", count: 1 }]}
         onChangeModelProvider={() => {}}

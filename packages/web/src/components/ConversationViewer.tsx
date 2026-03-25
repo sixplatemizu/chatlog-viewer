@@ -14,7 +14,14 @@ import {
   ArrowRightLeft,
 } from "lucide-react";
 import type { Conversation, CodexModelProvider } from "../lib/api";
-import { updateTitle, generateAiTitle, getErrorMessage } from "../lib/api";
+import {
+  updateTitle,
+  generateAiTitle,
+  updateConversationMessage,
+  deleteConversationMessage,
+  deleteConversationMessages,
+  getErrorMessage,
+} from "../lib/api";
 import type { ToastPayload } from "./ToastViewport";
 import { getProjectName, getProjectPathHint } from "../lib/project";
 import { MessageBubble } from "./MessageBubble";
@@ -28,6 +35,7 @@ interface Props {
   onExport: (id: string) => void;
   onDelete: (id: string) => void;
   onTitleChanged: (id: string) => void | Promise<void>;
+  onConversationChanged: (id: string) => void | Promise<void>;
   onNotify: (toast: ToastPayload) => void;
   codexModelProviders: CodexModelProvider[];
   onChangeModelProvider: (id: string, newProvider: string) => void;
@@ -44,6 +52,7 @@ export function ConversationViewer({
   onExport,
   onDelete,
   onTitleChanged,
+  onConversationChanged,
   onNotify,
   codexModelProviders,
   onChangeModelProvider,
@@ -56,13 +65,23 @@ export function ConversationViewer({
   const [editValue, setEditValue] = useState("");
   const [generating, setGenerating] = useState(false);
   const [genStatus, setGenStatus] = useState("");
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
+  const [batchDeleting, setBatchDeleting] = useState(false);
 
   const totalMessages = conversation?.messageCount ?? conversation?.messages.length ?? 0;
   const loadedMessages = conversation?.messages ?? EMPTY_MESSAGES;
   const hiddenCount = Math.max(0, totalMessages - loadedMessages.length);
+  const deletableMessageIds = useMemo(
+    () => loadedMessages
+      .filter((message) => message.deletable && message.messageId)
+      .map((message) => message.messageId!),
+    [loadedMessages]
+  );
+  const selectedDeletableCount = selectedMessageIds.size;
 
   const messageKeys = useMemo(
-    () => loadedMessages.map((msg, index) => `${index}-${msg.timestamp ?? "na"}-${msg.role}`),
+    () => loadedMessages.map((msg, index) => msg.messageId ?? `${index}-${msg.timestamp ?? "na"}-${msg.role}`),
     [loadedMessages]
   );
 
@@ -94,6 +113,29 @@ export function ConversationViewer({
   useEffect(() => {
     if (editing) inputRef.current?.focus();
   }, [editing]);
+
+  useEffect(() => {
+    setSelectionMode(false);
+    setSelectedMessageIds(new Set());
+  }, [conversation?.id]);
+
+  useEffect(() => {
+    const loadedMessageIdSet = new Set(deletableMessageIds);
+    setSelectedMessageIds((prev) => {
+      const next = new Set<string>();
+      let changed = false;
+
+      for (const messageId of prev) {
+        if (loadedMessageIdSet.has(messageId)) {
+          next.add(messageId);
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [deletableMessageIds]);
 
   const startEdit = () => {
     if (!conversation) return;
@@ -142,6 +184,90 @@ export function ConversationViewer({
 
     restoreIndexRef.current = Math.min(hiddenCount, 200);
     void onLoadEarlier();
+  };
+
+  const handleUpdateMessage = async (messageId: string, content: string) => {
+    if (!conversation) return;
+
+    try {
+      await updateConversationMessage(conversation.id, messageId, content);
+      await onConversationChanged(conversation.id);
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "保存消息失败",
+        description: getErrorMessage(error, "保存消息失败"),
+      });
+      throw error;
+    }
+  };
+
+  const handleDeleteMessage = async (messageId: string) => {
+    if (!conversation) return;
+
+    try {
+      await deleteConversationMessage(conversation.id, messageId);
+      await onConversationChanged(conversation.id);
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "删除消息失败",
+        description: getErrorMessage(error, "删除消息失败"),
+      });
+      throw error;
+    }
+  };
+
+  const toggleMessageSelect = (messageId: string) => {
+    setSelectedMessageIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(messageId)) {
+        next.delete(messageId);
+      } else {
+        next.add(messageId);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAllMessages = () => {
+    setSelectedMessageIds((prev) => {
+      if (deletableMessageIds.length > 0 && prev.size === deletableMessageIds.length) {
+        return new Set();
+      }
+      return new Set(deletableMessageIds);
+    });
+  };
+
+  const handleBatchDeleteMessages = async () => {
+    if (!conversation || selectedDeletableCount === 0 || batchDeleting) return;
+    const targetIds = deletableMessageIds.filter((messageId) => selectedMessageIds.has(messageId));
+    if (targetIds.length === 0) return;
+
+    const confirmed = window.confirm(
+      `确定删除当前已选中的 ${targetIds.length} 条消息吗？此操作无法恢复。`
+    );
+    if (!confirmed) return;
+
+    setBatchDeleting(true);
+    try {
+      await deleteConversationMessages(conversation.id, targetIds);
+      setSelectedMessageIds(new Set());
+      await onConversationChanged(conversation.id);
+      onNotify({
+        variant: "info",
+        title: "批量删除完成",
+        description: `已删除 ${targetIds.length} 条消息`,
+      });
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "批量删除消息失败",
+        description: getErrorMessage(error, "批量删除消息失败"),
+      });
+    } finally {
+      setBatchDeleting(false);
+    }
   };
 
   if (loading) {
@@ -264,9 +390,56 @@ export function ConversationViewer({
               {genStatus && (
                 <span className="text-purple-500 animate-pulse">{genStatus}</span>
               )}
+              {selectionMode && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  仅对当前已加载且支持删除的消息生效
+                </span>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+            {selectionMode ? (
+              <>
+                <button
+                  onClick={toggleSelectAllMessages}
+                  disabled={deletableMessageIds.length === 0 || batchDeleting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {selectedDeletableCount === deletableMessageIds.length && deletableMessageIds.length > 0
+                    ? "取消全选"
+                    : "全选已加载"}
+                </button>
+                <button
+                  onClick={handleBatchDeleteMessages}
+                  disabled={selectedDeletableCount === 0 || batchDeleting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <Trash2 className={`w-3.5 h-3.5 ${batchDeleting ? "animate-pulse" : ""}`} />
+                  删除选中
+                  {selectedDeletableCount > 0 ? ` (${selectedDeletableCount})` : ""}
+                </button>
+                <button
+                  onClick={() => {
+                    setSelectionMode(false);
+                    setSelectedMessageIds(new Set());
+                  }}
+                  disabled={batchDeleting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-white dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded-lg border border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-600 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  退出选择
+                </button>
+              </>
+            ) : (
+              deletableMessageIds.length > 0 && (
+                <button
+                  onClick={() => setSelectionMode(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  批量删除消息
+                </button>
+              )
+            )}
             <button
               onClick={() => onExport(conversation.id)}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
@@ -299,7 +472,16 @@ export function ConversationViewer({
           }}
           itemContent={(index, message) => (
             <div className="border-b border-gray-100 dark:border-gray-800 last:border-b-0">
-              <MessageBubble message={message} dark={dark} />
+              <MessageBubble
+                message={message}
+                dark={dark}
+                onUpdateMessage={handleUpdateMessage}
+                onDeleteMessage={handleDeleteMessage}
+                selectionMode={selectionMode}
+                selected={!!message.messageId && selectedMessageIds.has(message.messageId)}
+                selectable={!!message.deletable && !!message.messageId}
+                onToggleSelect={toggleMessageSelect}
+              />
             </div>
           )}
         />

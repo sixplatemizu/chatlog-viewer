@@ -29,6 +29,18 @@ export interface ParseJsonlTailOptions<T> {
   isEnough?: (items: T[], context: ParseJsonlTailContext) => boolean;
 }
 
+export interface JsonlLine<T> {
+  value: T;
+  rawLine: string;
+  lineNumber?: number;
+}
+
+export interface ParseJsonlTailWithMetaOptions<T> {
+  bytesHint?: number;
+  maxBytes?: number;
+  isEnough?: (items: JsonlLine<T>[], context: ParseJsonlTailContext) => boolean;
+}
+
 export async function visitJsonl<T = unknown>(
   filePath: string,
   visitor: (value: T) => void | Promise<void>
@@ -53,11 +65,49 @@ export async function visitJsonl<T = unknown>(
   }
 }
 
+export async function visitJsonlWithMeta<T = unknown>(
+  filePath: string,
+  visitor: (item: JsonlLine<T>) => void | Promise<void>
+): Promise<void> {
+  const rl = createInterface({
+    input: createReadStream(filePath, { encoding: "utf-8" }),
+    crlfDelay: Infinity,
+  });
+
+  let lineNumber = 0;
+  for await (const line of rl) {
+    lineNumber += 1;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let value: T;
+    try {
+      value = JSON.parse(trimmed) as T;
+    } catch {
+      continue;
+    }
+
+    await visitor({
+      value,
+      rawLine: trimmed,
+      lineNumber,
+    });
+  }
+}
+
 // 全量解析 JSONL（仅用于 read 详情时）
 export async function parseJsonl<T = unknown>(filePath: string): Promise<T[]> {
   const results: T[] = [];
   await visitJsonl<T>(filePath, (value) => {
     results.push(value);
+  });
+  return results;
+}
+
+export async function parseJsonlWithMeta<T = unknown>(filePath: string): Promise<JsonlLine<T>[]> {
+  const results: JsonlLine<T>[] = [];
+  await visitJsonlWithMeta<T>(filePath, (item) => {
+    results.push(item);
   });
   return results;
 }
@@ -95,22 +145,36 @@ async function readFileTail(
   });
 }
 
-function parseJsonlText<T>(content: string): T[] {
-  const lines = content
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+function parseJsonlTextWithMeta<T>(
+  content: string,
+  options?: {
+    includeLineNumbers?: boolean;
+    startLineNumber?: number;
+  }
+): JsonlLine<T>[] {
+  const parsed: JsonlLine<T>[] = [];
+  const startLineNumber = options?.startLineNumber ?? 1;
 
-  const parsed: T[] = [];
-  for (const line of lines) {
+  for (const [index, line] of content.split(/\r?\n/).entries()) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
     try {
-      parsed.push(JSON.parse(line) as T);
+      parsed.push({
+        value: JSON.parse(trimmed) as T,
+        rawLine: trimmed,
+        lineNumber: options?.includeLineNumbers ? startLineNumber + index : undefined,
+      });
     } catch {
       // 跳过无法解析的行
     }
   }
 
   return parsed;
+}
+
+function parseJsonlText<T>(content: string): T[] {
+  return parseJsonlTextWithMeta<T>(content).map((item) => item.value);
 }
 
 export async function parseJsonlTail<T = unknown>(
@@ -139,6 +203,49 @@ export async function parseJsonlTail<T = unknown>(
   while (true) {
     const { content, reachedStart } = await readFileTail(filePath, fileSize, bytesRead);
     const parsed = parseJsonlText<T>(content);
+
+    if (
+      reachedStart ||
+      !normalizedOptions.isEnough ||
+      normalizedOptions.isEnough(parsed, { reachedStart, bytesRead, fileSize })
+    ) {
+      return parsed;
+    }
+
+    if (bytesRead >= maxBytes) {
+      return parsed;
+    }
+
+    bytesRead = Math.min(maxBytes, Math.max(bytesRead * 2, bytesRead + baseBytesHint));
+  }
+}
+
+export async function parseJsonlTailWithMeta<T = unknown>(
+  filePath: string,
+  options: number | ParseJsonlTailWithMetaOptions<T> = 256 * 1024
+): Promise<JsonlLine<T>[]> {
+  const fileStat = await stat(filePath);
+  const fileSize = fileStat.size;
+  if (fileSize <= 0) return [];
+
+  const normalizedOptions = typeof options === "number"
+    ? { bytesHint: options }
+    : options;
+
+  const baseBytesHint = Math.max(
+    normalizedOptions.bytesHint ?? 256 * 1024,
+    MIN_TAIL_READ_BYTES
+  );
+  const maxBytes = Math.min(
+    Math.max(normalizedOptions.maxBytes ?? fileSize, baseBytesHint),
+    fileSize
+  );
+
+  let bytesRead = Math.min(baseBytesHint, maxBytes);
+
+  while (true) {
+    const { content, reachedStart } = await readFileTail(filePath, fileSize, bytesRead);
+    const parsed = parseJsonlTextWithMeta<T>(content);
 
     if (
       reachedStart ||

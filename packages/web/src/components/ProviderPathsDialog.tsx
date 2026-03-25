@@ -21,6 +21,11 @@ interface ProviderDraft {
   stateDbPath: string;
 }
 
+interface ProviderMigrationDraft {
+  storagePath?: boolean;
+  stateDbPath?: boolean;
+}
+
 const SOURCE_LABELS = {
   env: "环境变量",
   config: "配置文件",
@@ -45,6 +50,26 @@ function buildDrafts(settings: ProviderPathSettings): Record<string, ProviderDra
       },
     ])
   );
+}
+
+function normalizeComparablePath(value: string | undefined): string {
+  const normalized = (value ?? "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (/^[A-Za-z]:\//.test(normalized)) return normalized.toLowerCase();
+  return normalized;
+}
+
+function shouldOfferMigration(
+  currentPath: string | undefined,
+  currentExists: boolean | undefined,
+  currentSource: keyof typeof SOURCE_LABELS | undefined,
+  nextPath: string
+): boolean {
+  if (currentSource === "env" || !currentExists) return false;
+
+  const trimmedNextPath = nextPath.trim();
+  if (!trimmedNextPath) return false;
+
+  return normalizeComparablePath(currentPath) !== normalizeComparablePath(trimmedNextPath);
 }
 
 function PathStatus({ exists }: { exists?: boolean }) {
@@ -93,13 +118,17 @@ function ResolvedPathRow({
 function ProviderCard({
   provider,
   draft,
+  migration,
   saving,
   onChange,
+  onToggleMigration,
 }: {
   provider: ProviderPathInfo;
   draft: ProviderDraft;
+  migration: ProviderMigrationDraft;
   saving: boolean;
   onChange: (providerName: string, field: keyof ProviderDraft, value: string) => void;
+  onToggleMigration: (providerName: string, field: keyof ProviderMigrationDraft, value: boolean) => void;
 }) {
   const storageHint = provider.storageSource === "env"
     ? "当前由环境变量覆盖，保存配置后仍需移除对应 env 才会生效。"
@@ -107,6 +136,20 @@ function ProviderCard({
   const stateDbHint = provider.stateDbSource === "env"
     ? "当前由环境变量覆盖，保存配置后仍需移除对应 env 才会生效。"
     : "留空表示移除配置覆盖，回退到环境变量 / 自动发现 / 默认值。";
+  const canMigrateStorage = shouldOfferMigration(
+    provider.storagePath,
+    provider.storageExists,
+    provider.storageSource,
+    draft.storagePath
+  );
+  const canMigrateStateDb = provider.stateDbPath !== undefined && shouldOfferMigration(
+    provider.stateDbPath,
+    provider.stateDbExists,
+    provider.stateDbSource,
+    draft.stateDbPath
+  );
+  const migrateStorageChecked = canMigrateStorage && migration.storagePath !== false;
+  const migrateStateDbChecked = canMigrateStateDb && migration.stateDbPath !== false;
 
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800/70">
@@ -136,6 +179,18 @@ function ProviderCard({
             className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
           />
           <div className="text-[11px] text-gray-400 dark:text-gray-500">{storageHint}</div>
+          {canMigrateStorage && (
+            <label className="flex items-start gap-2 rounded-lg border border-blue-100 bg-blue-50/70 px-3 py-2 text-[11px] text-blue-700 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300">
+              <input
+                type="checkbox"
+                checked={migrateStorageChecked}
+                disabled={saving}
+                onChange={(e) => onToggleMigration(provider.name, "storagePath", e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 rounded accent-blue-500"
+              />
+              <span>保存时自动迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。</span>
+            </label>
+          )}
         </div>
 
         {provider.stateDbPath !== undefined && (
@@ -158,6 +213,18 @@ function ProviderCard({
                 className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-100"
               />
               <div className="text-[11px] text-gray-400 dark:text-gray-500">{stateDbHint}</div>
+              {canMigrateStateDb && (
+                <label className="flex items-start gap-2 rounded-lg border border-blue-100 bg-blue-50/70 px-3 py-2 text-[11px] text-blue-700 dark:border-blue-900/50 dark:bg-blue-950/30 dark:text-blue-300">
+                  <input
+                    type="checkbox"
+                    checked={migrateStateDbChecked}
+                    disabled={saving}
+                    onChange={(e) => onToggleMigration(provider.name, "stateDbPath", e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 rounded accent-blue-500"
+                  />
+                  <span>保存时自动迁移当前 State DB 文件到新路径，避免路径切换后元数据丢失。</span>
+                </label>
+              )}
             </div>
           </>
         )}
@@ -169,6 +236,7 @@ function ProviderCard({
 export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props) {
   const [settings, setSettings] = useState<ProviderPathSettings | null>(null);
   const [drafts, setDrafts] = useState<Record<string, ProviderDraft>>({});
+  const [migrationDrafts, setMigrationDrafts] = useState<Record<string, ProviderMigrationDraft>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -178,6 +246,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
       const nextSettings = await fetchProviderPathSettings();
       setSettings(nextSettings);
       setDrafts(buildDrafts(nextSettings));
+      setMigrationDrafts({});
     } catch (error) {
       onNotify({
         variant: "error",
@@ -202,13 +271,58 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
         [field]: value,
       },
     }));
+    setMigrationDrafts((prev) => ({
+      ...prev,
+      [providerName]: {
+        ...(prev[providerName] ?? {}),
+        [field]: undefined,
+      },
+    }));
   }, []);
+
+  const handleMigrationChange = useCallback(
+    (providerName: string, field: keyof ProviderMigrationDraft, value: boolean) => {
+      setMigrationDrafts((prev) => ({
+        ...prev,
+        [providerName]: {
+          ...(prev[providerName] ?? {}),
+          [field]: value,
+        },
+      }));
+    },
+    []
+  );
 
   const handleSave = useCallback(async () => {
     if (!settings) return;
 
     setSaving(true);
     try {
+      const migrations = Object.fromEntries(
+        settings.providers.flatMap((provider) => {
+          const draft = drafts[provider.name] ?? { storagePath: "", stateDbPath: "" };
+          const migrationDraft = migrationDrafts[provider.name] ?? {};
+          const nextSelection: { storagePath?: boolean; stateDbPath?: boolean } = {};
+
+          if (
+            shouldOfferMigration(provider.storagePath, provider.storageExists, provider.storageSource, draft.storagePath)
+            && migrationDraft.storagePath !== false
+          ) {
+            nextSelection.storagePath = true;
+          }
+
+          if (
+            provider.stateDbPath !== undefined
+            && shouldOfferMigration(provider.stateDbPath, provider.stateDbExists, provider.stateDbSource, draft.stateDbPath)
+            && migrationDraft.stateDbPath !== false
+          ) {
+            nextSelection.stateDbPath = true;
+          }
+
+          return Object.keys(nextSelection).length > 0 ? [[provider.name, nextSelection]] : [];
+        })
+      );
+
       const nextSettings = await updateProviderPathSettings({
         providers: Object.fromEntries(
           settings.providers.map((provider) => [
@@ -221,15 +335,21 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
             },
           ])
         ),
+        migrations,
       });
 
       setSettings(nextSettings);
       setDrafts(buildDrafts(nextSettings));
+      setMigrationDrafts({});
       await onSaved?.();
+
+      const migrationMessages = nextSettings.migrationResults?.map((item) => item.message) ?? [];
       onNotify({
         variant: "success",
-        title: "路径设置已保存",
-        description: "已写入配置文件并刷新 provider 解析结果。",
+        title: migrationMessages.length > 0 ? "路径设置已保存并迁移" : "路径设置已保存",
+        description: migrationMessages.length > 0
+          ? `已写入配置文件并刷新 provider 解析结果。\n${migrationMessages.join("\n")}`
+          : "已写入配置文件并刷新 provider 解析结果。",
       });
     } catch (error) {
       onNotify({
@@ -240,7 +360,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
     } finally {
       setSaving(false);
     }
-  }, [drafts, onNotify, onSaved, settings]);
+  }, [drafts, migrationDrafts, onNotify, onSaved, settings]);
 
   if (!open) return null;
 
@@ -284,8 +404,10 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
                   key={provider.name}
                   provider={provider}
                   draft={drafts[provider.name] ?? { storagePath: "", stateDbPath: "" }}
+                  migration={migrationDrafts[provider.name] ?? {}}
                   saving={saving}
                   onChange={handleDraftChange}
+                  onToggleMigration={handleMigrationChange}
                 />
               ))}
             </div>

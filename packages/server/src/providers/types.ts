@@ -17,6 +17,9 @@ export interface ConversationProvider {
   read(id: string, options?: ConversationReadOptions): Promise<Conversation>;
   delete(id: string): Promise<void>;
   move?(id: string, targetProjectKey: string): Promise<void>;
+  updateMessage?(id: string, messageId: string, content: string): Promise<void>;
+  deleteMessage?(id: string, messageId: string): Promise<void>;
+  deleteMessages?(id: string, messageIds: string[]): Promise<void>;
   listProjects?(): Promise<string[]>;
   getStoragePath(): string;
 }
@@ -41,10 +44,13 @@ export interface Conversation extends ConversationMeta {
 }
 
 export interface Message {
+  messageId?: string;
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   timestamp?: number;
   toolName?: string;
   toolInput?: string;
   toolResult?: string;
+  editable?: boolean;
+  deletable?: boolean;
 }

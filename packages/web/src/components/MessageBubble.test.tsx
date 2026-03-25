@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MessageBubble } from "./MessageBubble";
 
 describe("MessageBubble", () => {
@@ -26,5 +26,29 @@ describe("MessageBubble", () => {
     expect(screen.getByText((_, element) =>
       element?.tagName.toLowerCase() === "p" && !!element.textContent?.includes("line-200")
     )).toBeInTheDocument();
+  });
+
+  it("可编辑消息会显示编辑操作并触发保存回调", async () => {
+    const handleUpdate = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <MessageBubble
+        dark={false}
+        message={{
+          messageId: "text:1",
+          role: "assistant",
+          content: "old content",
+          timestamp: 1,
+          editable: true,
+        }}
+        onUpdateMessage={handleUpdate}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑消息" }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "new content" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(handleUpdate).toHaveBeenCalledWith("text:1", "new content");
   });
 });

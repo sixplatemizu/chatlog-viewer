@@ -89,6 +89,16 @@ export interface ProviderPathInfo {
 export interface ProviderPathSettings {
   configPath: string;
   providers: ProviderPathInfo[];
+  migrationResults?: ProviderPathMigrationResult[];
+}
+
+export interface ProviderPathMigrationResult {
+  providerName: string;
+  pathType: "storagePath" | "stateDbPath";
+  fromPath: string;
+  toPath: string;
+  mode: "moved" | "merged";
+  message: string;
 }
 
 export interface ConversationMeta {
@@ -106,12 +116,15 @@ export interface ConversationMeta {
 }
 
 export interface Message {
+  messageId?: string;
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   timestamp?: number;
   toolName?: string;
   toolInput?: string;
   toolResult?: string;
+  editable?: boolean;
+  deletable?: boolean;
 }
 
 export interface Conversation extends ConversationMeta {
@@ -136,6 +149,7 @@ export async function fetchProviderPathSettings(signal?: AbortSignal): Promise<P
 
 export async function updateProviderPathSettings(payload: {
   providers: Record<string, { storagePath?: string | null; stateDbPath?: string | null }>;
+  migrations?: Record<string, { storagePath?: boolean; stateDbPath?: boolean }>;
 }): Promise<ProviderPathSettings> {
   return requestJson<ProviderPathSettings>(`${BASE}/settings/provider-paths`, {
     method: "PUT",
@@ -184,6 +198,47 @@ export async function deleteConversation(id: string): Promise<void> {
   await requestJson<{ success: boolean }>(`${BASE}/conversations/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+export async function updateConversationMessage(
+  conversationId: string,
+  messageId: string,
+  content: string
+): Promise<void> {
+  await requestJson<{ success: boolean }>(
+    `${BASE}/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    }
+  );
+}
+
+export async function deleteConversationMessage(
+  conversationId: string,
+  messageId: string
+): Promise<void> {
+  await requestJson<{ success: boolean }>(
+    `${BASE}/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+    {
+      method: "DELETE",
+    }
+  );
+}
+
+export async function deleteConversationMessages(
+  conversationId: string,
+  messageIds: string[]
+): Promise<{ success: boolean; deleted: number }> {
+  return requestJson<{ success: boolean; deleted: number }>(
+    `${BASE}/conversations/${encodeURIComponent(conversationId)}/messages/batch-delete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messageIds }),
+    }
+  );
 }
 
 export interface ExportFailure {
@@ -311,6 +366,20 @@ export async function changeModelProvider(
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ modelProvider }),
+    }
+  );
+}
+
+export async function changeModelProviders(
+  ids: string[],
+  modelProvider: string
+): Promise<{ success: boolean; updated: number; error?: string }> {
+  return requestJson<{ success: boolean; updated: number; error?: string }>(
+    `${BASE}/conversations/model-provider/batch`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, modelProvider }),
     }
   );
 }

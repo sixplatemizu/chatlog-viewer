@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from "fs";
-import { mkdir, writeFile } from "fs/promises";
+import { copyFile, mkdir, readdir, rename, rm, stat, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { posix, win32 } from "path";
 
@@ -31,12 +31,34 @@ export interface ResolvedProviderPaths {
   stateDbSource?: ProviderPathSource;
 }
 
+export interface ProviderPathMigrationSelection {
+  storagePath?: boolean;
+  stateDbPath?: boolean;
+}
+
+export interface ProviderPathMigrationResult {
+  providerName: ResolvedProviderName;
+  pathType: "storagePath" | "stateDbPath";
+  fromPath: string;
+  toPath: string;
+  mode: "moved" | "merged";
+  message: string;
+}
+
+export interface UpdatedProviderConfigResult extends LoadedConfig {
+  migrationResults: ProviderPathMigrationResult[];
+}
+
 interface ResolveProviderPathsOptions {
   env?: EnvLike;
   homeDir?: string;
   config?: AppConfig;
   configDir?: string;
   pathExists?: (path: string, kind: PathKind) => boolean;
+}
+
+interface UpdateProviderConfigsOptions {
+  migrations?: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>>;
 }
 
 interface ResolvedPathResult {
@@ -189,8 +211,9 @@ function loadAppConfig(env: EnvLike, homeDir: string): LoadedConfig {
 export async function updateProviderConfigs(
   updates: Partial<Record<ResolvedProviderName, ProviderPathConfig>>,
   env: EnvLike = process.env,
-  homeDir = homedir()
-): Promise<LoadedConfig> {
+  homeDir = homedir(),
+  options: UpdateProviderConfigsOptions = {}
+): Promise<UpdatedProviderConfigResult> {
   const configPath = getProviderConfigPath(env, homeDir);
   const loadedConfig = loadAppConfig(env, homeDir);
   const nextConfig: AppConfig = {
@@ -231,10 +254,195 @@ export async function updateProviderConfigs(
     delete nextConfig.providers;
   }
 
+  const migrationResults = await migrateProviderPaths(
+    options.migrations ?? {},
+    loadedConfig,
+    nextConfig,
+    env,
+    homeDir
+  );
+
   await mkdir(dirnameStyledPath(configPath), { recursive: true });
   await writeFile(configPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf-8");
   clearProviderPathCache();
-  return loadAppConfig(env, homeDir);
+  return {
+    ...loadAppConfig(env, homeDir),
+    migrationResults,
+  };
+}
+
+async function migrateProviderPaths(
+  migrations: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>>,
+  currentConfig: LoadedConfig,
+  nextConfig: AppConfig,
+  env: EnvLike,
+  homeDir: string
+): Promise<ProviderPathMigrationResult[]> {
+  const results: ProviderPathMigrationResult[] = [];
+
+  for (const providerName of Object.keys(migrations) as ResolvedProviderName[]) {
+    const selection = migrations[providerName];
+    if (!selection) continue;
+
+    const currentResolved = resolveProviderPaths(providerName, {
+      env,
+      homeDir,
+      config: currentConfig.config,
+      configDir: currentConfig.configDir,
+    });
+    const nextResolved = resolveProviderPaths(providerName, {
+      env,
+      homeDir,
+      config: nextConfig,
+      configDir: currentConfig.configDir,
+    });
+
+    if (selection.storagePath) {
+      const storageResult = await maybeMigrateResolvedPath(
+        providerName,
+        "storagePath",
+        currentResolved.storagePath,
+        nextResolved.storagePath,
+        "directory"
+      );
+      if (storageResult) results.push(storageResult);
+    }
+
+    if (selection.stateDbPath && currentResolved.stateDbPath && nextResolved.stateDbPath) {
+      const stateDbResult = await maybeMigrateResolvedPath(
+        providerName,
+        "stateDbPath",
+        currentResolved.stateDbPath,
+        nextResolved.stateDbPath,
+        "file"
+      );
+      if (stateDbResult) results.push(stateDbResult);
+    }
+  }
+
+  return results;
+}
+
+async function maybeMigrateResolvedPath(
+  providerName: ResolvedProviderName,
+  pathType: "storagePath" | "stateDbPath",
+  fromPath: string,
+  toPath: string,
+  kind: PathKind
+): Promise<ProviderPathMigrationResult | null> {
+  if (!fromPath || !toPath) return null;
+  if (getPathKey(fromPath) === getPathKey(toPath)) return null;
+
+  const sourceExists = await pathExistsAsync(fromPath, kind);
+  if (!sourceExists) return null;
+
+  const mode = kind === "directory"
+    ? await moveDirectoryTree(fromPath, toPath)
+    : await moveFileTree(fromPath, toPath);
+
+  const label = pathType === "storagePath" ? "Storage Path" : "State DB";
+  const action = mode === "merged" ? "已合并迁移" : "已迁移";
+
+  return {
+    providerName,
+    pathType,
+    fromPath,
+    toPath,
+    mode,
+    message: `${providerName} ${label} ${action}到新路径`,
+  };
+}
+
+async function moveDirectoryTree(sourceDir: string, targetDir: string): Promise<"moved" | "merged"> {
+  await mkdir(dirnameStyledPath(targetDir), { recursive: true });
+
+  const targetStats = await statPath(targetDir);
+  if (!targetStats) {
+    try {
+      await rename(sourceDir, targetDir);
+      return "moved";
+    } catch (error) {
+      if (!isCrossDeviceError(error)) throw error;
+    }
+  } else if (!targetStats.isDirectory()) {
+    throw new Error(`自动迁移失败：目标路径不是目录 ${targetDir}`);
+  }
+
+  await mkdir(targetDir, { recursive: true });
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const sourceEntry = joinStyledPath(sourceDir, entry.name);
+    const targetEntry = joinStyledPath(targetDir, entry.name);
+    const targetEntryStats = await statPath(targetEntry);
+
+    if (entry.isDirectory()) {
+      if (targetEntryStats && !targetEntryStats.isDirectory()) {
+        throw new Error(`自动迁移失败：目标目录中已存在同名文件 ${targetEntry}`);
+      }
+      await moveDirectoryTree(sourceEntry, targetEntry);
+      continue;
+    }
+
+    if (targetEntryStats) {
+      throw new Error(`自动迁移失败：目标路径已存在同名文件 ${targetEntry}`);
+    }
+
+    await moveFileTree(sourceEntry, targetEntry, true);
+  }
+
+  await rm(sourceDir, { recursive: true, force: true });
+  return targetStats ? "merged" : "moved";
+}
+
+async function moveFileTree(sourceFile: string, targetFile: string, allowDirectory = false): Promise<"moved"> {
+  const sourceStats = await statPath(sourceFile);
+  if (!sourceStats) {
+    throw new Error(`自动迁移失败：源路径不存在 ${sourceFile}`);
+  }
+
+  if (sourceStats.isDirectory()) {
+    if (!allowDirectory) {
+      throw new Error(`自动迁移失败：预期文件路径却遇到目录 ${sourceFile}`);
+    }
+    await moveDirectoryTree(sourceFile, targetFile);
+    return "moved";
+  }
+
+  const targetStats = await statPath(targetFile);
+  if (targetStats) {
+    throw new Error(`自动迁移失败：目标文件已存在 ${targetFile}`);
+  }
+
+  await mkdir(dirnameStyledPath(targetFile), { recursive: true });
+
+  try {
+    await rename(sourceFile, targetFile);
+  } catch (error) {
+    if (!isCrossDeviceError(error)) throw error;
+    await copyFile(sourceFile, targetFile);
+    await rm(sourceFile, { force: true });
+  }
+
+  return "moved";
+}
+
+async function statPath(path: string) {
+  try {
+    return await stat(path);
+  } catch {
+    return null;
+  }
+}
+
+async function pathExistsAsync(path: string, kind: PathKind): Promise<boolean> {
+  const stats = await statPath(path);
+  if (!stats) return false;
+  return kind === "file" ? stats.isFile() : stats.isDirectory();
+}
+
+function isCrossDeviceError(error: unknown): boolean {
+  return getErrorCode(error) === "EXDEV";
 }
 
 function resolvePathWithFallback(options: {

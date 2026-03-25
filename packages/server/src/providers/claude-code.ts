@@ -1,12 +1,13 @@
 import { join } from "path";
-import { stat, readdir, unlink, rename, mkdir } from "fs/promises";
+import { stat, readdir, unlink, rename, mkdir, readFile, writeFile } from "fs/promises";
 import { glob } from "glob";
 import {
-  parseJsonl,
+  parseJsonlWithMeta,
   parseJsonlHead,
-  parseJsonlTail,
+  parseJsonlTailWithMeta,
   countLines,
   visitJsonl,
+  type JsonlLine,
 } from "../utils/jsonl.js";
 import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
@@ -17,6 +18,14 @@ import {
   type ConversationSearchIndex,
   type ConversationSearchIndexBuilder,
 } from "../utils/search-index.js";
+import {
+  assignStableMessageIds,
+  createMessageSourceKey,
+  normalizeUpdatedMessageContent,
+  rewriteJsonlLine,
+  rewriteJsonlLines,
+  type MessageRecord,
+} from "../utils/message-actions.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -44,8 +53,16 @@ interface ClaudeCodeEntry {
   timestamp?: string;
 }
 
+type ClaudeCodeContentBlock = {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+};
+
 function extractTextContent(
-  content: string | Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>
+  content: string | ClaudeCodeContentBlock[]
 ): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -56,7 +73,7 @@ function extractTextContent(
 }
 
 function extractToolCalls(
-  content: Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>
+  content: ClaudeCodeContentBlock[]
 ): Message[] {
   if (!Array.isArray(content)) return [];
   return content
@@ -93,41 +110,65 @@ function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items:
   };
 }
 
-function buildMessages(entries: ClaudeCodeEntry[]): Message[] {
-  const messages: Message[] = [];
+function isPureTextContent(content: string | ClaudeCodeContentBlock[]): boolean {
+  return typeof content === "string"
+    || (Array.isArray(content) && content.every((block) => block.type === "text"));
+}
 
+function buildMessageRecords(entries: JsonlLine<ClaudeCodeEntry>[]): MessageRecord<ClaudeCodeEntry>[] {
+  const records: MessageRecord<ClaudeCodeEntry>[] = [];
   for (const entry of entries) {
-    if (entry.isSidechain || entry.isMeta) continue;
-    if (!entry.message) continue;
-    if (entry.type === "system") continue;
+    const value = entry.value;
+    if (value.isSidechain || value.isMeta) continue;
+    if (!value.message) continue;
+    if (value.type === "system") continue;
 
-    if (entry.type === "user") {
-      const text = extractTextContent(entry.message.content);
+    if (value.type === "user") {
+      const text = extractTextContent(value.message.content);
       if (!text.trim() || text.includes("<local-command-") || text.includes("<command-name>") || text.includes("<local-command-stdout>")) continue;
       const cleanText = text.replace(/<[^>]+>/g, "").trim();
       if (!cleanText) continue;
-      messages.push({
-        role: "user",
-        content: cleanText,
-        timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
+      records.push({
+        entry: value,
+        sourceKey: isPureTextContent(value.message.content)
+          ? createMessageSourceKey(entry.rawLine, "user")
+          : undefined,
+        lineIndex: entry.lineNumber,
+        message: {
+          role: "user",
+          content: cleanText,
+          timestamp: value.timestamp ? new Date(value.timestamp).getTime() : undefined,
+        },
       });
-    } else if (entry.type === "assistant") {
-      const text = extractTextContent(entry.message.content);
+    } else if (value.type === "assistant") {
+      const text = extractTextContent(value.message.content);
       if (text.trim() && !text.startsWith("No response requested")) {
-        messages.push({
-          role: "assistant",
-          content: text,
-          timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
+        records.push({
+          entry: value,
+          sourceKey: isPureTextContent(value.message.content)
+            ? createMessageSourceKey(entry.rawLine, "assistant")
+            : undefined,
+          lineIndex: entry.lineNumber,
+          message: {
+            role: "assistant",
+            content: text,
+            timestamp: value.timestamp ? new Date(value.timestamp).getTime() : undefined,
+          },
         });
       }
-      if (Array.isArray(entry.message.content)) {
-        const tools = extractToolCalls(entry.message.content);
-        messages.push(...tools);
+      if (Array.isArray(value.message.content)) {
+        const tools = extractToolCalls(value.message.content);
+        for (const tool of tools) {
+          records.push({
+            entry: value,
+            message: tool,
+          });
+        }
       }
     }
   }
 
-  return messages;
+  return assignStableMessageIds(records);
 }
 
 function appendSearchIndexEntry(
@@ -387,14 +428,24 @@ export class ClaudeCodeProvider implements ConversationProvider {
     return meta;
   }
 
-  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
-    const sessionId = id.replace("claude-code:", "");
+  private async findConversationFilePath(sessionId: string): Promise<string> {
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
+    if (files.length === 0) {
+      throw new Error(`对话不存在: claude-code:${sessionId}`);
+    }
+    return files[0];
+  }
 
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-    const filePath = files[0];
+  private invalidateConversationCaches(filePath: string): void {
+    invalidateCache(filePath);
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
+    const sessionId = id.replace("claude-code:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
     const fileStat = await stat(filePath);
 
     const limit = options?.limit;
@@ -404,13 +455,13 @@ export class ClaudeCodeProvider implements ConversationProvider {
 
     // read 时默认全量解析，详情页可通过窗口模式只取最近一段
     const entries = shouldWindowRead
-      ? await parseJsonlTail<ClaudeCodeEntry>(filePath, {
+      ? await parseJsonlTailWithMeta<ClaudeCodeEntry>(filePath, {
           bytesHint: Math.max(256 * 1024, fileStat.size > 0 ? Math.min(fileStat.size, (before + limit) * 4096) : 256 * 1024),
           maxBytes: fileStat.size,
-          isEnough: (tailEntries) => buildMessages(tailEntries).length >= requiredMessages,
+          isEnough: (tailEntries) => buildMessageRecords(tailEntries).length >= requiredMessages,
         })
-      : await parseJsonl<ClaudeCodeEntry>(filePath);
-    const messages = buildMessages(entries);
+      : await parseJsonlWithMeta<ClaudeCodeEntry>(filePath);
+    const messages = buildMessageRecords(entries).map((record) => record.message);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
@@ -422,25 +473,15 @@ export class ClaudeCodeProvider implements ConversationProvider {
 
   async delete(id: string): Promise<void> {
     const sessionId = id.replace("claude-code:", "");
-    const basePath = this.getStoragePath();
-    const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-    invalidateListCache(getListCacheKey(this.name, basePath));
-    invalidateCache(files[0]);
-    await unlink(files[0]);
+    const filePath = await this.findConversationFilePath(sessionId);
+    await unlink(filePath);
+    this.invalidateConversationCaches(filePath);
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {
     const sessionId = id.replace("claude-code:", "");
     const basePath = this.getStoragePath();
-    const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-
-    const srcFile = files[0];
-    invalidateListCache(getListCacheKey(this.name, basePath));
-    invalidateCache(srcFile);
+    const srcFile = await this.findConversationFilePath(sessionId);
     const fileName = srcFile.split(/[/\\]/).pop()!;
     const targetDir = join(basePath, targetProjectKey);
     await mkdir(targetDir, { recursive: true });
@@ -448,6 +489,69 @@ export class ClaudeCodeProvider implements ConversationProvider {
 
     if (srcFile.replace(/\\/g, "/") === destFile.replace(/\\/g, "/")) return;
     await rename(srcFile, destFile);
+    this.invalidateConversationCaches(srcFile);
+  }
+
+  async updateMessage(id: string, messageId: string, content: string): Promise<void> {
+    const sessionId = id.replace("claude-code:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    const entries = await parseJsonlWithMeta<ClaudeCodeEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    const record = records.find((item) => item.message.messageId === messageId);
+
+    if (!record?.lineIndex || !record.entry.message) {
+      throw new Error(`消息不存在: ${messageId}`);
+    }
+
+    const normalizedContent = normalizeUpdatedMessageContent(content);
+    const nextEntry: ClaudeCodeEntry = {
+      ...record.entry,
+      message: {
+        ...record.entry.message,
+        content: typeof record.entry.message.content === "string"
+          ? normalizedContent
+          : [{ type: "text", text: normalizedContent }],
+      },
+    };
+
+    const originalContent = await readFile(filePath, "utf-8");
+    const rewritten = rewriteJsonlLine(
+      originalContent,
+      record.lineIndex,
+      JSON.stringify(nextEntry)
+    );
+    await writeFile(filePath, rewritten, "utf-8");
+    this.invalidateConversationCaches(filePath);
+  }
+
+  async deleteMessage(id: string, messageId: string): Promise<void> {
+    await this.deleteMessages(id, [messageId]);
+  }
+
+  async deleteMessages(id: string, messageIds: string[]): Promise<void> {
+    const sessionId = id.replace("claude-code:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueMessageIds.length === 0) {
+      throw new Error("待删除消息不能为空");
+    }
+
+    const entries = await parseJsonlWithMeta<ClaudeCodeEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    const lineNumbers: number[] = [];
+
+    for (const messageId of uniqueMessageIds) {
+      const record = records.find((item) => item.message.messageId === messageId);
+      if (!record?.lineIndex) {
+        throw new Error(`消息不存在: ${messageId}`);
+      }
+      lineNumbers.push(record.lineIndex);
+    }
+
+    const originalContent = await readFile(filePath, "utf-8");
+    const rewritten = rewriteJsonlLines(originalContent, lineNumbers);
+    await writeFile(filePath, rewritten, "utf-8");
+    this.invalidateConversationCaches(filePath);
   }
 
   async listProjects(): Promise<string[]> {

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { homedir } from "os";
 import type { ConversationProvider, ConversationMeta } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
@@ -11,6 +12,7 @@ import {
   getProviderConfigPath,
   getProviderPaths,
   updateProviderConfigs,
+  type ProviderPathMigrationSelection,
   type ProviderPathConfig,
   type ResolvedProviderName,
 } from "../utils/provider-paths.js";
@@ -81,6 +83,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   app.put("/settings/provider-paths", async (c) => {
     const body = await c.req.json<{
       providers?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
+      migrations?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
     }>();
 
     if (!body || typeof body !== "object" || !body.providers || typeof body.providers !== "object") {
@@ -88,6 +91,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     }
 
     const updates: Partial<Record<ResolvedProviderName, ProviderPathConfig>> = {};
+    const migrations: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>> = {};
 
     try {
       for (const [providerName, value] of Object.entries(body.providers)) {
@@ -111,15 +115,45 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
         updates[providerName] = nextConfig;
       }
+
+      if (body.migrations && typeof body.migrations === "object") {
+        for (const [providerName, value] of Object.entries(body.migrations)) {
+          if (!isResolvedProviderName(providerName) || !value || typeof value !== "object") continue;
+
+          const nextSelection: ProviderPathMigrationSelection = {};
+
+          if ("storagePath" in value) {
+            if (typeof value.storagePath !== "boolean") {
+              return c.json({ error: `${providerName} storagePath 迁移标记必须是布尔值` }, 400);
+            }
+            nextSelection.storagePath = value.storagePath;
+          }
+
+          if ("stateDbPath" in value) {
+            if (providerName !== "codex") {
+              return c.json({ error: `${providerName} 不支持 state db 迁移配置` }, 400);
+            }
+            if (typeof value.stateDbPath !== "boolean") {
+              return c.json({ error: `${providerName} stateDbPath 迁移标记必须是布尔值` }, 400);
+            }
+            nextSelection.stateDbPath = value.stateDbPath;
+          }
+
+          if (nextSelection.storagePath || nextSelection.stateDbPath) {
+            migrations[providerName] = nextSelection;
+          }
+        }
+      }
     } catch (error) {
       return c.json({ error: getErrorMessage(error) }, 400);
     }
 
-    await updateProviderConfigs(updates);
+    const updated = await updateProviderConfigs(updates, process.env, homedir(), { migrations });
 
     return c.json({
       configPath: getProviderConfigPath(),
       providers: buildProviderPathSettings(providers),
+      migrationResults: updated.migrationResults,
     });
   });
 
@@ -265,6 +299,83 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     }
   });
 
+  app.patch("/conversations/:id/messages/:messageId", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const messageId = decodeURIComponent(c.req.param("messageId"));
+    const providerName = id.split(":")[0];
+    const provider = providers.find((p) => p.name === providerName);
+    if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    if (!provider.updateMessage) {
+      return c.json({ error: `${provider.displayName} 不支持编辑消息` }, 400);
+    }
+
+    const body = await c.req.json<{ content?: unknown }>();
+    if (typeof body?.content !== "string" || !body.content.trim()) {
+      return c.json({ error: "消息内容不能为空" }, 400);
+    }
+
+    try {
+      await provider.updateMessage(id, messageId, body.content);
+      return c.json({ success: true });
+    } catch (e) {
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
+    }
+  });
+
+  app.post("/conversations/:id/messages/batch-delete", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const providerName = id.split(":")[0];
+    const provider = providers.find((p) => p.name === providerName);
+    if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    if (!provider.deleteMessages && !provider.deleteMessage) {
+      return c.json({ error: `${provider.displayName} 不支持删除消息` }, 400);
+    }
+
+    const body = await c.req.json<{ messageIds?: unknown }>();
+    if (!Array.isArray(body?.messageIds)) {
+      return c.json({ error: "messageIds 必须是数组" }, 400);
+    }
+
+    const messageIds = body.messageIds
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (messageIds.length === 0) {
+      return c.json({ error: "待删除消息不能为空" }, 400);
+    }
+
+    try {
+      if (provider.deleteMessages) {
+        await provider.deleteMessages(id, messageIds);
+      } else {
+        for (const messageId of messageIds) {
+          await provider.deleteMessage!(id, messageId);
+        }
+      }
+      return c.json({ success: true, deleted: messageIds.length });
+    } catch (e) {
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
+    }
+  });
+
+  app.delete("/conversations/:id/messages/:messageId", async (c) => {
+    const id = decodeURIComponent(c.req.param("id"));
+    const messageId = decodeURIComponent(c.req.param("messageId"));
+    const providerName = id.split(":")[0];
+    const provider = providers.find((p) => p.name === providerName);
+    if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    if (!provider.deleteMessage) {
+      return c.json({ error: `${provider.displayName} 不支持删除消息` }, 400);
+    }
+
+    try {
+      await provider.deleteMessage(id, messageId);
+      return c.json({ success: true });
+    } catch (e) {
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
+    }
+  });
+
   // 删除对话
   app.delete("/conversations/:id", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
@@ -363,6 +474,39 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const codex = providers.find((p) => p.name === "codex") as CodexProvider | undefined;
     if (!codex) return c.json([]);
     return c.json(codex.listModelProviders());
+  });
+
+  // 批量修改 Codex 对话的 model_provider
+  app.put("/conversations/model-provider/batch", async (c) => {
+    const codex = providers.find((p) => p.name === "codex") as CodexProvider | undefined;
+    if (!codex) return c.json({ error: "Codex provider 不可用" }, 404);
+
+    const body = await c.req.json<{ ids?: unknown; modelProvider?: unknown }>();
+    if (!Array.isArray(body?.ids)) {
+      return c.json({ error: "ids 必须是数组" }, 400);
+    }
+
+    const ids = body.ids
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (ids.length === 0) {
+      return c.json({ error: "待修改对话不能为空" }, 400);
+    }
+    if (ids.some((id) => !id.startsWith("codex:"))) {
+      return c.json({ error: "批量切换 model provider 仅支持 Codex 对话" }, 400);
+    }
+
+    if (typeof body.modelProvider !== "string" || !body.modelProvider.trim()) {
+      return c.json({ error: "model provider 不能为空" }, 400);
+    }
+
+    try {
+      const updated = await codex.changeModelProviders(ids, body.modelProvider.trim());
+      return c.json({ success: true, updated });
+    } catch (e) {
+      return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
+    }
   });
 
   // 修改 Codex 对话的 model_provider

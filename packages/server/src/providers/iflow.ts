@@ -1,12 +1,13 @@
 import { join } from "path";
-import { stat, unlink, rename, mkdir, readdir } from "fs/promises";
+import { stat, unlink, rename, mkdir, readdir, readFile, writeFile } from "fs/promises";
 import { glob } from "glob";
 import {
-  parseJsonl,
+  parseJsonlWithMeta,
   parseJsonlHead,
-  parseJsonlTail,
+  parseJsonlTailWithMeta,
   countLines,
   visitJsonl,
+  type JsonlLine,
 } from "../utils/jsonl.js";
 import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
@@ -17,11 +18,18 @@ import {
   type ConversationSearchIndex,
   type ConversationSearchIndexBuilder,
 } from "../utils/search-index.js";
+import {
+  assignStableMessageIds,
+  createMessageSourceKey,
+  normalizeUpdatedMessageContent,
+  rewriteJsonlLine,
+  rewriteJsonlLines,
+  type MessageRecord,
+} from "../utils/message-actions.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
-  Message,
   ConversationReadOptions,
   ConversationListOptions,
 } from "./types.js";
@@ -44,8 +52,16 @@ interface IFlowEntry {
   version?: string;
 }
 
+type IFlowContentBlock = {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+};
+
 function extractTextContent(
-  content: string | Array<{ type: string; text?: string }>
+  content: string | IFlowContentBlock[]
 ): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -94,37 +110,59 @@ function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items:
   };
 }
 
-function buildMessages(entries: IFlowEntry[]): Message[] {
-  const messages: Message[] = [];
+function isPureTextContent(content: string | IFlowContentBlock[]): boolean {
+  return typeof content === "string"
+    || (Array.isArray(content) && content.every((block) => block.type === "text"));
+}
 
+function buildMessageRecords(entries: JsonlLine<IFlowEntry>[]): MessageRecord<IFlowEntry>[] {
+  const records: MessageRecord<IFlowEntry>[] = [];
   for (const entry of entries) {
-    if (entry.isSidechain || !entry.message) continue;
+    const value = entry.value;
+    if (value.isSidechain || !value.message) continue;
 
-    if (entry.type === "user") {
-      const text = extractTextContent(entry.message.content);
+    if (value.type === "user") {
+      const text = extractTextContent(value.message.content);
       if (!text.trim()) continue;
-      messages.push({
-        role: "user",
-        content: text,
-        timestamp: new Date(entry.timestamp).getTime(),
-      });
-    } else if (entry.type === "assistant") {
-      const text = extractTextContent(entry.message.content);
-      if (text.trim()) {
-        messages.push({
-          role: "assistant",
+      records.push({
+        entry: value,
+        sourceKey: isPureTextContent(value.message.content)
+          ? createMessageSourceKey(entry.rawLine, "user")
+          : undefined,
+        lineIndex: entry.lineNumber,
+        message: {
+          role: "user",
           content: text,
-          timestamp: new Date(entry.timestamp).getTime(),
+          timestamp: new Date(value.timestamp).getTime(),
+        },
+      });
+    } else if (value.type === "assistant") {
+      const text = extractTextContent(value.message.content);
+      if (text.trim()) {
+        records.push({
+          entry: value,
+          sourceKey: isPureTextContent(value.message.content)
+            ? createMessageSourceKey(entry.rawLine, "assistant")
+            : undefined,
+          lineIndex: entry.lineNumber,
+          message: {
+            role: "assistant",
+            content: text,
+            timestamp: new Date(value.timestamp).getTime(),
+          },
         });
       }
-      if (Array.isArray(entry.message.content)) {
-        for (const block of entry.message.content) {
+      if (Array.isArray(value.message.content)) {
+        for (const block of value.message.content) {
           if (block.type === "tool_use") {
-            messages.push({
-              role: "tool",
-              content: "",
-              toolName: (block as { name?: string }).name || "unknown",
-              toolInput: JSON.stringify((block as { input?: unknown }).input, null, 2),
+            records.push({
+              entry: value,
+              message: {
+                role: "tool",
+                content: "",
+                toolName: (block as { name?: string }).name || "unknown",
+                toolInput: JSON.stringify((block as { input?: unknown }).input, null, 2),
+              },
             });
           }
         }
@@ -132,7 +170,7 @@ function buildMessages(entries: IFlowEntry[]): Message[] {
     }
   }
 
-  return messages;
+  return assignStableMessageIds(records);
 }
 
 function appendSearchIndexEntry(
@@ -412,14 +450,24 @@ export class IFlowProvider implements ConversationProvider {
     return meta;
   }
 
-  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
-    const sessionId = id.replace("iflow:", "");
+  private async findConversationFilePath(sessionId: string): Promise<string> {
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
+    if (files.length === 0) {
+      throw new Error(`对话不存在: iflow:${sessionId}`);
+    }
+    return files[0];
+  }
 
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-    const filePath = files[0];
+  private invalidateConversationCaches(filePath: string): void {
+    invalidateCache(filePath);
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
+    const sessionId = id.replace("iflow:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
     const fileStat = await stat(filePath);
 
     const limit = options?.limit;
@@ -428,13 +476,13 @@ export class IFlowProvider implements ConversationProvider {
     const requiredMessages = shouldWindowRead ? before + limit + 1 : 0;
 
     const entries = shouldWindowRead
-      ? await parseJsonlTail<IFlowEntry>(filePath, {
+      ? await parseJsonlTailWithMeta<IFlowEntry>(filePath, {
           bytesHint: Math.max(256 * 1024, fileStat.size > 0 ? Math.min(fileStat.size, (before + limit) * 4096) : 256 * 1024),
           maxBytes: fileStat.size,
-          isEnough: (tailEntries) => buildMessages(tailEntries).length >= requiredMessages,
+          isEnough: (tailEntries) => buildMessageRecords(tailEntries).length >= requiredMessages,
         })
-      : await parseJsonl<IFlowEntry>(filePath);
-    const messages = buildMessages(entries);
+      : await parseJsonlWithMeta<IFlowEntry>(filePath);
+    const messages = buildMessageRecords(entries).map((record) => record.message);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
@@ -450,25 +498,15 @@ export class IFlowProvider implements ConversationProvider {
 
   async delete(id: string): Promise<void> {
     const sessionId = id.replace("iflow:", "");
-    const basePath = this.getStoragePath();
-    const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-    invalidateListCache(getListCacheKey(this.name, basePath));
-    invalidateCache(files[0]);
-    await unlink(files[0]);
+    const filePath = await this.findConversationFilePath(sessionId);
+    await unlink(filePath);
+    this.invalidateConversationCaches(filePath);
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {
     const sessionId = id.replace("iflow:", "");
     const basePath = this.getStoragePath();
-    const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-
-    const srcFile = files[0];
-    invalidateListCache(getListCacheKey(this.name, basePath));
-    invalidateCache(srcFile);
+    const srcFile = await this.findConversationFilePath(sessionId);
     const fileName = srcFile.split(/[/\\]/).pop()!;
     const targetDir = join(basePath, targetProjectKey);
     await mkdir(targetDir, { recursive: true });
@@ -476,6 +514,69 @@ export class IFlowProvider implements ConversationProvider {
 
     if (srcFile.replace(/\\/g, "/") === destFile.replace(/\\/g, "/")) return;
     await rename(srcFile, destFile);
+    this.invalidateConversationCaches(srcFile);
+  }
+
+  async updateMessage(id: string, messageId: string, content: string): Promise<void> {
+    const sessionId = id.replace("iflow:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    const entries = await parseJsonlWithMeta<IFlowEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    const record = records.find((item) => item.message.messageId === messageId);
+
+    if (!record?.lineIndex || !record.entry.message) {
+      throw new Error(`消息不存在: ${messageId}`);
+    }
+
+    const normalizedContent = normalizeUpdatedMessageContent(content);
+    const nextEntry: IFlowEntry = {
+      ...record.entry,
+      message: {
+        ...record.entry.message,
+        content: typeof record.entry.message.content === "string"
+          ? normalizedContent
+          : [{ type: "text", text: normalizedContent }],
+      },
+    };
+
+    const originalContent = await readFile(filePath, "utf-8");
+    const rewritten = rewriteJsonlLine(
+      originalContent,
+      record.lineIndex,
+      JSON.stringify(nextEntry)
+    );
+    await writeFile(filePath, rewritten, "utf-8");
+    this.invalidateConversationCaches(filePath);
+  }
+
+  async deleteMessage(id: string, messageId: string): Promise<void> {
+    await this.deleteMessages(id, [messageId]);
+  }
+
+  async deleteMessages(id: string, messageIds: string[]): Promise<void> {
+    const sessionId = id.replace("iflow:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueMessageIds.length === 0) {
+      throw new Error("待删除消息不能为空");
+    }
+
+    const entries = await parseJsonlWithMeta<IFlowEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    const lineNumbers: number[] = [];
+
+    for (const messageId of uniqueMessageIds) {
+      const record = records.find((item) => item.message.messageId === messageId);
+      if (!record?.lineIndex) {
+        throw new Error(`消息不存在: ${messageId}`);
+      }
+      lineNumbers.push(record.lineIndex);
+    }
+
+    const originalContent = await readFile(filePath, "utf-8");
+    const rewritten = rewriteJsonlLines(originalContent, lineNumbers);
+    await writeFile(filePath, rewritten, "utf-8");
+    this.invalidateConversationCaches(filePath);
   }
 
   async listProjects(): Promise<string[]> {

@@ -4,11 +4,12 @@ import { createRequire } from "module";
 import { glob } from "glob";
 import type BetterSqlite3 from "better-sqlite3";
 import {
-  parseJsonl,
+  parseJsonlWithMeta,
   parseJsonlHead,
-  parseJsonlTail,
+  parseJsonlTailWithMeta,
   countLines,
   visitJsonl,
+  type JsonlLine,
 } from "../utils/jsonl.js";
 import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
@@ -19,11 +20,18 @@ import {
   type ConversationSearchIndex,
   type ConversationSearchIndexBuilder,
 } from "../utils/search-index.js";
+import {
+  assignStableMessageIds,
+  createMessageSourceKey,
+  normalizeUpdatedMessageContent,
+  rewriteJsonlLine,
+  rewriteJsonlLines,
+  type MessageRecord,
+} from "../utils/message-actions.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
-  Message,
   ConversationReadOptions,
   ConversationListOptions,
 } from "./types.js";
@@ -64,29 +72,34 @@ function canonicalizeProjectPath(value: string): string {
   return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
-function buildMessages(entries: CodexEntry[]): Message[] {
-  const messages: Message[] = [];
-
+function buildMessageRecords(entries: JsonlLine<CodexEntry>[]): MessageRecord<CodexEntry>[] {
+  const records: MessageRecord<CodexEntry>[] = [];
   for (const entry of entries) {
-    if (entry.type !== "response_item" || !entry.payload?.role) continue;
+    const value = entry.value;
+    if (value.type !== "response_item" || !value.payload?.role) continue;
 
-    const role = entry.payload.role as "user" | "assistant";
+    const role = value.payload.role as "user" | "assistant";
     if (role !== "user" && role !== "assistant") continue;
 
-    const content = entry.payload.content
-      ? extractContent(entry.payload.content)
+    const content = value.payload.content
+      ? extractContent(value.payload.content)
       : "";
     if (content.includes("<environment_context>")) continue;
     if (!content.trim()) continue;
 
-    messages.push({
-      role,
-      content,
-      timestamp: new Date(entry.timestamp).getTime(),
+    records.push({
+      entry: value,
+      sourceKey: createMessageSourceKey(entry.rawLine, "response_item"),
+      lineIndex: entry.lineNumber,
+      message: {
+        role,
+        content,
+        timestamp: new Date(value.timestamp).getTime(),
+      },
     });
   }
 
-  return messages;
+  return assignStableMessageIds(records);
 }
 
 function appendSearchIndexEntry(
@@ -347,14 +360,24 @@ export class CodexProvider implements ConversationProvider {
     return meta;
   }
 
-  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
-    const sessionId = id.replace("codex:", "");
+  private async findConversationFilePath(sessionId: string): Promise<string> {
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
     const files = await glob(pattern);
+    if (files.length === 0) {
+      throw new Error(`对话不存在: codex:${sessionId}`);
+    }
+    return files[0];
+  }
 
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-    const filePath = files[0];
+  private invalidateConversationCaches(filePath: string): void {
+    invalidateCache(filePath);
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
+    const sessionId = id.replace("codex:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
     const fileStat = await stat(filePath);
 
     const limit = options?.limit;
@@ -363,13 +386,13 @@ export class CodexProvider implements ConversationProvider {
     const requiredMessages = shouldWindowRead ? before + limit + 1 : 0;
 
     const entries = shouldWindowRead
-      ? await parseJsonlTail<CodexEntry>(filePath, {
+      ? await parseJsonlTailWithMeta<CodexEntry>(filePath, {
           bytesHint: Math.max(256 * 1024, fileStat.size > 0 ? Math.min(fileStat.size, (before + limit) * 4096) : 256 * 1024),
           maxBytes: fileStat.size,
-          isEnough: (tailEntries) => buildMessages(tailEntries).length >= requiredMessages,
+          isEnough: (tailEntries) => buildMessageRecords(tailEntries).length >= requiredMessages,
         })
-      : await parseJsonl<CodexEntry>(filePath);
-    const messages = buildMessages(entries);
+      : await parseJsonlWithMeta<CodexEntry>(filePath);
+    const messages = buildMessageRecords(entries).map((record) => record.message);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
@@ -381,25 +404,14 @@ export class CodexProvider implements ConversationProvider {
 
   async delete(id: string): Promise<void> {
     const sessionId = id.replace("codex:", "");
-    const basePath = this.getStoragePath();
-    const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-    invalidateListCache(getListCacheKey(this.name, basePath));
-    invalidateCache(files[0]);
-    await unlink(files[0]);
+    const filePath = await this.findConversationFilePath(sessionId);
+    await unlink(filePath);
+    this.invalidateConversationCaches(filePath);
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {
     const sessionId = id.replace("codex:", "");
-    const basePath = this.getStoragePath();
-    const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    if (files.length === 0) throw new Error(`对话不存在: ${id}`);
-
-    const filePath = files[0];
-    invalidateListCache(getListCacheKey(this.name, basePath));
-    invalidateCache(filePath);
+    const filePath = await this.findConversationFilePath(sessionId);
     const newCwd = targetProjectKey.replace(/\//g, "\\");
 
     const content = await readFile(filePath, "utf-8");
@@ -418,6 +430,70 @@ export class CodexProvider implements ConversationProvider {
       return line;
     });
     await writeFile(filePath, newLines.join("\n"), "utf-8");
+    this.invalidateConversationCaches(filePath);
+  }
+
+  async updateMessage(id: string, messageId: string, content: string): Promise<void> {
+    const sessionId = id.replace("codex:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    const entries = await parseJsonlWithMeta<CodexEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    const record = records.find((item) => item.message.messageId === messageId);
+
+    if (!record || !record.lineIndex) {
+      throw new Error(`消息不存在: ${messageId}`);
+    }
+
+    const normalizedContent = normalizeUpdatedMessageContent(content);
+    const nextEntry: CodexEntry = {
+      ...record.entry,
+      payload: {
+        ...record.entry.payload,
+        content: [{
+          type: record.message.role === "user" ? "input_text" : "output_text",
+          text: normalizedContent,
+        }],
+      },
+    };
+
+    const originalContent = await readFile(filePath, "utf-8");
+    const rewritten = rewriteJsonlLine(
+      originalContent,
+      record.lineIndex,
+      JSON.stringify(nextEntry)
+    );
+    await writeFile(filePath, rewritten, "utf-8");
+    this.invalidateConversationCaches(filePath);
+  }
+
+  async deleteMessage(id: string, messageId: string): Promise<void> {
+    await this.deleteMessages(id, [messageId]);
+  }
+
+  async deleteMessages(id: string, messageIds: string[]): Promise<void> {
+    const sessionId = id.replace("codex:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueMessageIds.length === 0) {
+      throw new Error("待删除消息不能为空");
+    }
+
+    const entries = await parseJsonlWithMeta<CodexEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    const lineNumbers: number[] = [];
+
+    for (const messageId of uniqueMessageIds) {
+      const record = records.find((item) => item.message.messageId === messageId);
+      if (!record?.lineIndex) {
+        throw new Error(`消息不存在: ${messageId}`);
+      }
+      lineNumbers.push(record.lineIndex);
+    }
+
+    const originalContent = await readFile(filePath, "utf-8");
+    const rewritten = rewriteJsonlLines(originalContent, lineNumbers);
+    await writeFile(filePath, rewritten, "utf-8");
+    this.invalidateConversationCaches(filePath);
   }
 
   async listProjects(): Promise<string[]> {
@@ -453,27 +529,62 @@ export class CodexProvider implements ConversationProvider {
 
   // 修改对话的 model_provider
   async changeModelProvider(id: string, newProvider: string): Promise<void> {
-    const sessionId = id.replace("codex:", "");
+    await this.changeModelProviders([id], newProvider);
+  }
+
+  // 批量修改对话的 model_provider
+  async changeModelProviders(ids: string[], newProvider: string): Promise<number> {
+    const normalizedProvider = newProvider.trim();
+    if (!normalizedProvider) {
+      throw new Error("model provider 不能为空");
+    }
+
+    const uniqueIds = [...new Set(ids.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      throw new Error("待修改对话不能为空");
+    }
+
+    const sessionIds = uniqueIds.map((id) => {
+      if (!id.startsWith("codex:")) {
+        throw new Error("仅支持修改 Codex 对话的 model provider");
+      }
+      return id.replace("codex:", "");
+    });
+
+    // 先确认所有文件都存在，避免 DB 已写入但文件找不到导致状态部分成功。
+    const filePaths = await Promise.all(
+      sessionIds.map(async (sessionId) => this.findConversationFilePath(sessionId))
+    );
+
     const dbPath = this.getStateDbPath();
     if (this.db) {
       this.db.close();
       this.db = null;
       this.dbPath = null;
     }
-    // 写操作需要新开一个可写连接
+
     const db = new Database(dbPath);
     try {
-      const result = db.prepare("UPDATE threads SET model_provider = ? WHERE id = ?").run(newProvider, sessionId);
-      if (result.changes === 0) throw new Error(`SQLite 中未找到对话: ${sessionId}`);
+      const updateStatement = db.prepare("UPDATE threads SET model_provider = ? WHERE id = ?");
+      const updateMany = db.transaction((targetSessionIds: string[]) => {
+        for (const sessionId of targetSessionIds) {
+          const result = updateStatement.run(normalizedProvider, sessionId);
+          if (result.changes === 0) {
+            throw new Error(`SQLite 中未找到对话: ${sessionId}`);
+          }
+        }
+      });
+
+      updateMany(sessionIds);
     } finally {
       db.close();
     }
 
-    // 清除文件缓存（缓存 key 是文件路径，不是对话 ID）
-    const basePath = this.getStoragePath();
-    const pattern = join(basePath, "**", `*${sessionId}*.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
-    for (const f of files) invalidateCache(f);
-    invalidateListCache(getListCacheKey(this.name, basePath));
+    for (const filePath of new Set(filePaths)) {
+      invalidateCache(filePath);
+    }
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+
+    return sessionIds.length;
   }
 }
