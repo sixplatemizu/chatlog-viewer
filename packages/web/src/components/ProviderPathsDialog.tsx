@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
-import { Loader2, RefreshCw, Save, Settings2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Loader2, RefreshCw, Save, Settings2, Sparkles, X } from "lucide-react";
 import {
+  fetchAvailableClis,
   fetchProviderPathSettings,
   getErrorMessage,
+  resetAiCliSession,
+  resetAllAiCliSessions,
   updateProviderPathSettings,
+  type AvailableCliInfo,
   type ProviderPathInfo,
   type ProviderPathSettings,
+  type TitleGenerationCli,
 } from "../lib/api";
 import type { ToastPayload } from "./ToastViewport";
 
@@ -39,6 +44,16 @@ const SOURCE_STYLES = {
   auto: "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-300 dark:border-emerald-700",
   default: "bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-700 dark:text-slate-300 dark:border-slate-600",
 } as const;
+
+const TITLE_GENERATION_CLI_LABELS: Record<TitleGenerationCli, string> = {
+  iflow: "iFlow",
+  codex: "Codex",
+  claude: "Claude Code",
+};
+
+function buildCliStateMap(clis: AvailableCliInfo[]): Partial<Record<TitleGenerationCli, AvailableCliInfo>> {
+  return Object.fromEntries(clis.map((cli) => [cli.name, cli])) as Partial<Record<TitleGenerationCli, AvailableCliInfo>>;
+}
 
 function buildDrafts(settings: ProviderPathSettings): Record<string, ProviderDraft> {
   return Object.fromEntries(
@@ -233,20 +248,163 @@ function ProviderCard({
   );
 }
 
+function TitleGenerationPriorityCard({
+  priority,
+  cliStates,
+  saving,
+  resettingCli,
+  onMove,
+  onResetCli,
+  onResetAll,
+}: {
+  priority: TitleGenerationCli[];
+  cliStates: Partial<Record<TitleGenerationCli, AvailableCliInfo>>;
+  saving: boolean;
+  resettingCli: TitleGenerationCli | "all" | null;
+  onMove: (index: number, direction: -1 | 1) => void;
+  onResetCli: (cli: TitleGenerationCli) => void;
+  onResetAll: () => void;
+}) {
+  const hasAnySession = priority.some((cli) => cliStates[cli]?.hasSession);
+
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800/70">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-purple-500" />
+          <div>
+            <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">AI 标题生成优先级</div>
+            <div className="text-[11px] text-gray-500 dark:text-gray-400">
+              生成标题时会按以下顺序依次尝试，成功后立即停止 fallback。每个 CLI 也会复用固定会话，可在这里手动重置。
+            </div>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onResetAll}
+          disabled={saving || resettingCli !== null || !hasAnySession}
+          className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-1.5 text-xs text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${resettingCli === "all" ? "animate-spin" : ""}`} />
+          全部重置会话
+        </button>
+      </div>
+
+      <div className="space-y-2">
+        {priority.map((cli, index) => {
+          const cliState = cliStates[cli];
+          const available = cliState?.available ?? false;
+          const hasSession = cliState?.hasSession ?? false;
+
+          return (
+            <div
+              key={cli}
+              className="flex items-center gap-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60"
+            >
+              <div className="flex h-6 w-6 items-center justify-center rounded-full bg-purple-100 text-xs font-semibold text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">
+                {index + 1}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm text-gray-800 dark:text-gray-100">
+                  {TITLE_GENERATION_CLI_LABELS[cli]}
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                  <span
+                    className={`rounded-full border px-2 py-0.5 text-[10px] ${
+                      available
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+                        : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
+                    }`}
+                  >
+                    {available ? "CLI 可用" : "CLI 未检测到"}
+                  </span>
+                  <span
+                    className={`rounded-full border px-2 py-0.5 text-[10px] ${
+                      hasSession
+                        ? "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-700 dark:bg-blue-900/30 dark:text-blue-300"
+                        : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
+                    }`}
+                  >
+                    {hasSession ? "已有固定会话" : "无固定会话"}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => onResetCli(cli)}
+                disabled={saving || resettingCli !== null || !hasSession}
+                className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                aria-label={`重置 ${TITLE_GENERATION_CLI_LABELS[cli]} 标题会话`}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${resettingCli === cli ? "animate-spin" : ""}`} />
+                重置会话
+              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => onMove(index, -1)}
+                  disabled={saving || resettingCli !== null || index === 0}
+                  className="rounded-md border border-gray-200 p-1 text-gray-500 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                  aria-label={`上移 ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onMove(index, 1)}
+                  disabled={saving || resettingCli !== null || index === priority.length - 1}
+                  className="rounded-md border border-gray-200 p-1 text-gray-500 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                  aria-label={`下移 ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                >
+                  <ArrowDown className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props) {
   const [settings, setSettings] = useState<ProviderPathSettings | null>(null);
   const [drafts, setDrafts] = useState<Record<string, ProviderDraft>>({});
   const [migrationDrafts, setMigrationDrafts] = useState<Record<string, ProviderMigrationDraft>>({});
+  const [titleGenerationCliPriority, setTitleGenerationCliPriority] = useState<TitleGenerationCli[]>([]);
+  const [cliStates, setCliStates] = useState<Partial<Record<TitleGenerationCli, AvailableCliInfo>>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resettingCli, setResettingCli] = useState<TitleGenerationCli | "all" | null>(null);
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
     try {
-      const nextSettings = await fetchProviderPathSettings();
+      const [settingsResult, clisResult] = await Promise.allSettled([
+        fetchProviderPathSettings(),
+        fetchAvailableClis(),
+      ]);
+
+      if (settingsResult.status === "rejected") {
+        throw settingsResult.reason;
+      }
+
+      const nextSettings = settingsResult.value;
       setSettings(nextSettings);
       setDrafts(buildDrafts(nextSettings));
       setMigrationDrafts({});
+      setTitleGenerationCliPriority(nextSettings.ai.titleGenerationCliPriority);
+
+      if (clisResult.status === "fulfilled") {
+        setCliStates(buildCliStateMap(clisResult.value));
+      } else {
+        setCliStates({});
+        onNotify({
+          variant: "error",
+          title: "读取 AI CLI 状态失败",
+          description: getErrorMessage(clisResult.reason, "读取 AI CLI 状态失败"),
+        });
+      }
     } catch (error) {
       onNotify({
         variant: "error",
@@ -293,6 +451,66 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
     []
   );
 
+  const handleMoveTitleGenerationCli = useCallback((index: number, direction: -1 | 1) => {
+    setTitleGenerationCliPriority((prev) => {
+      const targetIndex = index + direction;
+      if (targetIndex < 0 || targetIndex >= prev.length) {
+        return prev;
+      }
+
+      const next = [...prev];
+      [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
+      return next;
+    });
+  }, []);
+
+  const refreshCliStates = useCallback(async () => {
+    const nextClis = await fetchAvailableClis();
+    setCliStates(buildCliStateMap(nextClis));
+  }, []);
+
+  const handleResetCli = useCallback(async (cli: TitleGenerationCli) => {
+    setResettingCli(cli);
+    try {
+      await resetAiCliSession(cli);
+      await refreshCliStates();
+      onNotify({
+        variant: "success",
+        title: "会话已重置",
+        description: `${TITLE_GENERATION_CLI_LABELS[cli]} 的固定标题会话已清除，下次生成会自动新建。`,
+      });
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "重置会话失败",
+        description: getErrorMessage(error, "重置会话失败"),
+      });
+    } finally {
+      setResettingCli(null);
+    }
+  }, [onNotify, refreshCliStates]);
+
+  const handleResetAllClis = useCallback(async () => {
+    setResettingCli("all");
+    try {
+      await resetAllAiCliSessions();
+      await refreshCliStates();
+      onNotify({
+        variant: "success",
+        title: "会话已全部重置",
+        description: "所有标题生成 CLI 的固定会话已清除，下次生成会自动新建。",
+      });
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "重置全部会话失败",
+        description: getErrorMessage(error, "重置全部会话失败"),
+      });
+    } finally {
+      setResettingCli(null);
+    }
+  }, [onNotify, refreshCliStates]);
+
   const handleSave = useCallback(async () => {
     if (!settings) return;
 
@@ -336,31 +554,35 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
           ])
         ),
         migrations,
+        ai: {
+          titleGenerationCliPriority,
+        },
       });
 
       setSettings(nextSettings);
       setDrafts(buildDrafts(nextSettings));
       setMigrationDrafts({});
+      setTitleGenerationCliPriority(nextSettings.ai.titleGenerationCliPriority);
       await onSaved?.();
 
       const migrationMessages = nextSettings.migrationResults?.map((item) => item.message) ?? [];
       onNotify({
         variant: "success",
-        title: migrationMessages.length > 0 ? "路径设置已保存并迁移" : "路径设置已保存",
+        title: migrationMessages.length > 0 ? "设置已保存并迁移" : "设置已保存",
         description: migrationMessages.length > 0
-          ? `已写入配置文件并刷新 provider 解析结果。\n${migrationMessages.join("\n")}`
-          : "已写入配置文件并刷新 provider 解析结果。",
+          ? `已写入配置文件并刷新设置。\n${migrationMessages.join("\n")}`
+          : "已写入配置文件并刷新设置。",
       });
     } catch (error) {
       onNotify({
         variant: "error",
-        title: "保存路径设置失败",
-        description: getErrorMessage(error, "保存路径设置失败"),
+        title: "保存设置失败",
+        description: getErrorMessage(error, "保存设置失败"),
       });
     } finally {
       setSaving(false);
     }
-  }, [drafts, migrationDrafts, onNotify, onSaved, settings]);
+  }, [drafts, migrationDrafts, onNotify, onSaved, settings, titleGenerationCliPriority]);
 
   if (!open) return null;
 
@@ -371,8 +593,8 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
           <div className="flex items-center gap-2">
             <Settings2 className="h-4 w-4 text-blue-500" />
             <div>
-              <div className="text-base font-semibold text-gray-900 dark:text-gray-100">Provider 路径设置</div>
-              <div className="text-xs text-gray-500 dark:text-gray-400">查看当前解析结果，并保存 config override</div>
+              <div className="text-base font-semibold text-gray-900 dark:text-gray-100">Provider 与 AI 设置</div>
+              <div className="text-xs text-gray-500 dark:text-gray-400">查看当前解析结果，并保存 config override 与标题生成优先级</div>
             </div>
           </div>
           <button
@@ -399,6 +621,15 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
             </div>
           ) : settings ? (
             <div className="space-y-4">
+              <TitleGenerationPriorityCard
+                priority={titleGenerationCliPriority}
+                cliStates={cliStates}
+                saving={saving}
+                resettingCli={resettingCli}
+                onMove={handleMoveTitleGenerationCli}
+                onResetCli={(cli) => void handleResetCli(cli)}
+                onResetAll={() => void handleResetAllClis()}
+              />
               {settings.providers.map((provider) => (
                 <ProviderCard
                   key={provider.name}
@@ -422,7 +653,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
           <button
             type="button"
             onClick={() => void loadSettings()}
-            disabled={loading || saving}
+            disabled={loading || saving || resettingCli !== null}
             className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-600 transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
           >
             <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
@@ -432,6 +663,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
             <button
               type="button"
               onClick={onClose}
+              disabled={resettingCli !== null}
               className="rounded-lg px-3 py-2 text-sm text-gray-600 transition hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-700"
             >
               关闭
@@ -439,7 +671,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
             <button
               type="button"
               onClick={() => void handleSave()}
-              disabled={loading || saving || !settings}
+              disabled={loading || saving || resettingCli !== null || !settings}
               className="inline-flex items-center gap-2 rounded-lg bg-blue-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-blue-600 disabled:cursor-wait disabled:opacity-60"
             >
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

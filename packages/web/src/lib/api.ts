@@ -89,6 +89,9 @@ export interface ProviderPathInfo {
 export interface ProviderPathSettings {
   configPath: string;
   providers: ProviderPathInfo[];
+  ai: {
+    titleGenerationCliPriority: TitleGenerationCli[];
+  };
   migrationResults?: ProviderPathMigrationResult[];
 }
 
@@ -100,6 +103,8 @@ export interface ProviderPathMigrationResult {
   mode: "moved" | "merged";
   message: string;
 }
+
+export type TitleGenerationCli = "iflow" | "codex" | "claude";
 
 export interface ConversationMeta {
   id: string;
@@ -150,6 +155,7 @@ export async function fetchProviderPathSettings(signal?: AbortSignal): Promise<P
 export async function updateProviderPathSettings(payload: {
   providers: Record<string, { storagePath?: string | null; stateDbPath?: string | null }>;
   migrations?: Record<string, { storagePath?: boolean; stateDbPath?: boolean }>;
+  ai?: { titleGenerationCliPriority: TitleGenerationCli[] };
 }): Promise<ProviderPathSettings> {
   return requestJson<ProviderPathSettings>(`${BASE}/settings/provider-paths`, {
     method: "PUT",
@@ -314,12 +320,28 @@ export async function generateAiTitle(
 }
 
 export interface AvailableCliInfo {
-  name: string;
+  name: TitleGenerationCli;
+  available: boolean;
   hasSession: boolean;
 }
 
 export async function fetchAvailableClis(): Promise<AvailableCliInfo[]> {
   return requestJson<AvailableCliInfo[]>(`${BASE}/ai/clis`);
+}
+
+export async function resetAiCliSession(name: TitleGenerationCli): Promise<{ success: boolean }> {
+  return requestJson<{ success: boolean }>(
+    `${BASE}/ai/clis/${encodeURIComponent(name)}/session`,
+    {
+      method: "DELETE",
+    }
+  );
+}
+
+export async function resetAllAiCliSessions(): Promise<{ success: boolean }> {
+  return requestJson<{ success: boolean }>(`${BASE}/ai/clis/sessions`, {
+    method: "DELETE",
+  });
 }
 
 export interface ProjectInfo {

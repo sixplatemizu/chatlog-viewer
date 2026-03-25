@@ -7,6 +7,8 @@ import {
   clearProviderPathCache,
   getAppConfig,
   getProviderConfigPath,
+  getTitleGenerationCliPriority,
+  normalizeTitleGenerationCliPriority,
   resolveProviderPaths,
   updateProviderConfigs,
 } from "../../utils/provider-paths.js";
@@ -117,6 +119,13 @@ test("配置文件路径支持环境变量覆盖", () => {
   assert.equal(configPath, "/appdata/chatlog-viewer/config.json");
 });
 
+test("标题生成 CLI 优先级会归一化并补齐缺失项", () => {
+  assert.deepEqual(
+    normalizeTitleGenerationCliPriority(["codex", "iflow", "codex"]),
+    ["codex", "iflow", "claude"]
+  );
+});
+
 test("更新 provider 配置会写入文件并支持清空回退", async () => {
   const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-provider-paths-"));
   const env = {
@@ -135,18 +144,25 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
         },
       },
       env,
-      baseDir
+      baseDir,
+      {
+        ai: {
+          titleGenerationCliPriority: ["codex", "iflow", "claude"],
+        },
+      }
     );
 
     const saved = JSON.parse(
       await readFile(join(baseDir, "config.json"), "utf-8")
     ) as {
       providers?: Record<string, { storagePath?: string; stateDbPath?: string }>;
+      ai?: { titleGenerationCliPriority?: string[] };
     };
 
     assert.equal(saved.providers?.codex?.storagePath, "/data/codex/sessions");
     assert.equal(saved.providers?.codex?.stateDbPath, "/data/codex/state_5.sqlite");
     assert.equal(saved.providers?.["claude-code"]?.storagePath, "/data/claude/projects");
+    assert.deepEqual(saved.ai?.titleGenerationCliPriority, ["codex", "iflow", "claude"]);
 
     await updateProviderConfigs(
       {
@@ -162,6 +178,7 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
     const loaded = getAppConfig(env, baseDir);
     assert.equal(loaded.config.providers?.codex, undefined);
     assert.equal(loaded.config.providers?.["claude-code"]?.storagePath, "/data/claude/projects");
+    assert.deepEqual(getTitleGenerationCliPriority(env, baseDir), ["codex", "iflow", "claude"]);
   } finally {
     await rm(baseDir, { recursive: true, force: true });
   }

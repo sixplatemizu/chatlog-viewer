@@ -4,17 +4,26 @@ import { homedir } from "os";
 import { posix, win32 } from "path";
 
 export type ResolvedProviderName = "claude-code" | "codex" | "iflow";
+export type TitleGenerationCli = "iflow" | "codex" | "claude";
 type PathKind = "file" | "directory";
 type EnvLike = Record<string, string | undefined>;
 export type ProviderPathSource = "env" | "config" | "auto" | "default";
+
+const TITLE_GENERATION_CLI_ORDER: TitleGenerationCli[] = ["iflow", "codex", "claude"];
+const TITLE_GENERATION_CLI_SET = new Set<TitleGenerationCli>(TITLE_GENERATION_CLI_ORDER);
 
 export interface ProviderPathConfig {
   storagePath?: string;
   stateDbPath?: string;
 }
 
+export interface AiConfig {
+  titleGenerationCliPriority?: TitleGenerationCli[];
+}
+
 export interface AppConfig {
   providers?: Partial<Record<ResolvedProviderName, ProviderPathConfig>>;
+  ai?: AiConfig;
 }
 
 export interface LoadedConfig {
@@ -59,6 +68,7 @@ interface ResolveProviderPathsOptions {
 
 interface UpdateProviderConfigsOptions {
   migrations?: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>>;
+  ai?: AiConfig;
 }
 
 interface ResolvedPathResult {
@@ -92,6 +102,37 @@ export function getProviderConfigPath(env: EnvLike = process.env, homeDir = home
 
 export function getAppConfig(env: EnvLike = process.env, homeDir = homedir()): LoadedConfig {
   return loadAppConfig(env, homeDir);
+}
+
+export function normalizeTitleGenerationCliPriority(
+  priority?: readonly string[]
+): TitleGenerationCli[] {
+  const normalized: TitleGenerationCli[] = [];
+  const seen = new Set<TitleGenerationCli>();
+
+  for (const item of priority ?? []) {
+    if (!TITLE_GENERATION_CLI_SET.has(item as TitleGenerationCli)) continue;
+    const cli = item as TitleGenerationCli;
+    if (seen.has(cli)) continue;
+    seen.add(cli);
+    normalized.push(cli);
+  }
+
+  for (const cli of TITLE_GENERATION_CLI_ORDER) {
+    if (seen.has(cli)) continue;
+    normalized.push(cli);
+  }
+
+  return normalized;
+}
+
+export function getTitleGenerationCliPriority(
+  env: EnvLike = process.env,
+  homeDir = homedir()
+): TitleGenerationCli[] {
+  return normalizeTitleGenerationCliPriority(
+    loadAppConfig(env, homeDir).config.ai?.titleGenerationCliPriority
+  );
 }
 
 export function resolveProviderPaths(
@@ -252,6 +293,15 @@ export async function updateProviderConfigs(
 
   if (nextConfig.providers && Object.keys(nextConfig.providers).length === 0) {
     delete nextConfig.providers;
+  }
+
+  if (options.ai) {
+    nextConfig.ai = {
+      ...(nextConfig.ai ?? {}),
+      titleGenerationCliPriority: normalizeTitleGenerationCliPriority(
+        options.ai.titleGenerationCliPriority
+      ),
+    };
   }
 
   const migrationResults = await migrateProviderPaths(

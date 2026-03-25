@@ -3,7 +3,7 @@ import { homedir } from "os";
 import type { ConversationProvider, ConversationMeta } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
-import { generateTitle, getAvailableClis } from "../utils/ai.js";
+import { generateTitle, getAvailableClis, resetSession } from "../utils/ai.js";
 import { hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
 import { getErrorMessage, getErrorStatus } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
@@ -11,16 +11,24 @@ import {
   getAppConfig,
   getProviderConfigPath,
   getProviderPaths,
+  getTitleGenerationCliPriority,
+  normalizeTitleGenerationCliPriority,
   updateProviderConfigs,
   type ProviderPathMigrationSelection,
   type ProviderPathConfig,
   type ResolvedProviderName,
+  type TitleGenerationCli,
 } from "../utils/provider-paths.js";
 
 const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "iflow"]);
+const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["iflow", "codex", "claude"]);
 
 function isResolvedProviderName(name: string): name is ResolvedProviderName {
   return RESOLVED_PROVIDER_NAMES.has(name as ResolvedProviderName);
+}
+
+function isTitleGenerationCli(name: string): name is TitleGenerationCli {
+  return TITLE_GENERATION_CLI_NAMES.has(name as TitleGenerationCli);
 }
 
 function normalizeOptionalPathInput(value: unknown): string | undefined {
@@ -77,6 +85,9 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     return c.json({
       configPath: getProviderConfigPath(),
       providers: buildProviderPathSettings(providers),
+      ai: {
+        titleGenerationCliPriority: getTitleGenerationCliPriority(),
+      },
     });
   });
 
@@ -84,6 +95,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const body = await c.req.json<{
       providers?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
       migrations?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
+      ai?: { titleGenerationCliPriority?: unknown };
     }>();
 
     if (!body || typeof body !== "object" || !body.providers || typeof body.providers !== "object") {
@@ -92,6 +104,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
     const updates: Partial<Record<ResolvedProviderName, ProviderPathConfig>> = {};
     const migrations: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>> = {};
+    let titleGenerationCliPriority: TitleGenerationCli[] | undefined;
 
     try {
       for (const [providerName, value] of Object.entries(body.providers)) {
@@ -144,15 +157,43 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
           }
         }
       }
+
+      if (body.ai !== undefined) {
+        if (!body.ai || typeof body.ai !== "object") {
+          return c.json({ error: "ai 配置格式错误" }, 400);
+        }
+
+        if ("titleGenerationCliPriority" in body.ai) {
+          if (!Array.isArray(body.ai.titleGenerationCliPriority)) {
+            return c.json({ error: "标题生成 CLI 优先级必须是数组" }, 400);
+          }
+          titleGenerationCliPriority = normalizeTitleGenerationCliPriority(
+            body.ai.titleGenerationCliPriority
+              .filter((item): item is string => typeof item === "string")
+              .map((item) => item.trim())
+              .filter(Boolean)
+          );
+        }
+      }
     } catch (error) {
       return c.json({ error: getErrorMessage(error) }, 400);
     }
 
-    const updated = await updateProviderConfigs(updates, process.env, homedir(), { migrations });
+    const updated = await updateProviderConfigs(updates, process.env, homedir(), {
+      migrations,
+      ...(titleGenerationCliPriority ? {
+        ai: {
+          titleGenerationCliPriority,
+        },
+      } : {}),
+    });
 
     return c.json({
       configPath: getProviderConfigPath(),
       providers: buildProviderPathSettings(providers),
+      ai: {
+        titleGenerationCliPriority: getTitleGenerationCliPriority(),
+      },
       migrationResults: updated.migrationResults,
     });
   });
@@ -411,7 +452,9 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
     try {
       const conversation = await provider.read(id);
-      const result = await generateTitle(conversation.messages);
+      const result = await generateTitle(conversation.messages, {
+        priority: getTitleGenerationCliPriority(),
+      });
       // 自动保存生成的标题
       await setTitle(id, result.title);
       return c.json({ success: true, title: result.title, usedCli: result.usedCli });
@@ -467,6 +510,21 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   app.get("/ai/clis", async (c) => {
     const clis = await getAvailableClis();
     return c.json(clis);
+  });
+
+  app.delete("/ai/clis/sessions", async (c) => {
+    await resetSession();
+    return c.json({ success: true });
+  });
+
+  app.delete("/ai/clis/:name/session", async (c) => {
+    const name = decodeURIComponent(c.req.param("name"));
+    if (!isTitleGenerationCli(name)) {
+      return c.json({ error: "未知的 AI CLI" }, 404);
+    }
+
+    await resetSession(name);
+    return c.json({ success: true });
   });
 
   // Codex model_provider 列表

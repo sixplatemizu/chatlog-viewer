@@ -3,8 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationViewer } from "./ConversationViewer";
 import type { Conversation } from "../lib/api";
 
-const { mockDeleteConversationMessages } = vi.hoisted(() => ({
+const { mockDeleteConversationMessages, mockGenerateAiTitle } = vi.hoisted(() => ({
   mockDeleteConversationMessages: vi.fn(),
+  mockGenerateAiTitle: vi.fn(),
 }));
 
 vi.mock("../lib/api", async () => {
@@ -12,6 +13,7 @@ vi.mock("../lib/api", async () => {
   return {
     ...actual,
     deleteConversationMessages: mockDeleteConversationMessages,
+    generateAiTitle: mockGenerateAiTitle,
   };
 });
 
@@ -54,6 +56,7 @@ const baseConversation: Conversation = {
 describe("ConversationViewer", () => {
   beforeEach(() => {
     mockDeleteConversationMessages.mockReset();
+    mockGenerateAiTitle.mockReset();
   });
 
   it("批量删除模式会选择已加载消息并触发批量删除", async () => {
@@ -92,6 +95,41 @@ describe("ConversationViewer", () => {
     });
 
     confirmSpy.mockRestore();
+  });
+
+  it("右侧显式 AI 标题按钮会触发生成并刷新当前对话", async () => {
+    const onTitleChanged = vi.fn().mockResolvedValue(undefined);
+    mockGenerateAiTitle.mockResolvedValue({
+      success: true,
+      title: "新的 AI 标题",
+      usedCli: "iflow",
+    });
+
+    render(
+      <ConversationViewer
+        conversation={baseConversation}
+        dark={false}
+        loading={false}
+        loadingEarlier={false}
+        onLoadEarlier={() => {}}
+        onExport={() => {}}
+        onDelete={() => {}}
+        onTitleChanged={onTitleChanged}
+        onConversationChanged={() => {}}
+        onNotify={() => {}}
+        codexModelProviders={[{ name: "openai", count: 1 }]}
+        onChangeModelProvider={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 标题" }));
+
+    await waitFor(() => {
+      expect(mockGenerateAiTitle).toHaveBeenCalledWith("codex:test-1");
+    });
+    await waitFor(() => {
+      expect(onTitleChanged).toHaveBeenCalledWith("codex:test-1");
+    });
   });
 
   it("没有会话时显示空态", () => {

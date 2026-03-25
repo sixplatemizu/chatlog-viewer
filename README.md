@@ -9,6 +9,7 @@
 - 支持 provider 过滤、Codex model provider 过滤、按更新时间 / 创建时间 / provider 排序
 - 搜索基于本地索引，支持长消息 chunk search，降低超长会话中段内容漏检概率
 - 支持手动改标题、调用本地 CLI 生成标题、批量选择、批量删除、项目间移动会话
+- AI 标题生成支持 `iflow / codex / claude` 优先级设置，并为每个 CLI 复用固定会话
 - 导出支持 `完整导出` 和 `Partial Export` 两种模式，超长对话可优先走 partial
 - Provider 路径支持自动发现、环境变量覆盖、配置文件覆盖，并可直接在 UI 中查看与修改
 - API 默认只允许本机 Host / Origin 访问，减少误暴露风险
@@ -46,6 +47,7 @@ pnpm install
 pnpm dev
 ```
 
+- `pnpm dev` 会同时启动 Web 和 Server 两个子进程
 - Web: `http://localhost:5173`
 - API: `http://127.0.0.1:3456`
 
@@ -91,6 +93,9 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 
 - 支持手动改标题
 - 支持调用本地 AI CLI 自动生成标题
+- 标题生成支持 `iflow -> codex -> claude` 等可调 fallback 优先级
+- 每个标题生成 CLI 会复用固定会话，避免每次都新建新对话
+- 设置页支持查看每个 CLI 是否可用、是否已有固定会话，并可单独或全部重置
 - 支持批量选择、批量删除
 - 支持在同 provider 的不同项目目录间移动会话
 - Codex 会话支持修改 `model_provider`
@@ -121,6 +126,9 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 - 查看路径来源是 `env` / `config` / `auto` / `default`
 - 查看目录或文件是否存在
 - 直接保存配置覆盖值
+- 调整 AI 标题生成 CLI 优先级
+- 查看 AI CLI 可用状态与固定会话状态
+- 手动重置单个或全部 AI 标题固定会话
 
 ### 配置文件
 

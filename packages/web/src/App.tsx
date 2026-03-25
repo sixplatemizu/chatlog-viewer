@@ -351,9 +351,9 @@ export default function App() {
       setGenProgress((prev) => ({ ...prev!, results: [...results] }));
     }
 
-    refresh();
+    await reloadAllData();
     setBatchGenerating(false);
-  }, [selectedIds, batchGenerating, conversations, refresh]);
+  }, [selectedIds, batchGenerating, conversations, reloadAllData]);
 
   const handleAbortGenerate = useCallback(() => {
     abortRef.current = true;

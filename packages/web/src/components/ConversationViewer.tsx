@@ -341,18 +341,6 @@ export function ConversationViewer({
                 >
                   <Pencil className="w-3.5 h-3.5" />
                 </button>
-                <button
-                  onClick={handleGenerate}
-                  disabled={generating}
-                  className="p-1 text-gray-300 hover:text-purple-600 dark:hover:text-purple-400 opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-50"
-                  title="AI 生成标题"
-                >
-                  {generating ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <Sparkles className="w-3.5 h-3.5" />
-                  )}
-                </button>
               </div>
             )}
 
@@ -440,6 +428,18 @@ export function ConversationViewer({
                 </button>
               )
             )}
+            <button
+              onClick={handleGenerate}
+              disabled={generating}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {generating ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="w-3.5 h-3.5" />
+              )}
+              {generating ? "生成中" : "AI 标题"}
+            </button>
             <button
               onClick={() => onExport(conversation.id)}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
