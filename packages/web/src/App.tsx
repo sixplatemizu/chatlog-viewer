@@ -75,7 +75,6 @@ export default function App() {
     partialSearch,
     searchWarnings,
     reloadAllData,
-    refreshConversation,
     applyLocalTitleChange,
     applyLocalMessageUpdate,
     applyLocalMessageDelete,

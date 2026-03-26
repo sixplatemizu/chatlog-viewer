@@ -694,7 +694,9 @@ export class CodexProvider implements ConversationProvider {
       }
 
       messageCount += 1;
-      searchBuilder && appendSearchIndexEntry(searchBuilder, entry);
+      if (searchBuilder) {
+        appendSearchIndexEntry(searchBuilder, entry);
+      }
     });
 
     if (messageCount === 0 && userMessageCount === 0) {

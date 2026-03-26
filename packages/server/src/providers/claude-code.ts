@@ -649,7 +649,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
         }
       }
 
-      searchBuilder && appendSearchIndexEntry(searchBuilder, entry);
+      if (searchBuilder) {
+        appendSearchIndexEntry(searchBuilder, entry);
+      }
     });
 
     if (messageCount === 0) {
