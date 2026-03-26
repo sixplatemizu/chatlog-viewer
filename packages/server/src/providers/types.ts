@@ -9,14 +9,34 @@ export interface ConversationListOptions {
   eagerSearchIndex?: boolean;
 }
 
+export type TitleSyncMode = "native" | "overlay";
+
+export interface ConversationProviderCapabilities {
+  titleSyncMode?: TitleSyncMode;
+  canUpdateTitle?: boolean;
+  canGenerateTitle?: boolean;
+  updateTitleDisabledReason?: string;
+  generateTitleDisabledReason?: string;
+}
+
+export interface ConversationCapabilities {
+  canUpdateTitle: boolean;
+  canGenerateTitle: boolean;
+  updateTitleDisabledReason?: string;
+  generateTitleDisabledReason?: string;
+}
+
 export interface ConversationProvider {
   name: string;
   displayName: string;
+  capabilities?: ConversationProviderCapabilities;
   detect(): Promise<boolean>;
   list(options?: ConversationListOptions): Promise<ConversationMeta[]>;
+  getListSourceSignature?(): Promise<string | null>;
   read(id: string, options?: ConversationReadOptions): Promise<Conversation>;
   delete(id: string): Promise<void>;
   move?(id: string, targetProjectKey: string): Promise<void>;
+  updateTitle?(id: string, title: string): Promise<void>;
   updateMessage?(id: string, messageId: string, content: string): Promise<void>;
   deleteMessage?(id: string, messageId: string): Promise<void>;
   deleteMessages?(id: string, messageIds: string[]): Promise<void>;
@@ -28,8 +48,11 @@ export interface ConversationMeta {
   id: string;
   provider: string;
   title: string;
-  project: string;         // 显示用的可读路径（来自 cwd）
-  projectKey: string;       // 分组用的 key（来自文件夹名，保证同项目一致）
+  titleSyncMode?: TitleSyncMode;
+  capabilities?: ConversationCapabilities;
+  project: string;          // 显示用的可读路径（优先来自 cwd）
+  projectKey: string;       // provider 内部项目 key（用于移动或定位存储目录）
+  projectId?: string;       // 稳定分组 identity（优先规范化 cwd，缺失时退回 projectKey）
   createdAt: number;
   updatedAt: number;
   messageCount: number;

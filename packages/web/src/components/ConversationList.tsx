@@ -17,6 +17,14 @@ const PROVIDER_BADGE: Record<string, string> = {
   opencode: "bg-cyan-500",
 };
 
+const PROVIDER_LABEL: Record<string, string> = {
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  iflow: "iFlow",
+  "gemini-cli": "Gemini CLI",
+  opencode: "OpenCode",
+};
+
 const FOLDER_COLOR: Record<string, string> = {
   "claude-code": "text-orange-400",
   codex: "text-green-400",
@@ -47,6 +55,7 @@ interface ConversationGroup {
   displayPath: string;
   provider: string;
   projectKey: string;
+  projectId: string;
   conversations: ConversationMeta[];
   ids: string[];
 }
@@ -103,7 +112,9 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
   for (const conv of conversations) {
     const rawProjectKey = conv.projectKey || conv.project || "未知目录";
     const projectKey = canonicalizeProjectPath(rawProjectKey) || rawProjectKey;
-    const key = `${conv.provider}::${projectKey}`;
+    const rawProjectId = conv.projectId || conv.project || rawProjectKey;
+    const projectId = canonicalizeProjectPath(rawProjectId) || projectKey;
+    const key = `${conv.provider}::${projectId}`;
     let group = groups.get(key);
 
     if (!group) {
@@ -112,6 +123,7 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
         displayPath: normalizeProjectPath(conv.project || rawProjectKey),
         provider: conv.provider,
         projectKey,
+        projectId,
         conversations: [],
         ids: [],
       };
@@ -236,6 +248,29 @@ export const ConversationList = memo(function ConversationList({
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
 
   const groups = useMemo(() => groupByProject(conversations), [conversations]);
+  const duplicateProjectGroupKeys = useMemo(() => {
+    const providersByDisplayPath = new Map<string, Set<string>>();
+
+    for (const group of groups) {
+      const displayPathKey = canonicalizeProjectPath(
+        getProjectPathHint(group.displayPath, group.projectKey)
+      ) || normalizeProjectPath(getProjectPathHint(group.displayPath, group.projectKey)).toLowerCase();
+      const providers = providersByDisplayPath.get(displayPathKey) ?? new Set<string>();
+      providers.add(group.provider);
+      providersByDisplayPath.set(displayPathKey, providers);
+    }
+
+    return new Set(
+      groups
+        .filter((group) => {
+          const displayPathKey = canonicalizeProjectPath(
+            getProjectPathHint(group.displayPath, group.projectKey)
+          ) || normalizeProjectPath(getProjectPathHint(group.displayPath, group.projectKey)).toLowerCase();
+          return (providersByDisplayPath.get(displayPathKey)?.size ?? 0) > 1;
+        })
+        .map((group) => group.key)
+    );
+  }, [groups]);
   const groupSelectionState = useMemo(() => {
     const selectedCountByGroup = new Map<string, number>();
 
@@ -320,6 +355,7 @@ export const ConversationList = memo(function ConversationList({
         const allChecked = selectedCount > 0 && selectedCount === group.ids.length;
         const someChecked = selectedCount > 0 && selectedCount < group.ids.length;
         const isDragTarget = dragOverKey === group.key;
+        const showProviderLabel = duplicateProjectGroupKeys.has(group.key);
 
         return (
           <div
@@ -354,6 +390,11 @@ export const ConversationList = memo(function ConversationList({
               <span className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">
                 {displayName}
               </span>
+              {showProviderLabel && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-gray-300 text-gray-500 dark:border-gray-600 dark:text-gray-300 flex-shrink-0">
+                  {PROVIDER_LABEL[group.provider] || group.provider}
+                </span>
+              )}
               <span className="text-xs text-gray-400 ml-auto flex-shrink-0">
                 {group.conversations.length}
               </span>

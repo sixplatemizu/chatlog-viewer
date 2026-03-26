@@ -1,5 +1,5 @@
 import { join } from "path";
-import { stat, unlink, rename, mkdir, readdir, readFile, writeFile } from "fs/promises";
+import { stat, unlink, rename, mkdir, readdir } from "fs/promises";
 import { glob } from "glob";
 import {
   parseJsonlWithMeta,
@@ -12,7 +12,11 @@ import {
 import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
-import { collectIndexedCacheItemsInBatches } from "../utils/provider-indexing.js";
+import {
+  collectGlobFileStates,
+  collectIndexedCacheItemsInBatches,
+  createIndexedListSourceSignature,
+} from "../utils/provider-indexing.js";
 import {
   createConversationSearchIndexBuilder,
   type ConversationSearchIndex,
@@ -21,9 +25,13 @@ import {
 import {
   assignStableMessageIds,
   createMessageSourceKey,
+  createStableMessageSourceKey,
+  getMessageActionLineNumbers,
+  invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
-  rewriteJsonlLine,
-  rewriteJsonlLines,
+  primeMessageActionIndex,
+  rewriteJsonlFileLine,
+  rewriteJsonlFileLines,
   type MessageRecord,
 } from "../utils/message-actions.js";
 import type {
@@ -73,6 +81,14 @@ function extractTextContent(
 
 function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function canonicalizeProjectPath(value: string): string {
+  const normalized = normalizePath(value);
+  if (!normalized) return "";
+  return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("~/")
+    ? normalized.toLowerCase()
+    : normalized;
 }
 
 function isWindowsHomePath(path: string): boolean {
@@ -127,7 +143,20 @@ function buildMessageRecords(entries: JsonlLine<IFlowEntry>[]): MessageRecord<IF
       records.push({
         entry: value,
         sourceKey: isPureTextContent(value.message.content)
-          ? createMessageSourceKey(entry.rawLine, "user")
+          ? createStableMessageSourceKey(
+            "iflow",
+            [
+              value.uuid,
+              value.message.id,
+              value.sessionId,
+              value.timestamp,
+              value.type,
+              Array.isArray(value.message.content)
+                ? value.message.content.map((block) => block.type).join(",")
+                : "text",
+            ],
+            entry.rawLine
+          ) ?? createMessageSourceKey(entry.rawLine, "iflow")
           : undefined,
         lineIndex: entry.lineNumber,
         message: {
@@ -142,7 +171,20 @@ function buildMessageRecords(entries: JsonlLine<IFlowEntry>[]): MessageRecord<IF
         records.push({
           entry: value,
           sourceKey: isPureTextContent(value.message.content)
-            ? createMessageSourceKey(entry.rawLine, "assistant")
+            ? createStableMessageSourceKey(
+              "iflow",
+              [
+                value.uuid,
+                value.message.id,
+                value.sessionId,
+                value.timestamp,
+                value.type,
+                Array.isArray(value.message.content)
+                  ? value.message.content.map((block) => block.type).join(",")
+                  : "text",
+              ],
+              entry.rawLine
+            ) ?? createMessageSourceKey(entry.rawLine, "iflow")
             : undefined,
           lineIndex: entry.lineNumber,
           message: {
@@ -206,6 +248,13 @@ function appendSearchIndexEntry(
 export class IFlowProvider implements ConversationProvider {
   name = "iflow";
   displayName = "iFlow CLI";
+  capabilities = {
+    titleSyncMode: "overlay",
+    canUpdateTitle: false,
+    canGenerateTitle: false,
+    updateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+    generateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+  } as const;
   private backgroundRefreshes = new Map<string, Promise<void>>();
 
   getStoragePath(): string {
@@ -226,6 +275,16 @@ export class IFlowProvider implements ConversationProvider {
       eagerSearchIndex: options.eagerSearchIndex ?? false,
       allowBackground: true,
     });
+  }
+
+  async getListSourceSignature(): Promise<string | null> {
+    try {
+      const pattern = join(this.getStoragePath(), "*", "session-*.jsonl").replace(/\\/g, "/");
+      const fileStates = await collectGlobFileStates(pattern);
+      return createIndexedListSourceSignature(fileStates);
+    } catch {
+      return null;
+    }
   }
 
   private scheduleBackgroundIndexRefresh(): void {
@@ -255,8 +314,12 @@ export class IFlowProvider implements ConversationProvider {
   }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
     const cacheKey = getListCacheKey(this.name, basePath);
+    const pattern = join(basePath, "*", "session-*.jsonl").replace(/\\/g, "/");
+    const fileStates = await collectGlobFileStates(pattern);
+    const sourceSignature = createIndexedListSourceSignature(fileStates);
     const cachedList = getIndexedListCache(cacheKey, undefined, {
       requireSearchReady: options.eagerSearchIndex,
+      sourceSignature,
     });
     if (cachedList) {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
@@ -264,57 +327,151 @@ export class IFlowProvider implements ConversationProvider {
 
     const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
     const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
-    const pattern = join(basePath, "*", "session-*.jsonl").replace(/\\/g, "/");
-    const files = await glob(pattern);
 
     const results: IndexedCacheItem[] = [];
     const filesToRefresh: string[] = [];
 
-    for (const filePath of files) {
+    for (const fileState of fileStates) {
+      const filePath = fileState.path;
       const previousMeta = previousByFilePath.get(filePath);
       if (!previousMeta) {
         filesToRefresh.push(filePath);
         continue;
       }
 
-      try {
-        const fileStat = await stat(filePath);
-        if (
-          fileStat.mtimeMs === previousMeta.meta.updatedAt
-          && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
-        ) {
-          setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
-          results.push(previousMeta);
-        } else {
-          filesToRefresh.push(filePath);
-        }
-      } catch {
+      if (
+        fileState.mtimeMs === previousMeta.meta.updatedAt
+        && fileState.size === previousMeta.meta.fileSize
+        && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
+      ) {
+        setCache(filePath, fileState.mtimeMs, previousMeta.meta);
+        results.push(previousMeta);
+      } else {
         filesToRefresh.push(filePath);
       }
     }
 
-    results.push(...await collectIndexedCacheItemsInBatches(filesToRefresh, 20, async (filePath) => {
-      const meta = await this.extractMeta(filePath);
-      if (!meta) return null;
-      if (!options.eagerSearchIndex) {
-        return { meta };
-      }
-      return {
-        meta,
-        ...(await this.extractSearchIndex(filePath)),
-      };
-    }));
+    results.push(...await collectIndexedCacheItemsInBatches(filesToRefresh, 20, async (filePath) => (
+      this.buildIndexedCacheItem(filePath, {
+        includeSearchIndex: options.eagerSearchIndex,
+        metaHint: previousByFilePath.get(filePath)?.meta,
+      })
+    )));
 
     const normalizedResults = this.applyProjectDisplayPathHints(results);
 
     const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
-    setIndexedListCache(cacheKey, normalizedResults, { searchReady });
+    setIndexedListCache(cacheKey, normalizedResults, { searchReady, sourceSignature });
 
     if (!searchReady && options.allowBackground) {
       this.scheduleBackgroundIndexRefresh();
     }
 
     return normalizedResults.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  private async buildIndexedCacheItem(
+    filePath: string,
+    options: {
+      includeSearchIndex: boolean;
+      metaHint?: ConversationMeta;
+    }
+  ): Promise<IndexedCacheItem | null> {
+    const fileStat = await stat(filePath);
+    const metaHint = options.metaHint;
+
+    if (metaHint && metaHint.updatedAt === fileStat.mtimeMs && metaHint.fileSize === fileStat.size) {
+      setCache(filePath, fileStat.mtimeMs, metaHint);
+      if (!options.includeSearchIndex) {
+        return { meta: metaHint };
+      }
+      return {
+        meta: metaHint,
+        ...(await this.extractSearchIndex(filePath)),
+      };
+    }
+
+    return this.scanConversationFile(filePath, fileStat, options.includeSearchIndex);
+  }
+
+  private async scanConversationFile(
+    filePath: string,
+    fileStat: {
+      mtimeMs: number;
+      size: number;
+      birthtimeMs: number;
+    },
+    includeSearchIndex: boolean
+  ): Promise<IndexedCacheItem | null> {
+    const pathParts = filePath.replace(/\\/g, "/").split("/");
+    const projectFolder = pathParts[pathParts.length - 2] || "";
+    const sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
+    let project = projectFolder;
+    let title = "";
+    let firstTimestamp: number | undefined;
+    let messageCount = 0;
+    const searchBuilder = includeSearchIndex ? createConversationSearchIndexBuilder() : null;
+
+    await visitJsonl<IFlowEntry>(filePath, (entry) => {
+      if (
+        entry.isSidechain
+        || !entry.message
+        || (entry.type !== "user" && entry.type !== "assistant")
+      ) {
+        return;
+      }
+
+      messageCount += 1;
+
+      if (firstTimestamp === undefined) {
+        const timestamp = Date.parse(entry.timestamp);
+        if (Number.isFinite(timestamp)) {
+          firstTimestamp = timestamp;
+        }
+      }
+
+      if (entry.type === "user" && entry.cwd) {
+        project = normalizePath(entry.cwd);
+      }
+
+      if (!title && entry.type === "user") {
+        const text = extractTextContent(entry.message.content);
+        if (text.trim() && !text.startsWith("/")) {
+          title = text.slice(0, 100);
+        }
+      }
+
+      searchBuilder && appendSearchIndexEntry(searchBuilder, entry);
+    });
+
+    if (messageCount === 0) {
+      return null;
+    }
+
+    const meta: ConversationMeta = {
+      id: `iflow:${sessionId}`,
+      provider: this.name,
+      title: title.replace(/<[^>]+>/g, "").trim() || "未知对话",
+      project,
+      projectKey: projectFolder,
+      projectId: canonicalizeProjectPath(project) || projectFolder,
+      createdAt: firstTimestamp ?? fileStat.birthtimeMs,
+      updatedAt: fileStat.mtimeMs,
+      messageCount,
+      fileSize: fileStat.size,
+      filePath,
+    };
+
+    setCache(filePath, fileStat.mtimeMs, meta);
+
+    if (!searchBuilder) {
+      return { meta };
+    }
+
+    return {
+      meta,
+      ...searchBuilder.build(),
+    };
   }
 
   private applyProjectDisplayPathHints(
@@ -324,7 +481,7 @@ export class IFlowProvider implements ConversationProvider {
 
     for (const item of items) {
       const projectKey = item.meta.projectKey || item.meta.project || "";
-      const candidate = item.meta.project || projectKey;
+      const candidate = item.meta.project || item.meta.projectId || projectKey;
       const current = bestProjectByKey.get(projectKey);
       const candidateScore = getProjectSpecificity(candidate, projectKey);
       const currentScore = current ? getProjectSpecificity(current, projectKey) : -1;
@@ -341,15 +498,29 @@ export class IFlowProvider implements ConversationProvider {
     return items.map((item) => {
       const projectKey = item.meta.projectKey || item.meta.project || "";
       const preferredProject = bestProjectByKey.get(projectKey);
-      if (!preferredProject) return item;
+      const preferredProjectId = canonicalizeProjectPath(preferredProject || "") || projectKey;
+      if (!preferredProject) {
+        if (item.meta.projectId === preferredProjectId) return item;
+
+        const updatedMeta = {
+          ...item.meta,
+          projectId: preferredProjectId,
+        };
+        setCache(item.meta.filePath, item.meta.updatedAt, updatedMeta);
+        return {
+          ...item,
+          meta: updatedMeta,
+        };
+      }
 
       const currentScore = getProjectSpecificity(item.meta.project, projectKey);
       const preferredScore = getProjectSpecificity(preferredProject, projectKey);
-      if (preferredScore <= currentScore) return item;
+      if (preferredScore <= currentScore && item.meta.projectId === preferredProjectId) return item;
 
       const updatedMeta = {
         ...item.meta,
-        project: preferredProject,
+        project: preferredScore > currentScore ? preferredProject : item.meta.project,
+        projectId: preferredProjectId,
       };
       setCache(item.meta.filePath, item.meta.updatedAt, updatedMeta);
       return {
@@ -439,6 +610,7 @@ export class IFlowProvider implements ConversationProvider {
       title: title.replace(/<[^>]+>/g, "").trim() || "未知对话",
       project,
       projectKey,
+      projectId: canonicalizeProjectPath(project) || projectKey,
       createdAt: firstTs,
       updatedAt: fileStat.mtimeMs,
       messageCount,
@@ -462,7 +634,36 @@ export class IFlowProvider implements ConversationProvider {
 
   private invalidateConversationCaches(filePath: string): void {
     invalidateCache(filePath);
+    invalidateMessageActionIndex(filePath);
     invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  private async resolveMessageLineNumbers(
+    filePath: string,
+    mtimeMs: number,
+    messageIds: string[]
+  ): Promise<number[]> {
+    const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
+    if (cached) return cached;
+
+    const entries = await parseJsonlWithMeta<IFlowEntry>(filePath);
+    const records = buildMessageRecords(entries);
+    primeMessageActionIndex(filePath, mtimeMs, records);
+
+    const lineByMessageId = new Map<string, number>();
+    for (const record of records) {
+      if (record.message.messageId && record.lineIndex) {
+        lineByMessageId.set(record.message.messageId, record.lineIndex);
+      }
+    }
+
+    return messageIds.map((messageId) => {
+      const lineNumber = lineByMessageId.get(messageId);
+      if (!lineNumber) {
+        throw new Error(`消息不存在: ${messageId}`);
+      }
+      return lineNumber;
+    });
   }
 
   async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
@@ -482,7 +683,9 @@ export class IFlowProvider implements ConversationProvider {
           isEnough: (tailEntries) => buildMessageRecords(tailEntries).length >= requiredMessages,
         })
       : await parseJsonlWithMeta<IFlowEntry>(filePath);
-    const messages = buildMessageRecords(entries).map((record) => record.message);
+    const records = buildMessageRecords(entries);
+    primeMessageActionIndex(filePath, fileStat.mtimeMs, records);
+    const messages = records.map((record) => record.message);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
@@ -520,32 +723,30 @@ export class IFlowProvider implements ConversationProvider {
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
     const sessionId = id.replace("iflow:", "");
     const filePath = await this.findConversationFilePath(sessionId);
-    const entries = await parseJsonlWithMeta<IFlowEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    const record = records.find((item) => item.message.messageId === messageId);
-
-    if (!record?.lineIndex || !record.entry.message) {
-      throw new Error(`消息不存在: ${messageId}`);
-    }
-
+    const fileStat = await stat(filePath);
+    const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
     const normalizedContent = normalizeUpdatedMessageContent(content);
-    const nextEntry: IFlowEntry = {
-      ...record.entry,
-      message: {
-        ...record.entry.message,
-        content: typeof record.entry.message.content === "string"
-          ? normalizedContent
-          : [{ type: "text", text: normalizedContent }],
-      },
-    };
+    await rewriteJsonlFileLine(
+      filePath,
+      lineNumber,
+      (line) => {
+        const entry = JSON.parse(line) as IFlowEntry;
+        if (!entry.message || (entry.type !== "user" && entry.type !== "assistant")) {
+          throw new Error(`消息不存在: ${messageId}`);
+        }
 
-    const originalContent = await readFile(filePath, "utf-8");
-    const rewritten = rewriteJsonlLine(
-      originalContent,
-      record.lineIndex,
-      JSON.stringify(nextEntry)
+        const nextEntry: IFlowEntry = {
+          ...entry,
+          message: {
+            ...entry.message,
+            content: typeof entry.message.content === "string"
+              ? normalizedContent
+              : [{ type: "text", text: normalizedContent }],
+          },
+        };
+        return JSON.stringify(nextEntry);
+      }
     );
-    await writeFile(filePath, rewritten, "utf-8");
     this.invalidateConversationCaches(filePath);
   }
 
@@ -556,26 +757,13 @@ export class IFlowProvider implements ConversationProvider {
   async deleteMessages(id: string, messageIds: string[]): Promise<void> {
     const sessionId = id.replace("iflow:", "");
     const filePath = await this.findConversationFilePath(sessionId);
+    const fileStat = await stat(filePath);
     const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
     if (uniqueMessageIds.length === 0) {
       throw new Error("待删除消息不能为空");
     }
-
-    const entries = await parseJsonlWithMeta<IFlowEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    const lineNumbers: number[] = [];
-
-    for (const messageId of uniqueMessageIds) {
-      const record = records.find((item) => item.message.messageId === messageId);
-      if (!record?.lineIndex) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      lineNumbers.push(record.lineIndex);
-    }
-
-    const originalContent = await readFile(filePath, "utf-8");
-    const rewritten = rewriteJsonlLines(originalContent, lineNumbers);
-    await writeFile(filePath, rewritten, "utf-8");
+    const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
+    await rewriteJsonlFileLines(filePath, lineNumbers);
     this.invalidateConversationCaches(filePath);
   }
 

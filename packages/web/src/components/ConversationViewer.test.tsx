@@ -38,6 +38,11 @@ const baseConversation: Conversation = {
   id: "codex:test-1",
   provider: "codex",
   title: "测试对话",
+  titleSyncMode: "native",
+  capabilities: {
+    canUpdateTitle: true,
+    canGenerateTitle: true,
+  },
   project: "/tmp/project",
   projectKey: "/tmp/project",
   createdAt: 1,
@@ -60,7 +65,7 @@ describe("ConversationViewer", () => {
   });
 
   it("批量删除模式会选择已加载消息并触发批量删除", async () => {
-    const onConversationChanged = vi.fn().mockResolvedValue(undefined);
+    const onMessagesDeleted = vi.fn().mockResolvedValue(undefined);
     const onNotify = vi.fn();
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     mockDeleteConversationMessages.mockResolvedValue({ success: true, deleted: 2 });
@@ -75,7 +80,8 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
-        onConversationChanged={onConversationChanged}
+        onMessageUpdated={() => {}}
+        onMessagesDeleted={onMessagesDeleted}
         onNotify={onNotify}
         codexModelProviders={[{ name: "openai", count: 1 }]}
         onChangeModelProvider={() => {}}
@@ -91,7 +97,7 @@ describe("ConversationViewer", () => {
       expect(mockDeleteConversationMessages).toHaveBeenCalledWith("codex:test-1", ["text:1", "text:2"]);
     });
     await waitFor(() => {
-      expect(onConversationChanged).toHaveBeenCalledWith("codex:test-1");
+      expect(onMessagesDeleted).toHaveBeenCalledWith("codex:test-1", ["text:1", "text:2"]);
     });
 
     confirmSpy.mockRestore();
@@ -115,7 +121,8 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={onTitleChanged}
-        onConversationChanged={() => {}}
+        onMessageUpdated={() => {}}
+        onMessagesDeleted={() => {}}
         onNotify={() => {}}
         codexModelProviders={[{ name: "openai", count: 1 }]}
         onChangeModelProvider={() => {}}
@@ -128,8 +135,45 @@ describe("ConversationViewer", () => {
       expect(mockGenerateAiTitle).toHaveBeenCalledWith("codex:test-1");
     });
     await waitFor(() => {
-      expect(onTitleChanged).toHaveBeenCalledWith("codex:test-1");
+      expect(onTitleChanged).toHaveBeenCalledWith("codex:test-1", "新的 AI 标题");
     });
+
+    expect(screen.getByText("已同步到 CLI")).toBeInTheDocument();
+  });
+
+  it("iFlow 对话会明确显示仅 viewer 覆盖", () => {
+    render(
+      <ConversationViewer
+        conversation={{
+          ...baseConversation,
+          id: "iflow:test-1",
+          provider: "iflow",
+          titleSyncMode: "overlay",
+          capabilities: {
+            canUpdateTitle: false,
+            canGenerateTitle: false,
+            updateTitleDisabledReason: "iFlow 当前已禁用修改标题",
+            generateTitleDisabledReason: "iFlow 当前已禁用修改标题",
+          },
+        }}
+        dark={false}
+        loading={false}
+        loadingEarlier={false}
+        onLoadEarlier={() => {}}
+        onExport={() => {}}
+        onDelete={() => {}}
+        onTitleChanged={() => {}}
+        onMessageUpdated={() => {}}
+        onMessagesDeleted={() => {}}
+        onNotify={() => {}}
+        codexModelProviders={[]}
+        onChangeModelProvider={() => {}}
+      />
+    );
+
+    expect(screen.getByText("仅 viewer 覆盖")).toBeInTheDocument();
+    expect(screen.getByText("iFlow 当前已禁用修改标题")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "AI 标题" })).not.toBeInTheDocument();
   });
 
   it("没有会话时显示空态", () => {
@@ -143,7 +187,8 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
-        onConversationChanged={() => {}}
+        onMessageUpdated={() => {}}
+        onMessagesDeleted={() => {}}
         onNotify={() => {}}
         codexModelProviders={[]}
         onChangeModelProvider={() => {}}
@@ -166,7 +211,8 @@ describe("ConversationViewer", () => {
         onExport={() => {}}
         onDelete={() => {}}
         onTitleChanged={() => {}}
-        onConversationChanged={() => {}}
+        onMessageUpdated={() => {}}
+        onMessagesDeleted={() => {}}
         onNotify={() => {}}
         codexModelProviders={[{ name: "openai", count: 1 }]}
         onChangeModelProvider={() => {}}

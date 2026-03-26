@@ -107,4 +107,77 @@ describe("ConversationList", () => {
     expect(screen.getByText("Beta")).toBeInTheDocument();
     expect(screen.getAllByText("~/desktop/code_area/r-bioinfo")).toHaveLength(1);
   });
+
+  it("同一 provider 下不同存储 projectKey 但相同 projectId 会合并到同一分组", () => {
+    const conversations = [
+      createConversation({
+        id: "claude-code:1",
+        provider: "claude-code",
+        title: "Alpha",
+        project: "C:/Users/mortis097/Desktop/code_area/r-bioinfo",
+        projectKey: "C--Users-mortis097-Desktop-code-area-r-bioinfo",
+        projectId: "c:/users/mortis097/desktop/code_area/r-bioinfo",
+      }),
+      createConversation({
+        id: "claude-code:2",
+        provider: "claude-code",
+        title: "Beta",
+        project: "C:/Users/mortis097/Desktop/code_area/r-bioinfo",
+        projectKey: "C--Users-mortis097-Desktop-code_area-r-bioinfo",
+        projectId: "c:/users/mortis097/desktop/code_area/r-bioinfo",
+      }),
+    ];
+
+    render(
+      <ConversationList
+        conversations={conversations}
+        selectedId={null}
+        onSelect={() => {}}
+        loading={false}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onToggleSelectGroup={() => {}}
+        onDrop={() => {}}
+      />
+    );
+
+    expect(screen.getByText("Alpha")).toBeInTheDocument();
+    expect(screen.getByText("Beta")).toBeInTheDocument();
+    expect(screen.getAllByText("~/desktop/code_area/r-bioinfo")).toHaveLength(1);
+  });
+
+  it("同一路径跨 provider 分组时会显示 provider 标识，避免误判为同一目录", () => {
+    const conversations = [
+      createConversation({
+        id: "codex:1",
+        provider: "codex",
+        title: "Codex 会话",
+        project: "C:/Users/mortis097/Desktop/code_area/r-bioinfo",
+        projectKey: "C:/Users/mortis097/Desktop/code_area/r-bioinfo",
+      }),
+      createConversation({
+        id: "claude-code:1",
+        provider: "claude-code",
+        title: "Claude 会话",
+        project: "C:/Users/mortis097/Desktop/code_area/r-bioinfo",
+        projectKey: "C--Users-mortis097-Desktop-code-area-r-bioinfo",
+      }),
+    ];
+
+    render(
+      <ConversationList
+        conversations={conversations}
+        selectedId={null}
+        onSelect={() => {}}
+        loading={false}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onToggleSelectGroup={() => {}}
+        onDrop={() => {}}
+      />
+    );
+
+    expect(screen.getByText("Codex")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+  });
 });

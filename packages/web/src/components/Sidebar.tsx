@@ -108,6 +108,12 @@ export function Sidebar({
     () => conversations.filter((item) => selectedIds.has(item.id)),
     [conversations, selectedIds]
   );
+  const unsupportedBatchTitleConversations = useMemo(
+    () => selectedConversations.filter((item) => item.capabilities?.canGenerateTitle === false),
+    [selectedConversations]
+  );
+  const batchTitleGenerationSupported = selectedConversations.length > 0 && unsupportedBatchTitleConversations.length === 0;
+  const batchTitleGenerationDisabledReason = unsupportedBatchTitleConversations[0]?.capabilities?.generateTitleDisabledReason;
 
   const hasSelectedNonCodexConversation = useMemo(
     () => selectedConversations.some((item) => item.provider !== "codex"),
@@ -273,8 +279,8 @@ export function Sidebar({
             <div className="flex items-center gap-1.5">
               <button
                 onClick={onBatchGenerate}
-                disabled={batchGenerating}
-                className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-500 text-white rounded hover:bg-purple-600 disabled:opacity-50 transition-colors"
+                disabled={batchGenerating || !batchTitleGenerationSupported}
+                className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-500 text-white rounded hover:bg-purple-600 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-600 disabled:hover:bg-gray-300 dark:disabled:bg-gray-600 dark:disabled:text-gray-300 transition-colors"
               >
                 <Sparkles className="w-3 h-3" />
                 AI 标题
@@ -301,6 +307,12 @@ export function Sidebar({
               </button>
             </div>
           </div>
+
+          {unsupportedBatchTitleConversations.length > 0 && (
+            <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              {batchTitleGenerationDisabledReason ?? "当前选择包含不支持标题生成的对话，批量标题修改已禁用"}
+            </div>
+          )}
 
           {batchModelProviderSupported && (
             <div className="mt-2 flex items-center gap-1.5 rounded-lg border border-blue-200 bg-white/80 px-2 py-2 dark:border-blue-800 dark:bg-gray-800/80">

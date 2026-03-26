@@ -1,4 +1,51 @@
+import { createHash } from "crypto";
+import { stat } from "fs/promises";
+import { glob } from "glob";
 import type { IndexedCacheItem } from "./cache.js";
+
+export interface IndexedSourceFile {
+  path: string;
+  mtimeMs: number;
+  size: number;
+}
+
+function normalizeIndexedPath(filePath: string): string {
+  return filePath.replace(/\\/g, "/");
+}
+
+export async function collectGlobFileStates(pattern: string): Promise<IndexedSourceFile[]> {
+  const files = (await glob(pattern)).map(normalizeIndexedPath).sort();
+  const states = await Promise.all(files.map(async (filePath) => {
+    try {
+      const fileStat = await stat(filePath);
+      return {
+        path: filePath,
+        mtimeMs: fileStat.mtimeMs,
+        size: fileStat.size,
+      };
+    } catch {
+      return null;
+    }
+  }));
+
+  return states.filter((item): item is IndexedSourceFile => !!item);
+}
+
+export function createIndexedListSourceSignature(files: IndexedSourceFile[]): string {
+  const hash = createHash("sha1");
+  hash.update(String(files.length));
+
+  for (const file of files) {
+    hash.update("\0");
+    hash.update(file.path);
+    hash.update("\0");
+    hash.update(String(file.mtimeMs));
+    hash.update("\0");
+    hash.update(String(file.size));
+  }
+
+  return hash.digest("hex");
+}
 
 export async function collectIndexedCacheItemsInBatches(
   filePaths: string[],

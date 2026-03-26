@@ -1,16 +1,37 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createConversationRoutes } from "../conversations.js";
 import {
   invalidateListCache,
   setIndexedListCache,
+  setCacheStoreDirForTests,
 } from "../../utils/cache.js";
+import { getTitle, setTitle, setTitleStoreDirForTests } from "../../utils/title-store.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
   ConversationListOptions,
 } from "../../providers/types.js";
+
+let storeDir = "";
+
+test.before(async () => {
+  storeDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-conversations-test-"));
+  setCacheStoreDirForTests(storeDir);
+  setTitleStoreDirForTests(storeDir);
+});
+
+test.after(async () => {
+  setCacheStoreDirForTests();
+  setTitleStoreDirForTests();
+  if (storeDir) {
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
 
 type ProviderOverrides = Partial<ConversationProvider> & {
   name: string;
@@ -21,12 +42,23 @@ type ProviderOverrides = Partial<ConversationProvider> & {
 function createProvider(overrides: ProviderOverrides): ConversationProvider {
   const conversations = overrides.conversations ?? [];
   const storagePath = `/tmp/${overrides.name}-${Math.random().toString(36).slice(2)}`;
+  const defaultCapabilities = overrides.name === "iflow"
+    ? {
+        titleSyncMode: "overlay" as const,
+        canUpdateTitle: false,
+        canGenerateTitle: false,
+        updateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+        generateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+      }
+    : undefined;
 
   return {
     name: overrides.name,
     displayName: overrides.displayName,
+    capabilities: overrides.capabilities ?? defaultCapabilities,
     detect: overrides.detect ?? (async () => true),
     list: overrides.list ?? (async (_options?: ConversationListOptions) => conversations),
+    getListSourceSignature: overrides.getListSourceSignature,
     read:
       overrides.read ??
       (async (id: string) => {
@@ -36,6 +68,7 @@ function createProvider(overrides: ProviderOverrides): ConversationProvider {
       }),
     delete: overrides.delete ?? (async () => {}),
     move: overrides.move,
+    updateTitle: overrides.updateTitle,
     updateMessage: overrides.updateMessage,
     deleteMessage: overrides.deleteMessage,
     deleteMessages: overrides.deleteMessages,
@@ -107,6 +140,339 @@ test("列表接口不会修改 provider 返回的原始对话对象", async () =
   const data = (await res.json()) as { total: number; conversations: ConversationMeta[] };
   assert.equal(data.conversations[0]?.title, "覆盖标题");
   assert.equal(sourceConversations[0]?.title, "原始标题");
+});
+
+test("支持原生标题持久化的 provider 会调用 updateTitle 并清理 overlay", async () => {
+  const sourceConversations = [
+    createConversationMeta({
+      id: "codex:native-1",
+      provider: "codex",
+      title: "原始标题",
+    }),
+  ];
+  const receivedCalls: Array<{ id: string; title: string }> = [];
+
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      conversations: sourceConversations,
+      updateTitle: async (id, title) => {
+        receivedCalls.push({ id, title });
+        sourceConversations[0] = {
+          ...sourceConversations[0],
+          title,
+        };
+      },
+    }),
+  ]);
+
+  const titleRes = await app.request("http://localhost/conversations/codex%3Anative-1/title", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: "同步到原生存储" }),
+  });
+  assert.equal(titleRes.status, 200);
+  assert.deepEqual(receivedCalls, [{
+    id: "codex:native-1",
+    title: "同步到原生存储",
+  }]);
+  assert.equal(await getTitle("codex:native-1"), null);
+
+  const res = await app.request("http://localhost/conversations?provider=codex");
+  assert.equal(res.status, 200);
+
+  const data = (await res.json()) as { total: number; conversations: ConversationMeta[] };
+  assert.equal(data.conversations[0]?.title, "同步到原生存储");
+});
+
+test("列表接口会把旧 overlay 标题回填到支持原生标题的 provider", async () => {
+  const sourceConversations = [
+    createConversationMeta({
+      id: "codex:legacy-title",
+      provider: "codex",
+      title: "原始标题",
+    }),
+  ];
+  const receivedCalls: Array<{ id: string; title: string }> = [];
+
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      conversations: sourceConversations,
+      updateTitle: async (id, title) => {
+        receivedCalls.push({ id, title });
+        sourceConversations[0] = {
+          ...sourceConversations[0],
+          title,
+        };
+      },
+    }),
+  ]);
+
+  await setTitle("codex:legacy-title", "旧覆盖标题");
+
+  const res = await app.request("http://localhost/conversations?provider=codex");
+  assert.equal(res.status, 200);
+
+  const data = (await res.json()) as { total: number; conversations: ConversationMeta[] };
+  assert.equal(data.conversations[0]?.title, "旧覆盖标题");
+  assert.deepEqual(receivedCalls, [{
+    id: "codex:legacy-title",
+    title: "旧覆盖标题",
+  }]);
+  assert.equal(await getTitle("codex:legacy-title"), null);
+});
+
+test("详情接口会把旧 overlay 标题回填到支持原生标题的 provider", async () => {
+  const sourceConversations = [
+    createConversationMeta({
+      id: "codex:legacy-detail",
+      provider: "codex",
+      title: "原始标题",
+    }),
+  ];
+  const receivedCalls: Array<{ id: string; title: string }> = [];
+
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      conversations: sourceConversations,
+      updateTitle: async (id, title) => {
+        receivedCalls.push({ id, title });
+        sourceConversations[0] = {
+          ...sourceConversations[0],
+          title,
+        };
+      },
+      read: async (id) => ({
+        ...sourceConversations.find((item) => item.id === id)!,
+        messages: [],
+      }),
+    }),
+  ]);
+
+  await setTitle("codex:legacy-detail", "详情覆盖标题");
+
+  const res = await app.request("http://localhost/conversations/codex%3Alegacy-detail");
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as Conversation;
+  assert.equal(data.title, "详情覆盖标题");
+  assert.deepEqual(receivedCalls, [{
+    id: "codex:legacy-detail",
+    title: "详情覆盖标题",
+  }]);
+  assert.equal(await getTitle("codex:legacy-detail"), null);
+});
+
+test("列表和详情接口会返回标题同步模式", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      conversations: [
+        createConversationMeta({
+          id: "codex:title-sync",
+          provider: "codex",
+          title: "原生标题",
+        }),
+      ],
+      updateTitle: async () => {},
+      read: async (id) => ({
+        ...createConversationMeta({
+          id,
+          provider: "codex",
+          title: "原生标题",
+        }),
+        messages: [],
+      }),
+    }),
+    createProvider({
+      name: "iflow",
+      displayName: "iFlow",
+      capabilities: {
+        titleSyncMode: "overlay",
+        canUpdateTitle: false,
+        canGenerateTitle: false,
+        updateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+        generateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+      },
+      conversations: [
+        createConversationMeta({
+          id: "iflow:title-sync",
+          provider: "iflow",
+          title: "覆盖标题",
+        }),
+      ],
+      read: async (id) => ({
+        ...createConversationMeta({
+          id,
+          provider: "iflow",
+          title: "覆盖标题",
+        }),
+        messages: [],
+      }),
+    }),
+  ]);
+
+  const listRes = await app.request("http://localhost/conversations?provider=codex,iflow");
+  assert.equal(listRes.status, 200);
+
+  const listData = (await listRes.json()) as {
+    conversations: Array<ConversationMeta & { titleSyncMode?: "native" | "overlay" }>;
+  };
+  const codexConversation = listData.conversations.find((item) => item.id === "codex:title-sync");
+  const iflowConversation = listData.conversations.find((item) => item.id === "iflow:title-sync");
+  assert.equal(codexConversation?.titleSyncMode, "native");
+  assert.equal(iflowConversation?.titleSyncMode, "overlay");
+  assert.equal(codexConversation?.capabilities?.canUpdateTitle, true);
+  assert.equal(codexConversation?.capabilities?.canGenerateTitle, true);
+  assert.equal(iflowConversation?.capabilities?.canUpdateTitle, false);
+  assert.equal(iflowConversation?.capabilities?.canGenerateTitle, false);
+
+  const detailRes = await app.request("http://localhost/conversations/codex%3Atitle-sync");
+  assert.equal(detailRes.status, 200);
+
+  const detailData = await detailRes.json() as Conversation;
+  assert.equal(detailData.titleSyncMode, "native");
+  assert.equal(detailData.capabilities?.canUpdateTitle, true);
+});
+
+test("provider capabilities 会覆盖默认标题能力", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "iflow",
+      displayName: "iFlow",
+      capabilities: {
+        titleSyncMode: "overlay",
+        canUpdateTitle: false,
+        canGenerateTitle: false,
+        updateTitleDisabledReason: "禁用手动标题",
+        generateTitleDisabledReason: "禁用 AI 标题",
+      },
+      conversations: [
+        createConversationMeta({
+          id: "iflow:capabilities",
+          provider: "iflow",
+          title: "原始标题",
+        }),
+      ],
+      read: async (id) => ({
+        ...createConversationMeta({
+          id,
+          provider: "iflow",
+          title: "原始标题",
+        }),
+        messages: [],
+      }),
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations/iflow%3Acapabilities");
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as Conversation;
+  assert.equal(data.titleSyncMode, "overlay");
+  assert.equal(data.capabilities?.canUpdateTitle, false);
+  assert.equal(data.capabilities?.canGenerateTitle, false);
+  assert.equal(data.capabilities?.updateTitleDisabledReason, "禁用手动标题");
+  assert.equal(data.capabilities?.generateTitleDisabledReason, "禁用 AI 标题");
+});
+
+test("iFlow 标题修改接口会被禁用", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "iflow",
+      displayName: "iFlow",
+      conversations: [
+        createConversationMeta({
+          id: "iflow:readonly-title",
+          provider: "iflow",
+          title: "原始标题",
+        }),
+      ],
+    }),
+  ]);
+
+  const titleRes = await app.request("http://localhost/conversations/iflow%3Areadonly-title/title", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: "不应该成功" }),
+  });
+
+  assert.equal(titleRes.status, 400);
+  assert.deepEqual(await titleRes.json(), {
+    error: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+  });
+});
+
+test("iFlow AI 标题生成接口会被禁用", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "iflow",
+      displayName: "iFlow",
+      conversations: [
+        createConversationMeta({
+          id: "iflow:readonly-ai-title",
+          provider: "iflow",
+          title: "原始标题",
+        }),
+      ],
+      read: async (id) => ({
+        ...createConversationMeta({
+          id,
+          provider: "iflow",
+          title: "原始标题",
+        }),
+        messages: [],
+      }),
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations/iflow%3Areadonly-ai-title/generate-title", {
+    method: "POST",
+  });
+
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), {
+    error: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+  });
+});
+
+test("批量 AI 标题生成会跳过 iFlow 并返回禁用错误", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "iflow",
+      displayName: "iFlow",
+      conversations: [
+        createConversationMeta({
+          id: "iflow:batch-readonly",
+          provider: "iflow",
+          title: "原始标题",
+        }),
+      ],
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations/generate-title/batch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: ["iflow:batch-readonly"] }),
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    success: false,
+    generated: 0,
+    failed: 1,
+    results: [{
+      id: "iflow:batch-readonly",
+      error: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+    }],
+  });
 });
 
 test("空 modelProvider 过滤会排除所有带 modelProvider 的 Codex 对话", async () => {
@@ -363,6 +729,46 @@ test("删除接口对不存在对话返回 404", async () => {
   assert.equal(data.error, "对话不存在: codex:missing");
 });
 
+test("批量删除接口会汇总成功和失败结果", async () => {
+  const deletedIds: string[] = [];
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      delete: async (id) => {
+        if (id === "codex:missing") {
+          throw new Error("对话不存在: codex:missing");
+        }
+        deletedIds.push(id);
+      },
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations/batch-delete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      ids: ["codex:ok-1", "codex:missing", "codex:ok-2", "codex:ok-1"],
+    }),
+  });
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as {
+    success: boolean;
+    deleted: number;
+    failed: number;
+    failures: Array<{ id: string; error: string }>;
+  };
+  assert.equal(data.success, false);
+  assert.equal(data.deleted, 2);
+  assert.equal(data.failed, 1);
+  assert.deepEqual(deletedIds.sort(), ["codex:ok-1", "codex:ok-2"]);
+  assert.deepEqual(data.failures, [{
+    id: "codex:missing",
+    error: "对话不存在: codex:missing",
+  }]);
+});
+
 test("刷新 provider 后会优先使用新索引结果", async () => {
   const provider = createProvider({
     name: "codex",
@@ -443,6 +849,55 @@ test("搜索请求会要求 provider 同步补齐搜索索引", async () => {
   assert.equal(data.total, 1);
   assert.equal(data.conversations[0]?.id, "codex:indexed-search");
   assert.deepEqual(eagerFlags, [true]);
+
+  invalidateListCache(cacheKey);
+});
+
+test("底层文件 signature 变化后会跳过旧 indexed cache 并触发 provider 刷新", async () => {
+  let listCalls = 0;
+
+  const provider = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    getListSourceSignature: async () => "signature-v2",
+    list: async () => {
+      listCalls += 1;
+      const cacheKey = `codex::${provider.getStoragePath()}::indexed`;
+      setIndexedListCache(cacheKey, [{
+        meta: createConversationMeta({
+          id: "codex:refreshed",
+          provider: "codex",
+          title: "刷新结果",
+          updatedAt: 10,
+        }),
+      }], { sourceSignature: "signature-v2" });
+      return [createConversationMeta({
+        id: "codex:fallback-stale",
+        provider: "codex",
+        title: "旧缓存回退",
+        updatedAt: 1,
+      })];
+    },
+  });
+
+  const cacheKey = `codex::${provider.getStoragePath()}::indexed`;
+  setIndexedListCache(cacheKey, [
+    createConversationMeta({
+      id: "codex:stale-cache",
+      provider: "codex",
+      title: "旧缓存",
+      updatedAt: 2,
+    }),
+  ], { sourceSignature: "signature-v1" });
+
+  const app = createConversationRoutes([provider]);
+  const res = await app.request("http://localhost/conversations?provider=codex");
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as { total: number; conversations: ConversationMeta[] };
+  assert.equal(listCalls, 1);
+  assert.equal(data.total, 1);
+  assert.equal(data.conversations[0]?.id, "codex:refreshed");
 
   invalidateListCache(cacheKey);
 });

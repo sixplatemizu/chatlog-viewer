@@ -56,6 +56,26 @@ function getModelProviderParam(
   return Array.from(activeModelProviders).join(",");
 }
 
+function sortConversationItems(items: ConversationMeta[], sort: string): ConversationMeta[] {
+  const next = [...items];
+  if (sort === "createdAt") {
+    next.sort((a, b) => b.createdAt - a.createdAt);
+    return next;
+  }
+
+  if (sort === "provider") {
+    next.sort((a, b) => a.provider.localeCompare(b.provider) || b.updatedAt - a.updatedAt);
+    return next;
+  }
+
+  next.sort((a, b) => b.updatedAt - a.updatedAt);
+  return next;
+}
+
+function normalizeClientMessageContent(content: string): string {
+  return content.replace(/\r\n/g, "\n").trim();
+}
+
 export function useConversations(options: UseConversationsOptions = {}) {
   const { onNotify } = options;
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -252,9 +272,11 @@ export function useConversations(options: UseConversationsOptions = {}) {
       appendEarlier?: boolean;
       limitOverride?: number;
       preserveView?: boolean;
+      silent?: boolean;
     }) => {
       const appendEarlier = options?.appendEarlier ?? false;
       const preserveView = options?.preserveView ?? false;
+      const silent = options?.silent ?? false;
 
       detailAbortRef.current?.abort();
       const abortController = new AbortController();
@@ -262,7 +284,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
 
       if (appendEarlier) {
         setLoadingEarlier(true);
-      } else {
+      } else if (!silent) {
         setSelectedId(id);
         setLoadingDetail(true);
         if (!preserveView) {
@@ -298,7 +320,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
         if (!abortController.signal.aborted) {
           if (appendEarlier) {
             setLoadingEarlier(false);
-          } else {
+          } else if (!silent) {
             setLoadingDetail(false);
           }
         }
@@ -313,6 +335,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
       options?: {
         keepLoadedWindow?: boolean;
         syncList?: boolean;
+        silent?: boolean;
       }
     ) => {
       const loadedCount = conversation?.id === id ? conversation.messages.length : DETAIL_PAGE_SIZE;
@@ -329,10 +352,116 @@ export function useConversations(options: UseConversationsOptions = {}) {
       await loadConversationDetail(id, {
         limitOverride: options?.keepLoadedWindow ? loadedCount : DETAIL_PAGE_SIZE,
         preserveView: true,
+        silent: options?.silent,
       });
     },
     [conversation, loadConversationDetail, loadConversations]
   );
+
+  const applyConversationMetaPatch = useCallback((id: string, patch: Partial<ConversationMeta>) => {
+    setConversation((prev) => (
+      prev?.id === id
+        ? {
+            ...prev,
+            ...patch,
+          }
+        : prev
+    ));
+    setConversations((prev) => sortConversationItems(
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+      sort
+    ));
+  }, [sort]);
+
+  const applyLocalTitleChange = useCallback((id: string, title: string) => {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) return;
+
+    applyConversationMetaPatch(id, {
+      title: normalizedTitle,
+      updatedAt: Date.now(),
+    });
+
+    if (debouncedSearch) {
+      void loadConversations();
+    }
+  }, [applyConversationMetaPatch, debouncedSearch, loadConversations]);
+
+  const applyLocalMessageUpdate = useCallback((id: string, messageId: string, content: string) => {
+    const normalizedContent = normalizeClientMessageContent(content);
+    const updatedAt = Date.now();
+
+    setConversation((prev) => {
+      if (!prev || prev.id !== id) return prev;
+      return {
+        ...prev,
+        updatedAt,
+        messages: prev.messages.map((message) => (
+          message.messageId === messageId
+            ? { ...message, content: normalizedContent }
+            : message
+        )),
+      };
+    });
+
+    setConversations((prev) => sortConversationItems(
+      prev.map((item) => (
+        item.id === id
+          ? { ...item, updatedAt }
+          : item
+      )),
+      sort
+    ));
+
+    void refreshConversation(id, {
+      keepLoadedWindow: true,
+      syncList: !!debouncedSearch,
+      silent: true,
+    });
+  }, [debouncedSearch, refreshConversation, sort]);
+
+  const applyLocalMessageDelete = useCallback((id: string, messageIds: string[]) => {
+    const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueMessageIds.length === 0) return;
+
+    const messageIdSet = new Set(uniqueMessageIds);
+    const updatedAt = Date.now();
+
+    setConversation((prev) => {
+      if (!prev || prev.id !== id) return prev;
+
+      const nextMessages = prev.messages.filter((message) => !message.messageId || !messageIdSet.has(message.messageId));
+      const deletedLoadedCount = prev.messages.length - nextMessages.length;
+      const nextMessageCount = Math.max(0, prev.messageCount - deletedLoadedCount);
+
+      return {
+        ...prev,
+        updatedAt,
+        messageCount: nextMessageCount,
+        hasMore: prev.hasMore || nextMessageCount > nextMessages.length,
+        messages: nextMessages,
+      };
+    });
+
+    setConversations((prev) => sortConversationItems(
+      prev.map((item) => (
+        item.id === id
+          ? {
+              ...item,
+              updatedAt,
+              messageCount: Math.max(0, item.messageCount - uniqueMessageIds.length),
+            }
+          : item
+      )),
+      sort
+    ));
+
+    void refreshConversation(id, {
+      keepLoadedWindow: true,
+      syncList: !!debouncedSearch,
+      silent: true,
+    });
+  }, [debouncedSearch, refreshConversation, sort]);
 
   const reloadAllData = useCallback(async () => {
     const providerState = await loadProviderData();
@@ -455,5 +584,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
     reloadProviders: loadProviderData,
     reloadAllData,
     refreshConversation,
+    applyLocalTitleChange,
+    applyLocalMessageUpdate,
+    applyLocalMessageDelete,
   };
 }

@@ -2,14 +2,25 @@ import { homedir } from "os";
 import { join } from "path";
 import { readFile, writeFile, mkdir } from "fs/promises";
 
-const STORE_DIR = join(homedir(), ".chatlog-viewer");
-const STORE_FILE = join(STORE_DIR, "titles.json");
-
 type TitleMap = Record<string, string>;
+let storeDirOverride: string | null = null;
+
+function getStoreDir(): string {
+  const envOverride = process.env.CHATLOG_VIEWER_STORE_DIR?.trim();
+  return storeDirOverride || envOverride || join(homedir(), ".chatlog-viewer");
+}
+
+function getStoreFile(): string {
+  return join(getStoreDir(), "titles.json");
+}
+
+export function setTitleStoreDirForTests(storeDir?: string): void {
+  storeDirOverride = storeDir?.trim() || null;
+}
 
 async function loadTitles(): Promise<TitleMap> {
   try {
-    const data = await readFile(STORE_FILE, "utf-8");
+    const data = await readFile(getStoreFile(), "utf-8");
     return JSON.parse(data);
   } catch {
     return {};
@@ -17,8 +28,9 @@ async function loadTitles(): Promise<TitleMap> {
 }
 
 async function saveTitles(titles: TitleMap): Promise<void> {
-  await mkdir(STORE_DIR, { recursive: true });
-  await writeFile(STORE_FILE, JSON.stringify(titles, null, 2), "utf-8");
+  const storeDir = getStoreDir();
+  await mkdir(storeDir, { recursive: true });
+  await writeFile(getStoreFile(), JSON.stringify(titles, null, 2), "utf-8");
 }
 
 export async function getTitle(id: string): Promise<string | null> {

@@ -10,6 +10,7 @@ vi.mock("./ConversationList", () => ({
 const providers: ProviderInfo[] = [
   { name: "codex", displayName: "Codex", available: true, storagePath: "/tmp/codex" },
   { name: "claude-code", displayName: "Claude Code", available: true, storagePath: "/tmp/claude" },
+  { name: "iflow", displayName: "iFlow", available: true, storagePath: "/tmp/iflow" },
 ];
 
 function createConversation(partial: Partial<ConversationMeta> & Pick<ConversationMeta, "id" | "provider">): ConversationMeta {
@@ -17,6 +18,7 @@ function createConversation(partial: Partial<ConversationMeta> & Pick<Conversati
     id: partial.id,
     provider: partial.provider,
     title: partial.title ?? "测试对话",
+    capabilities: partial.capabilities,
     project: partial.project ?? "/tmp/project",
     projectKey: partial.projectKey ?? "/tmp/project",
     createdAt: partial.createdAt ?? 1,
@@ -117,5 +119,55 @@ describe("Sidebar", () => {
 
     expect(screen.queryByRole("combobox", { name: "批量切换 Codex provider" })).not.toBeInTheDocument();
     expect(screen.getByText("批量 provider 切换目前仅支持 Codex 对话")).toBeInTheDocument();
+  });
+
+  it("选中 iFlow 对话时会禁用批量 AI 标题按钮", () => {
+    render(
+      <Sidebar
+        providers={providers}
+        activeProviders={new Set(["codex", "iflow"])}
+        toggleProvider={() => {}}
+        conversations={[
+          createConversation({ id: "codex:1", provider: "codex", modelProvider: "openai" }),
+          createConversation({
+            id: "iflow:1",
+            provider: "iflow",
+            capabilities: {
+              canUpdateTitle: false,
+              canGenerateTitle: false,
+              updateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+              generateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
+            },
+          }),
+        ]}
+        selectedId={null}
+        onSelect={() => {}}
+        search=""
+        onSearchChange={() => {}}
+        sort="updatedAt"
+        onSortChange={() => {}}
+        loading={false}
+        total={2}
+        selectedIds={new Set(["codex:1", "iflow:1"])}
+        onToggleSelect={() => {}}
+        onSelectAll={() => {}}
+        onDeselectAll={() => {}}
+        onToggleSelectGroup={() => {}}
+        onBatchExport={() => {}}
+        onBatchDelete={() => {}}
+        onBatchGenerate={() => {}}
+        onBatchChangeModelProvider={() => {}}
+        batchGenerating={false}
+        onMoveConversation={() => {}}
+        codexModelProviders={[{ name: "openai", count: 1 }]}
+        activeModelProviders={new Set(["openai"])}
+        onToggleModelProvider={() => {}}
+        partialSearch={false}
+        searchWarnings={[]}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: "AI 标题" })).toBeDisabled();
+    expect(screen.getByText("iFlow 当前没有稳定的原生标题字段，已禁用修改标题")).toBeInTheDocument();
   });
 });

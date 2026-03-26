@@ -13,7 +13,7 @@ import {
   Loader2,
   ArrowRightLeft,
 } from "lucide-react";
-import type { Conversation, CodexModelProvider } from "../lib/api";
+import type { Conversation, CodexModelProvider, TitleSyncMode } from "../lib/api";
 import {
   updateTitle,
   generateAiTitle,
@@ -34,14 +34,59 @@ interface Props {
   onLoadEarlier: () => void | Promise<void>;
   onExport: (id: string) => void;
   onDelete: (id: string) => void;
-  onTitleChanged: (id: string) => void | Promise<void>;
-  onConversationChanged: (id: string) => void | Promise<void>;
+  onTitleChanged: (id: string, title: string) => void | Promise<void>;
+  onMessageUpdated: (id: string, messageId: string, content: string) => void | Promise<void>;
+  onMessagesDeleted: (id: string, messageIds: string[]) => void | Promise<void>;
   onNotify: (toast: ToastPayload) => void;
   codexModelProviders: CodexModelProvider[];
   onChangeModelProvider: (id: string, newProvider: string) => void;
 }
 
 const EMPTY_MESSAGES: NonNullable<Conversation["messages"]> = [];
+
+function getProviderDisplayName(provider: string): string {
+  if (provider === "codex") return "Codex";
+  if (provider === "claude-code") return "Claude Code";
+  if (provider === "iflow") return "iFlow";
+  return provider;
+}
+
+function getTitleSyncInfo(
+  provider: string,
+  mode: TitleSyncMode | undefined
+): {
+  badgeLabel: string;
+  badgeClassName: string;
+  description: string;
+  saveTitle: string;
+  statusSuffix: string;
+  variant: ToastPayload["variant"];
+} | null {
+  if (!mode) return null;
+
+  const providerLabel = getProviderDisplayName(provider);
+  if (mode === "native") {
+    return {
+      badgeLabel: "已同步到 CLI",
+      badgeClassName:
+        "rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300",
+      description: `${providerLabel} 支持原生标题字段，修改会写回本地会话数据。`,
+      saveTitle: "标题已同步到本地 CLI",
+      statusSuffix: "并同步到本地 CLI",
+      variant: "info",
+    };
+  }
+
+  return {
+    badgeLabel: "仅 viewer 覆盖",
+    badgeClassName:
+      "rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
+    description: `${providerLabel} 当前没有稳定标题字段，修改只保存在 chatlog-viewer，不会写回原始 CLI。`,
+    saveTitle: "标题仅保存在 chatlog-viewer",
+    statusSuffix: "仅保存在 viewer",
+    variant: "warning",
+  };
+}
 
 export function ConversationViewer({
   conversation,
@@ -52,7 +97,8 @@ export function ConversationViewer({
   onExport,
   onDelete,
   onTitleChanged,
-  onConversationChanged,
+  onMessageUpdated,
+  onMessagesDeleted,
   onNotify,
   codexModelProviders,
   onChangeModelProvider,
@@ -79,6 +125,12 @@ export function ConversationViewer({
     [loadedMessages]
   );
   const selectedDeletableCount = selectedMessageIds.size;
+  const titleSyncInfo = conversation
+    ? getTitleSyncInfo(conversation.provider, conversation.titleSyncMode)
+    : null;
+  const titleUpdateDisabledReason = conversation?.capabilities?.updateTitleDisabledReason;
+  const canUpdateTitle = conversation?.capabilities?.canUpdateTitle ?? true;
+  const canGenerateTitle = conversation?.capabilities?.canGenerateTitle ?? canUpdateTitle;
 
   const messageKeys = useMemo(
     () => loadedMessages.map((msg, index) => msg.messageId ?? `${index}-${msg.timestamp ?? "na"}-${msg.role}`),
@@ -138,17 +190,24 @@ export function ConversationViewer({
   }, [deletableMessageIds]);
 
   const startEdit = () => {
-    if (!conversation) return;
+    if (!conversation || !canUpdateTitle) return;
     setEditValue(conversation.title);
     setEditing(true);
   };
 
   const saveEdit = async () => {
-    if (!conversation || !editValue.trim()) return;
+    if (!conversation || !canUpdateTitle || !editValue.trim()) return;
     try {
-      await updateTitle(conversation.id, editValue.trim());
-      await onTitleChanged(conversation.id);
+      const result = await updateTitle(conversation.id, editValue.trim());
+      await onTitleChanged(conversation.id, result.title);
       setEditing(false);
+      if (titleSyncInfo) {
+        onNotify({
+          variant: titleSyncInfo.variant,
+          title: titleSyncInfo.saveTitle,
+          description: titleSyncInfo.description,
+        });
+      }
     } catch (error) {
       onNotify({
         variant: "error",
@@ -159,14 +218,18 @@ export function ConversationViewer({
   };
 
   const handleGenerate = async () => {
-    if (!conversation || generating) return;
+    if (!conversation || !canGenerateTitle || generating) return;
     setGenerating(true);
     setGenStatus("正在调用 AI CLI 生成标题...");
     try {
       const result = await generateAiTitle(conversation.id);
       if (result.success) {
-        setGenStatus(`已通过 ${result.usedCli} 生成`);
-        await onTitleChanged(conversation.id);
+        setGenStatus(
+          titleSyncInfo
+            ? `已通过 ${result.usedCli} 生成，${titleSyncInfo.statusSuffix}`
+            : `已通过 ${result.usedCli} 生成`
+        );
+        await onTitleChanged(conversation.id, result.title);
         setTimeout(() => setGenStatus(""), 3000);
       } else {
         setGenStatus(`失败: ${result.error}`);
@@ -191,7 +254,7 @@ export function ConversationViewer({
 
     try {
       await updateConversationMessage(conversation.id, messageId, content);
-      await onConversationChanged(conversation.id);
+      await onMessageUpdated(conversation.id, messageId, content);
     } catch (error) {
       onNotify({
         variant: "error",
@@ -207,7 +270,7 @@ export function ConversationViewer({
 
     try {
       await deleteConversationMessage(conversation.id, messageId);
-      await onConversationChanged(conversation.id);
+      await onMessagesDeleted(conversation.id, [messageId]);
     } catch (error) {
       onNotify({
         variant: "error",
@@ -253,7 +316,7 @@ export function ConversationViewer({
     try {
       await deleteConversationMessages(conversation.id, targetIds);
       setSelectedMessageIds(new Set());
-      await onConversationChanged(conversation.id);
+      await onMessagesDeleted(conversation.id, targetIds);
       onNotify({
         variant: "info",
         title: "批量删除完成",
@@ -334,13 +397,15 @@ export function ConversationViewer({
                 <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100 truncate">
                   {conversation.title}
                 </h2>
-                <button
-                  onClick={startEdit}
-                  className="p-1 text-gray-300 hover:text-gray-600 dark:hover:text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
-                  title="编辑标题"
-                >
-                  <Pencil className="w-3.5 h-3.5" />
-                </button>
+                {canUpdateTitle && (
+                  <button
+                    onClick={startEdit}
+                    className="p-1 text-gray-300 hover:text-gray-600 dark:hover:text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity"
+                    title="编辑标题"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
             )}
 
@@ -357,6 +422,14 @@ export function ConversationViewer({
                 {new Date(conversation.createdAt).toLocaleDateString("zh-CN")}
               </span>
               <span>{totalMessages} 条消息</span>
+              {titleSyncInfo && (
+                <span
+                  className={titleSyncInfo.badgeClassName}
+                  title={titleSyncInfo.description}
+                >
+                  {titleSyncInfo.badgeLabel}
+                </span>
+              )}
               {conversation.provider === "codex" && conversation.modelProvider && (
                 <span className="flex items-center gap-1">
                   <ArrowRightLeft className="w-3 h-3 text-gray-400" />
@@ -381,6 +454,11 @@ export function ConversationViewer({
               {selectionMode && (
                 <span className="text-amber-600 dark:text-amber-400">
                   仅对当前已加载且支持删除的消息生效
+                </span>
+              )}
+              {!canUpdateTitle && titleUpdateDisabledReason && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  {titleUpdateDisabledReason}
                 </span>
               )}
             </div>
@@ -428,18 +506,20 @@ export function ConversationViewer({
                 </button>
               )
             )}
-            <button
-              onClick={handleGenerate}
-              disabled={generating}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {generating ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Sparkles className="w-3.5 h-3.5" />
-              )}
-              {generating ? "生成中" : "AI 标题"}
-            </button>
+            {canGenerateTitle && (
+              <button
+                onClick={handleGenerate}
+                disabled={generating}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {generating ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5" />
+                )}
+                {generating ? "生成中" : "AI 标题"}
+              </button>
+            )}
             <button
               onClick={() => onExport(conversation.id)}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"

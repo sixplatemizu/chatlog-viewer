@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   getIndexedCacheSnapshot,
   getIndexedListCache,
@@ -7,9 +10,24 @@ import {
   queryConversationIndex,
   setIndexedListCache,
   invalidateListCache,
+  setCacheStoreDirForTests,
 } from "../../utils/cache.js";
 import { SEARCH_INDEX_VERSION } from "../../utils/search-index.js";
 import type { ConversationMeta } from "../../providers/types.js";
+
+let storeDir = "";
+
+test.before(async () => {
+  storeDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-cache-test-"));
+  setCacheStoreDirForTests(storeDir);
+});
+
+test.after(async () => {
+  setCacheStoreDirForTests();
+  if (storeDir) {
+    await rm(storeDir, { recursive: true, force: true });
+  }
+});
 
 function createConversationMeta(id: string): ConversationMeta {
   return {
@@ -161,6 +179,28 @@ test("partial indexed list cache 在需要完整搜索索引时不会命中", ()
   assert.deepEqual(getIndexedListCache(cacheKey, 60_000), items);
   assert.equal(getIndexedListCache(cacheKey, 60_000, { requireSearchReady: true }), null);
   assert.equal(hasFreshIndexedListCache(cacheKey, 60_000, { requireSearchReady: true }), false);
+
+  invalidateListCache(cacheKey);
+});
+
+test("source signature 变化后不会继续命中旧 indexed cache", () => {
+  const cacheKey = `test-index-signature-${Date.now()}`;
+  const items = [createConversationMeta("codex:signature")];
+
+  setIndexedListCache(cacheKey, items, { sourceSignature: "signature-v1" });
+
+  assert.deepEqual(
+    getIndexedListCache(cacheKey, 60_000, { sourceSignature: "signature-v1" }),
+    items
+  );
+  assert.equal(
+    getIndexedListCache(cacheKey, 60_000, { sourceSignature: "signature-v2" }),
+    null
+  );
+  assert.equal(
+    hasFreshIndexedListCache(cacheKey, 60_000, { sourceSignature: "signature-v2" }),
+    false
+  );
 
   invalidateListCache(cacheKey);
 });

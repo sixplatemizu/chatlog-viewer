@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations } from "./useConversations";
-import type { ConversationListResponse, ConversationMeta } from "../lib/api";
+import type { Conversation, ConversationListResponse, ConversationMeta } from "../lib/api";
 
 const {
   mockFetchProviders,
@@ -41,6 +41,17 @@ function createConversation(id: string): ConversationMeta {
   };
 }
 
+function createConversationDetail(id: string): Conversation {
+  return {
+    ...createConversation(id),
+    messages: [
+      { messageId: "msg-1", role: "user", content: "原始问题", timestamp: 1, editable: true, deletable: true },
+      { messageId: "msg-2", role: "assistant", content: "原始回答", timestamp: 2, editable: true, deletable: true },
+    ],
+    hasMore: false,
+  };
+}
+
 describe("useConversations", () => {
   beforeEach(() => {
     mockFetchProviders.mockReset();
@@ -57,7 +68,7 @@ describe("useConversations", () => {
       },
     ]);
     mockFetchCodexProviders.mockResolvedValue([]);
-    mockFetchConversation.mockResolvedValue(null);
+    mockFetchConversation.mockResolvedValue(createConversationDetail("codex:1"));
   });
 
   it("筛选后会移除当前不可见项的多选状态，并暴露 partialSearch 提示", async () => {
@@ -99,5 +110,84 @@ describe("useConversations", () => {
     expect([...result.current.selectedIds]).toEqual(["codex:2"]);
     expect(result.current.partialSearch).toBe(true);
     expect(result.current.searchWarnings).toEqual(filteredResponse.warnings);
+  });
+
+  it("标题修改会先本地更新，不再同步阻塞整窗刷新", async () => {
+    mockFetchConversations.mockResolvedValue({
+      total: 1,
+      conversations: [createConversation("codex:1")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.conversations).toHaveLength(1);
+    });
+
+    await act(async () => {
+      await result.current.selectConversation("codex:1");
+    });
+
+    mockFetchConversation.mockClear();
+
+    act(() => {
+      result.current.applyLocalTitleChange("codex:1", "新的本地标题");
+    });
+
+    expect(result.current.conversation?.title).toBe("新的本地标题");
+    expect(result.current.conversations[0]?.title).toBe("新的本地标题");
+    expect(mockFetchConversation).not.toHaveBeenCalled();
+  });
+
+  it("消息编辑会先本地更新，再后台静默校正", async () => {
+    mockFetchConversations.mockResolvedValue({
+      total: 1,
+      conversations: [createConversation("codex:1")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+
+    const refreshedDetail: Conversation = {
+      ...createConversation("codex:1"),
+      updatedAt: 999,
+      messages: [
+        { messageId: "msg-1b", role: "user", content: "修改后的问题", timestamp: 1, editable: true, deletable: true },
+        { messageId: "msg-2", role: "assistant", content: "原始回答", timestamp: 2, editable: true, deletable: true },
+      ],
+      hasMore: false,
+    };
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.conversations).toHaveLength(1);
+    });
+
+    await act(async () => {
+      await result.current.selectConversation("codex:1");
+    });
+
+    mockFetchConversation.mockReset();
+    mockFetchConversation.mockResolvedValue(refreshedDetail);
+
+    act(() => {
+      result.current.applyLocalMessageUpdate("codex:1", "msg-1", "修改后的问题");
+    });
+
+    expect(result.current.conversation?.messages[0]?.content).toBe("修改后的问题");
+
+    await waitFor(() => {
+      expect(mockFetchConversation).toHaveBeenCalledWith("codex:1", {
+        before: 0,
+        limit: 200,
+        signal: expect.any(AbortSignal),
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.conversation?.messages[0]?.messageId).toBe("msg-1b");
+    });
   });
 });

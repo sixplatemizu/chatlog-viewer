@@ -9,13 +9,12 @@ import { SEARCH_INDEX_VERSION } from "./search-index.js";
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
 
-const STORE_DIR = join(homedir(), ".chatlog-viewer");
-const DB_PATH = join(STORE_DIR, "meta-cache.sqlite");
 const INDEX_TTL_MS = 30_000;
 const CACHE_PRUNE_INTERVAL_MS = 5 * 60_000;
 const VACUUM_INTERVAL_MS = 24 * 60 * 60_000;
 const META_CACHE_MAX_AGE_MS = 90 * 24 * 60 * 60_000;
 const LIST_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+const MESSAGE_IDENTITY_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const KEEP_META_ROWS = 50_000;
 
 interface CacheEntry {
@@ -33,6 +32,7 @@ interface IndexedListCacheEntry {
   updatedAt: number;
   searchReady: boolean;
   searchVersion: number;
+  sourceSignature?: string;
   detailedItems?: IndexedCacheItem[];
 }
 
@@ -42,13 +42,21 @@ export interface IndexedCacheItem {
   searchChunks?: string[];
 }
 
+export interface PersistedMessageIdentityEntry {
+  mtimeMs: number;
+  orderedMessageIds: string[];
+  lineByMessageId: Map<string, number>;
+}
+
 interface IndexedListCacheReadOptions {
   requireSearchReady?: boolean;
+  sourceSignature?: string;
 }
 
 interface IndexedListCacheWriteOptions {
   searchReady?: boolean;
   searchVersion?: number;
+  sourceSignature?: string;
 }
 
 // 基于文件 mtime 的元数据缓存
@@ -56,23 +64,66 @@ const memoryCache = new Map<string, CacheEntry>();
 const memoryListCache = new Map<string, ListCacheEntry>();
 const memoryIndexedListCache = new Map<string, IndexedListCacheEntry>();
 let db: BetterSqlite3.Database | null = null;
+let dbPath: string | null = null;
 let lastPruneAt = 0;
 let lastVacuumAt = 0;
 let supportsConversationFtsSearch = false;
 let supportsChunkFtsSearch = false;
+let storeDirOverride: string | null = null;
+
+function getStoreDir(): string {
+  const envOverride = process.env.CHATLOG_VIEWER_STORE_DIR?.trim();
+  return storeDirOverride || envOverride || join(homedir(), ".chatlog-viewer");
+}
+
+function getDbPath(): string {
+  return join(getStoreDir(), "meta-cache.sqlite");
+}
+
+function resetCacheState(): void {
+  memoryCache.clear();
+  memoryListCache.clear();
+  memoryIndexedListCache.clear();
+  supportsConversationFtsSearch = false;
+  supportsChunkFtsSearch = false;
+  lastPruneAt = 0;
+  lastVacuumAt = 0;
+
+  if (db) {
+    try {
+      db.close();
+    } catch {
+      // 忽略关闭失败
+    }
+  }
+
+  db = null;
+  dbPath = null;
+}
+
+export function setCacheStoreDirForTests(storeDir?: string): void {
+  storeDirOverride = storeDir?.trim() || null;
+  resetCacheState();
+}
 
 export function getIndexedListCacheKey(providerName: string, storagePath: string): string {
   return `${providerName}::${storagePath}::indexed`;
 }
 
 function getDb(): BetterSqlite3.Database {
-  if (db) return db;
-
-  if (!existsSync(STORE_DIR)) {
-    mkdirSync(STORE_DIR, { recursive: true });
+  const nextDbPath = getDbPath();
+  if (db && dbPath === nextDbPath) return db;
+  if (db && dbPath !== nextDbPath) {
+    resetCacheState();
   }
 
-  db = new Database(DB_PATH);
+  const storeDir = getStoreDir();
+  if (!existsSync(storeDir)) {
+    mkdirSync(storeDir, { recursive: true });
+  }
+
+  db = new Database(nextDbPath);
+  dbPath = nextDbPath;
   db.exec(`
     CREATE TABLE IF NOT EXISTS meta_cache (
       file_path TEXT PRIMARY KEY,
@@ -93,7 +144,8 @@ function getDb(): BetterSqlite3.Database {
       list_json TEXT NOT NULL,
       updated_at INTEGER NOT NULL,
       search_ready INTEGER NOT NULL DEFAULT 1,
-      search_version INTEGER NOT NULL DEFAULT 1
+      search_version INTEGER NOT NULL DEFAULT 1,
+      source_signature TEXT
     );
 
     CREATE TABLE IF NOT EXISTS conversation_index (
@@ -103,6 +155,7 @@ function getDb(): BetterSqlite3.Database {
       search_text TEXT,
       project TEXT NOT NULL,
       project_key TEXT NOT NULL,
+      project_id TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       message_count INTEGER NOT NULL,
@@ -122,6 +175,14 @@ function getDb(): BetterSqlite3.Database {
       indexed_at INTEGER NOT NULL,
       search_version INTEGER NOT NULL DEFAULT 1,
       PRIMARY KEY (conversation_id, chunk_index)
+    );
+
+    CREATE TABLE IF NOT EXISTS codex_message_identity (
+      file_path TEXT PRIMARY KEY,
+      mtime_ms REAL NOT NULL,
+      ordered_message_ids_json TEXT NOT NULL,
+      line_by_message_id_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
     )
   `);
 
@@ -165,6 +226,10 @@ function ensureIndexedListCacheSchema(database: BetterSqlite3.Database): void {
       "ALTER TABLE indexed_list_cache ADD COLUMN search_version INTEGER NOT NULL DEFAULT 1"
     );
   }
+
+  if (!columns.some((column) => column.name === "source_signature")) {
+    database.exec("ALTER TABLE indexed_list_cache ADD COLUMN source_signature TEXT");
+  }
 }
 
 function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
@@ -174,6 +239,10 @@ function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
 
   if (!columns.some((column) => column.name === "search_text")) {
     database.exec("ALTER TABLE conversation_index ADD COLUMN search_text TEXT");
+  }
+
+  if (!columns.some((column) => column.name === "project_id")) {
+    database.exec("ALTER TABLE conversation_index ADD COLUMN project_id TEXT");
   }
 
   if (!columns.some((column) => column.name === "search_version")) {
@@ -325,6 +394,7 @@ function createIndexedItemSignature(item: {
     item.searchChunks ?? [],
     item.meta.project,
     item.meta.projectKey,
+    item.meta.projectId ?? null,
     item.meta.createdAt,
     item.meta.updatedAt,
     item.meta.messageCount,
@@ -424,6 +494,7 @@ function isUsableIndexedListCache(
   ttlMs: number,
   searchReady: boolean,
   searchVersion: number,
+  sourceSignature: string | undefined,
   options?: IndexedListCacheReadOptions
 ): boolean {
   if (now - updatedAt > ttlMs) {
@@ -435,6 +506,10 @@ function isUsableIndexedListCache(
   }
 
   if (options?.requireSearchReady && searchVersion !== SEARCH_INDEX_VERSION) {
+    return false;
+  }
+
+  if (options?.sourceSignature !== undefined && sourceSignature !== options.sourceSignature) {
     return false;
   }
 
@@ -456,6 +531,7 @@ export function getIndexedListCache(
       ttlMs,
       memoryEntry.searchReady,
       memoryEntry.searchVersion,
+      memoryEntry.sourceSignature,
       options
     )
   ) {
@@ -464,9 +540,15 @@ export function getIndexedListCache(
 
   try {
     const row = getDb()
-      .prepare("SELECT list_json, updated_at, search_ready, search_version FROM indexed_list_cache WHERE cache_key = ?")
+      .prepare("SELECT list_json, updated_at, search_ready, search_version, source_signature FROM indexed_list_cache WHERE cache_key = ?")
       .get(cacheKey) as
-      | { list_json: string; updated_at: number; search_ready: number; search_version: number }
+      | {
+        list_json: string;
+        updated_at: number;
+        search_ready: number;
+        search_version: number;
+        source_signature: string | null;
+      }
       | undefined;
 
     if (
@@ -477,6 +559,7 @@ export function getIndexedListCache(
         ttlMs,
         !!row.search_ready,
         row.search_version,
+        row.source_signature ?? undefined,
         options
       )
     ) {
@@ -489,6 +572,7 @@ export function getIndexedListCache(
       updatedAt: row.updated_at,
       searchReady: !!row.search_ready,
       searchVersion: row.search_version,
+      sourceSignature: row.source_signature ?? undefined,
     });
     return items;
   } catch {
@@ -504,9 +588,15 @@ export function getIndexedListSnapshot(cacheKey: string): ConversationMeta[] | n
 
   try {
     const row = getDb()
-      .prepare("SELECT list_json, updated_at, search_ready, search_version FROM indexed_list_cache WHERE cache_key = ?")
+      .prepare("SELECT list_json, updated_at, search_ready, search_version, source_signature FROM indexed_list_cache WHERE cache_key = ?")
       .get(cacheKey) as
-      | { list_json: string; updated_at: number; search_ready: number; search_version: number }
+      | {
+        list_json: string;
+        updated_at: number;
+        search_ready: number;
+        search_version: number;
+        source_signature: string | null;
+      }
       | undefined;
 
     if (!row) {
@@ -519,6 +609,7 @@ export function getIndexedListSnapshot(cacheKey: string): ConversationMeta[] | n
       updatedAt: row.updated_at,
       searchReady: !!row.search_ready,
       searchVersion: row.search_version,
+      sourceSignature: row.source_signature ?? undefined,
     });
     return items;
   } catch {
@@ -545,6 +636,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
           search_text,
           project,
           project_key,
+          project_id,
           created_at,
           updated_at,
           message_count,
@@ -564,6 +656,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
       search_text: string | null;
       project: string;
       project_key: string;
+      project_id: string | null;
       created_at: number;
       updated_at: number;
       message_count: number;
@@ -607,6 +700,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
         title: row.title,
         project: row.project,
         projectKey: row.project_key,
+        projectId: row.project_id ?? undefined,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         messageCount: row.message_count,
@@ -647,6 +741,7 @@ export function hasFreshIndexedListCache(
       ttlMs,
       memoryEntry.searchReady,
       memoryEntry.searchVersion,
+      memoryEntry.sourceSignature,
       options
     )
   ) {
@@ -655,8 +750,15 @@ export function hasFreshIndexedListCache(
 
   try {
     const row = getDb()
-      .prepare("SELECT updated_at, search_ready, search_version FROM indexed_list_cache WHERE cache_key = ?")
-      .get(cacheKey) as { updated_at: number; search_ready: number; search_version: number } | undefined;
+      .prepare("SELECT updated_at, search_ready, search_version, source_signature FROM indexed_list_cache WHERE cache_key = ?")
+      .get(cacheKey) as
+      | {
+        updated_at: number;
+        search_ready: number;
+        search_version: number;
+        source_signature: string | null;
+      }
+      | undefined;
 
     return !!row && isUsableIndexedListCache(
       now,
@@ -664,6 +766,7 @@ export function hasFreshIndexedListCache(
       ttlMs,
       !!row.search_ready,
       row.search_version,
+      row.source_signature ?? undefined,
       options
     );
   } catch {
@@ -679,6 +782,7 @@ export function setIndexedListCache(
   const updatedAt = Date.now();
   const searchReady = options?.searchReady ?? true;
   const searchVersion = options?.searchVersion ?? SEARCH_INDEX_VERSION;
+  const sourceSignature = options?.sourceSignature;
   const normalizedDetailedItems = items.map((item) => ("meta" in item ? item : { meta: item }));
   const normalizedItems = normalizedDetailedItems.map((item) => item.meta);
   memoryIndexedListCache.set(cacheKey, {
@@ -686,6 +790,7 @@ export function setIndexedListCache(
     updatedAt,
     searchReady,
     searchVersion,
+    sourceSignature,
     detailedItems: normalizedDetailedItems,
   });
 
@@ -694,15 +799,16 @@ export function setIndexedListCache(
     database.transaction(() => {
       database
         .prepare(
-          `INSERT INTO indexed_list_cache (cache_key, list_json, updated_at, search_ready, search_version)
-           VALUES (?, ?, ?, ?, ?)
+          `INSERT INTO indexed_list_cache (cache_key, list_json, updated_at, search_ready, search_version, source_signature)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(cache_key) DO UPDATE SET
              list_json = excluded.list_json,
              updated_at = excluded.updated_at,
              search_ready = excluded.search_ready,
-             search_version = excluded.search_version`
+             search_version = excluded.search_version,
+             source_signature = excluded.source_signature`
         )
-        .run(cacheKey, JSON.stringify(normalizedItems), updatedAt, searchReady ? 1 : 0, searchVersion);
+        .run(cacheKey, JSON.stringify(normalizedItems), updatedAt, searchReady ? 1 : 0, searchVersion, sourceSignature ?? null);
 
       const upsertConversation = database.prepare(
         `INSERT INTO conversation_index (
@@ -712,6 +818,7 @@ export function setIndexedListCache(
            search_text,
            project,
            project_key,
+           project_id,
            created_at,
            updated_at,
            message_count,
@@ -721,13 +828,14 @@ export function setIndexedListCache(
            cache_key,
            indexed_at,
            search_version
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            title = excluded.title,
            search_text = excluded.search_text,
            project = excluded.project,
            project_key = excluded.project_key,
+           project_id = excluded.project_id,
            created_at = excluded.created_at,
            updated_at = excluded.updated_at,
            message_count = excluded.message_count,
@@ -765,6 +873,7 @@ export function setIndexedListCache(
            search_text,
            project,
            project_key,
+           project_id,
            created_at,
            updated_at,
            message_count,
@@ -781,6 +890,7 @@ export function setIndexedListCache(
         search_text: string | null;
         project: string;
         project_key: string;
+        project_id: string | null;
         created_at: number;
         updated_at: number;
         message_count: number;
@@ -822,6 +932,7 @@ export function setIndexedListCache(
               title: row.title,
               project: row.project,
               projectKey: row.project_key,
+              projectId: row.project_id ?? undefined,
               createdAt: row.created_at,
               updatedAt: row.updated_at,
               messageCount: row.message_count,
@@ -872,6 +983,7 @@ export function setIndexedListCache(
           item.searchText ?? null,
           meta.project,
           meta.projectKey,
+          meta.projectId ?? null,
           meta.createdAt,
           meta.updatedAt,
           meta.messageCount,
@@ -899,6 +1011,106 @@ export function setIndexedListCache(
     pruneCacheStorage(database);
   } catch {
     // 持久化失败时退回内存缓存
+  }
+}
+
+function serializeLineByMessageId(lineByMessageId: Map<string, number>): string {
+  return JSON.stringify([...lineByMessageId.entries()]);
+}
+
+function deserializeLineByMessageId(rawValue: string): Map<string, number> {
+  try {
+    const parsed = JSON.parse(rawValue) as unknown;
+    if (!Array.isArray(parsed)) {
+      return new Map();
+    }
+
+    return new Map(
+      parsed.filter((item): item is [string, number] => (
+        Array.isArray(item)
+        && typeof item[0] === "string"
+        && typeof item[1] === "number"
+        && Number.isInteger(item[1])
+      ))
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+export function getPersistedCodexMessageIdentity(
+  filePath: string,
+  mtimeMs: number
+): PersistedMessageIdentityEntry | null {
+  try {
+    const row = getDb()
+      .prepare(`
+        SELECT mtime_ms, ordered_message_ids_json, line_by_message_id_json
+        FROM codex_message_identity
+        WHERE file_path = ? AND mtime_ms = ?
+      `)
+      .get(filePath, mtimeMs) as {
+        mtime_ms: number;
+        ordered_message_ids_json: string;
+        line_by_message_id_json: string;
+      } | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    const orderedMessageIds = JSON.parse(row.ordered_message_ids_json) as unknown;
+    if (!Array.isArray(orderedMessageIds) || !orderedMessageIds.every((item) => typeof item === "string")) {
+      return null;
+    }
+
+    return {
+      mtimeMs: row.mtime_ms,
+      orderedMessageIds,
+      lineByMessageId: deserializeLineByMessageId(row.line_by_message_id_json),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function setPersistedCodexMessageIdentity(
+  filePath: string,
+  entry: PersistedMessageIdentityEntry
+): void {
+  try {
+    const database = getDb();
+    database.prepare(`
+      INSERT INTO codex_message_identity (
+        file_path,
+        mtime_ms,
+        ordered_message_ids_json,
+        line_by_message_id_json,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(file_path) DO UPDATE SET
+        mtime_ms = excluded.mtime_ms,
+        ordered_message_ids_json = excluded.ordered_message_ids_json,
+        line_by_message_id_json = excluded.line_by_message_id_json,
+        updated_at = excluded.updated_at
+    `).run(
+      filePath,
+      entry.mtimeMs,
+      JSON.stringify(entry.orderedMessageIds),
+      serializeLineByMessageId(entry.lineByMessageId),
+      Date.now()
+    );
+    pruneCacheStorage(database);
+  } catch {
+    // 忽略持久化失败
+  }
+}
+
+export function deletePersistedCodexMessageIdentity(filePath: string): void {
+  try {
+    getDb().prepare("DELETE FROM codex_message_identity WHERE file_path = ?").run(filePath);
+  } catch {
+    // 忽略持久化失败
   }
 }
 
@@ -1000,6 +1212,7 @@ export function queryConversationIndex(options: {
         conversation_index.search_text,
         conversation_index.project,
         conversation_index.project_key,
+        conversation_index.project_id,
         conversation_index.created_at,
         conversation_index.updated_at,
         conversation_index.message_count,
@@ -1018,6 +1231,7 @@ export function queryConversationIndex(options: {
       search_text: string | null;
       project: string;
       project_key: string;
+      project_id: string | null;
       created_at: number;
       updated_at: number;
       message_count: number;
@@ -1032,6 +1246,7 @@ export function queryConversationIndex(options: {
       title: row.title,
       project: row.project,
       projectKey: row.project_key,
+      projectId: row.project_id ?? undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       messageCount: row.message_count,
@@ -1054,6 +1269,7 @@ function pruneCacheStorage(database: BetterSqlite3.Database): void {
   database.prepare("DELETE FROM meta_cache WHERE updated_at < ?").run(now - META_CACHE_MAX_AGE_MS);
   database.prepare("DELETE FROM list_cache WHERE updated_at < ?").run(now - LIST_CACHE_MAX_AGE_MS);
   database.prepare("DELETE FROM indexed_list_cache WHERE updated_at < ?").run(now - LIST_CACHE_MAX_AGE_MS);
+  database.prepare("DELETE FROM codex_message_identity WHERE updated_at < ?").run(now - MESSAGE_IDENTITY_CACHE_MAX_AGE_MS);
   database.prepare(
     `DELETE FROM meta_cache
      WHERE file_path IN (

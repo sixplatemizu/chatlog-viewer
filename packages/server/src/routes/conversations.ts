@@ -1,6 +1,11 @@
 import { Hono } from "hono";
 import { homedir } from "os";
-import type { ConversationProvider, ConversationMeta } from "../providers/types.js";
+import type {
+  ConversationProvider,
+  ConversationMeta,
+  ConversationCapabilities,
+  TitleSyncMode,
+} from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
 import { generateTitle, getAvailableClis, resetSession } from "../utils/ai.js";
@@ -40,6 +45,44 @@ function normalizeOptionalPathInput(value: unknown): string | undefined {
   return trimmed || undefined;
 }
 
+function resolveProviderTitleSyncMode(provider: ConversationProvider | undefined): TitleSyncMode {
+  if (!provider) return "overlay";
+  return provider.capabilities?.titleSyncMode ?? (provider.updateTitle ? "native" : "overlay");
+}
+
+function resolveConversationCapabilities(provider: ConversationProvider | undefined): ConversationCapabilities {
+  if (!provider) {
+    return {
+      canUpdateTitle: true,
+      canGenerateTitle: true,
+    };
+  }
+
+  const canUpdateTitle = provider.capabilities?.canUpdateTitle ?? true;
+  const canGenerateTitle = provider.capabilities?.canGenerateTitle ?? canUpdateTitle;
+
+  return {
+    canUpdateTitle,
+    canGenerateTitle,
+    updateTitleDisabledReason: provider.capabilities?.updateTitleDisabledReason,
+    generateTitleDisabledReason: provider.capabilities?.generateTitleDisabledReason,
+  };
+}
+
+function getTitleMutationDisabledReason(
+  provider: ConversationProvider,
+  operation: "update" | "generate"
+): string | null {
+  const capabilities = resolveConversationCapabilities(provider);
+  if (operation === "update" && !capabilities.canUpdateTitle) {
+    return capabilities.updateTitleDisabledReason ?? `${provider.displayName} 不支持修改标题`;
+  }
+  if (operation === "generate" && !capabilities.canGenerateTitle) {
+    return capabilities.generateTitleDisabledReason ?? `${provider.displayName} 不支持 AI 标题生成`;
+  }
+  return null;
+}
+
 function buildProviderPathSettings(providers: ConversationProvider[]) {
   const loadedConfig = getAppConfig();
   const configuredProviders = loadedConfig.config.providers ?? {};
@@ -61,8 +104,58 @@ function buildProviderPathSettings(providers: ConversationProvider[]) {
   });
 }
 
+async function persistConversationTitle(
+  provider: ConversationProvider,
+  id: string,
+  title: string
+): Promise<void> {
+  const normalizedTitle = title.trim();
+  if (!normalizedTitle) {
+    throw new Error("标题不能为空");
+  }
+
+  if (provider.updateTitle) {
+    await provider.updateTitle(id, normalizedTitle);
+    await deleteTitle(id);
+    return;
+  }
+
+  await setTitle(id, normalizedTitle);
+}
+
+async function resolveConversationTitle(
+  provider: ConversationProvider,
+  id: string,
+  currentTitle: string,
+  customTitle: string | null | undefined
+): Promise<string> {
+  const normalizedCustomTitle = customTitle?.trim();
+  if (!normalizedCustomTitle) {
+    return currentTitle;
+  }
+
+  if (!provider.updateTitle) {
+    return normalizedCustomTitle;
+  }
+
+  if (normalizedCustomTitle === currentTitle) {
+    await deleteTitle(id);
+    return currentTitle;
+  }
+
+  try {
+    await provider.updateTitle(id, normalizedCustomTitle);
+    await deleteTitle(id);
+  } catch (error) {
+    logProviderError("conversations.title.sync", provider.name, error);
+  }
+
+  return normalizedCustomTitle;
+}
+
 export function createConversationRoutes(providers: ConversationProvider[]) {
   const app = new Hono();
+  const providerByName = new Map(providers.map((provider) => [provider.name, provider]));
 
   function getProviderListCacheKey(provider: ConversationProvider): string {
     return `${provider.name}::${provider.getStoragePath()}::indexed`;
@@ -234,13 +327,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
           }
           continue;
         }
-        if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady })) {
+        const sourceSignature = (await provider.getListSourceSignature?.()) ?? undefined;
+        if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
           indexedCacheKeys.push(cacheKey);
           continue;
         }
 
         const refreshedItems = await provider.list({ eagerSearchIndex: requireSearchReady });
-        if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady })) {
+        if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
           indexedCacheKeys.push(cacheKey);
         } else {
           refreshedByProvider.set(provider.name, refreshedItems);
@@ -294,11 +388,21 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       );
     }
 
-    const filtered = [...indexedConversations, ...filteredRefreshed]
-      .map((conv) => ({
-        ...conv,
-        title: customTitles[conv.id] ?? conv.title,
-      }))
+    const filtered = (await Promise.all([...indexedConversations, ...filteredRefreshed]
+      .map(async (conv) => {
+        const provider = providerByName.get(conv.provider);
+        const resolvedTitle = provider
+          ? await resolveConversationTitle(provider, conv.id, conv.title, customTitles[conv.id])
+          : (customTitles[conv.id] ?? conv.title);
+        const capabilities = resolveConversationCapabilities(provider);
+
+        return {
+          ...conv,
+          title: resolvedTitle,
+          titleSyncMode: resolveProviderTitleSyncMode(provider),
+          capabilities,
+        };
+      })))
       .sort((a, b) => {
         if (sort === "createdAt") return b.createdAt - a.createdAt;
         if (sort === "provider") {
@@ -319,7 +423,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   app.get("/conversations/:id", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
     const providerName = id.split(":")[0];
-    const provider = providers.find((p) => p.name === providerName);
+    const provider = providerByName.get(providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
 
     const limitParam = c.req.query("limit");
@@ -332,9 +436,18 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         limit: Number.isFinite(limit) && limit! > 0 ? limit : undefined,
         before: Number.isFinite(before) && before! >= 0 ? before : undefined,
       });
-      const customTitle = await getTitle(id);
-      if (customTitle) conversation.title = customTitle;
-      return c.json(conversation);
+      const resolvedTitle = await resolveConversationTitle(
+        provider,
+        id,
+        conversation.title,
+        await getTitle(id)
+      );
+      return c.json({
+        ...conversation,
+        title: resolvedTitle,
+        titleSyncMode: resolveProviderTitleSyncMode(provider),
+        capabilities: resolveConversationCapabilities(provider),
+      });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
@@ -417,6 +530,50 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     }
   });
 
+  app.post("/conversations/batch-delete", async (c) => {
+    const body = await c.req.json<{ ids?: unknown }>();
+    if (!Array.isArray(body?.ids)) {
+      return c.json({ error: "ids 必须是数组" }, 400);
+    }
+
+    const ids = [...new Set(
+      body.ids
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )];
+    if (ids.length === 0) {
+      return c.json({ error: "待删除对话不能为空" }, 400);
+    }
+
+    const settled = await Promise.allSettled(ids.map(async (id) => {
+      const providerName = id.split(":")[0];
+      const provider = providers.find((p) => p.name === providerName);
+      if (!provider) {
+        throw new Error("未知的 provider");
+      }
+
+      await provider.delete(id);
+      await deleteTitle(id);
+      return id;
+    }));
+
+    const failures = settled.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [];
+      return [{
+        id: ids[index] || "",
+        error: getErrorMessage(result.reason),
+      }];
+    });
+
+    return c.json({
+      success: failures.length === 0,
+      deleted: ids.length - failures.length,
+      failed: failures.length,
+      failures,
+    });
+  });
+
   // 删除对话
   app.delete("/conversations/:id", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
@@ -436,10 +593,16 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   // 修改标题
   app.put("/conversations/:id/title", async (c) => {
     const id = decodeURIComponent(c.req.param("id"));
+    const providerName = id.split(":")[0];
+    const provider = providerByName.get(providerName);
+    if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    const disabledReason = getTitleMutationDisabledReason(provider, "update");
+    if (disabledReason) return c.json({ error: disabledReason }, 400);
+
     const body = await c.req.json<{ title: string }>();
     if (!body.title?.trim()) return c.json({ error: "标题不能为空" }, 400);
 
-    await setTitle(id, body.title.trim());
+    await persistConversationTitle(provider, id, body.title.trim());
     return c.json({ success: true, title: body.title.trim() });
   });
 
@@ -449,18 +612,78 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = id.split(":")[0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    const disabledReason = getTitleMutationDisabledReason(provider, "generate");
+    if (disabledReason) return c.json({ error: disabledReason }, 400);
 
     try {
       const conversation = await provider.read(id);
       const result = await generateTitle(conversation.messages, {
         priority: getTitleGenerationCliPriority(),
       });
-      // 自动保存生成的标题
-      await setTitle(id, result.title);
+      await persistConversationTitle(provider, id, result.title);
       return c.json({ success: true, title: result.title, usedCli: result.usedCli });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
+  });
+
+  app.post("/conversations/generate-title/batch", async (c) => {
+    const body = await c.req.json<{ ids?: unknown }>();
+    if (!Array.isArray(body?.ids)) {
+      return c.json({ error: "ids 必须是数组" }, 400);
+    }
+
+    const ids = [...new Set(
+      body.ids
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )];
+    if (ids.length === 0) {
+      return c.json({ error: "待生成标题的对话不能为空" }, 400);
+    }
+
+    const results: Array<{ id: string; title?: string; usedCli?: string; error?: string }> = [];
+
+    for (const id of ids) {
+      const providerName = id.split(":")[0];
+      const provider = providers.find((p) => p.name === providerName);
+      if (!provider) {
+        results.push({ id, error: "未知的 provider" });
+        continue;
+      }
+      const disabledReason = getTitleMutationDisabledReason(provider, "generate");
+      if (disabledReason) {
+        results.push({ id, error: disabledReason });
+        continue;
+      }
+
+      try {
+        const conversation = await provider.read(id);
+        const result = await generateTitle(conversation.messages, {
+          priority: getTitleGenerationCliPriority(),
+        });
+        await persistConversationTitle(provider, id, result.title);
+        results.push({
+          id,
+          title: result.title,
+          usedCli: result.usedCli,
+        });
+      } catch (e) {
+        results.push({
+          id,
+          error: getErrorMessage(e),
+        });
+      }
+    }
+
+    const generated = results.filter((item) => !!item.title).length;
+    return c.json({
+      success: generated === results.length,
+      generated,
+      failed: results.length - generated,
+      results,
+    });
   });
 
   // 移动对话到另一个项目文件夹

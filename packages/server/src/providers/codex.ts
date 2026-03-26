@@ -11,10 +11,27 @@ import {
   visitJsonl,
   type JsonlLine,
 } from "../utils/jsonl.js";
-import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
+import {
+  deletePersistedCodexMessageIdentity,
+  getCached,
+  getIndexedCacheSnapshot,
+  getIndexedListCache,
+  getPersistedCodexMessageIdentity,
+  hasIndexedSearchData,
+  setCache,
+  setIndexedListCache,
+  setPersistedCodexMessageIdentity,
+  invalidateCache,
+  invalidateListCache,
+  type IndexedCacheItem,
+} from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
-import { collectIndexedCacheItemsInBatches } from "../utils/provider-indexing.js";
+import {
+  collectGlobFileStates,
+  collectIndexedCacheItemsInBatches,
+  createIndexedListSourceSignature,
+} from "../utils/provider-indexing.js";
 import {
   createConversationSearchIndexBuilder,
   type ConversationSearchIndex,
@@ -23,9 +40,13 @@ import {
 import {
   assignStableMessageIds,
   createMessageSourceKey,
+  createStableMessageSourceKey,
+  getMessageActionLineNumbers,
+  invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
-  rewriteJsonlLine,
-  rewriteJsonlLines,
+  primeMessageActionIndex,
+  rewriteJsonlFileLine,
+  rewriteJsonlFileLines,
   type MessageRecord,
 } from "../utils/message-actions.js";
 import type {
@@ -55,6 +76,24 @@ interface CodexEntry {
   };
 }
 
+interface CodexThreadMetadata {
+  modelProvider?: string;
+  title?: string;
+  firstUserMessage?: string;
+}
+
+interface CodexMessageIdentityCacheEntry {
+  mtimeMs: number;
+  orderedMessageIds: string[];
+  lineByMessageId: Map<string, number>;
+}
+
+const codexMessageIdentityCache = new Map<string, CodexMessageIdentityCacheEntry>();
+
+export function clearCodexMessageIdentityCacheForTests(): void {
+  codexMessageIdentityCache.clear();
+}
+
 function extractContent(content: Array<{ type: string; text?: string }>): string {
   return content
     .filter((c) => (c.type === "input_text" || c.type === "output_text") && c.text)
@@ -72,7 +111,181 @@ function canonicalizeProjectPath(value: string): string {
   return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
-function buildMessageRecords(entries: JsonlLine<CodexEntry>[]): MessageRecord<CodexEntry>[] {
+function applyMessageActionFlags(records: MessageRecord<CodexEntry>[]): MessageRecord<CodexEntry>[] {
+  for (const record of records) {
+    if (!record.message.messageId) continue;
+    record.message.editable = true;
+    record.message.deletable = true;
+  }
+  return records;
+}
+
+function getCodexMessageIdentityCache(
+  filePath: string,
+  mtimeMs: number
+): CodexMessageIdentityCacheEntry | undefined {
+  const cached = codexMessageIdentityCache.get(filePath);
+  if (cached?.mtimeMs === mtimeMs) {
+    return cached;
+  }
+
+  const persisted = getPersistedCodexMessageIdentity(filePath, mtimeMs);
+  if (!persisted) {
+    return undefined;
+  }
+
+  codexMessageIdentityCache.set(filePath, persisted);
+  return persisted;
+}
+
+function primeCodexMessageIdentityCache(
+  filePath: string,
+  mtimeMs: number,
+  records: MessageRecord<CodexEntry>[]
+): void {
+  const orderedMessageIds: string[] = [];
+  const lineByMessageId = new Map<string, number>();
+
+  for (const record of records) {
+    const messageId = record.message.messageId;
+    if (!messageId) continue;
+    orderedMessageIds.push(messageId);
+    if (record.lineIndex) {
+      lineByMessageId.set(messageId, record.lineIndex);
+    }
+  }
+
+  codexMessageIdentityCache.set(filePath, {
+    mtimeMs,
+    orderedMessageIds,
+    lineByMessageId,
+  });
+  setPersistedCodexMessageIdentity(filePath, {
+    mtimeMs,
+    orderedMessageIds,
+    lineByMessageId,
+  });
+}
+
+function invalidateCodexMessageIdentityCache(filePath: string): void {
+  codexMessageIdentityCache.delete(filePath);
+}
+
+function hydrateCodexMessageIdsFromCache(
+  filePath: string,
+  mtimeMs: number,
+  records: MessageRecord<CodexEntry>[]
+): boolean {
+  if (records.length === 0) return true;
+
+  const cached = getCodexMessageIdentityCache(filePath, mtimeMs);
+  if (!cached) {
+    return false;
+  }
+
+  const allHaveLineNumbers = records.every((record) => record.lineIndex !== undefined);
+  const hydratedIds: string[] = [];
+
+  if (allHaveLineNumbers) {
+    const messageIdByLineNumber = new Map<number, string>();
+    for (const [messageId, lineNumber] of cached.lineByMessageId.entries()) {
+      messageIdByLineNumber.set(lineNumber, messageId);
+    }
+
+    for (const record of records) {
+      const lineIndex = record.lineIndex;
+      if (!lineIndex) {
+        return false;
+      }
+      const messageId = messageIdByLineNumber.get(lineIndex);
+      if (!messageId) {
+        return false;
+      }
+      hydratedIds.push(messageId);
+    }
+  } else {
+    if (records.length > cached.orderedMessageIds.length) {
+      return false;
+    }
+    hydratedIds.push(...cached.orderedMessageIds.slice(-records.length));
+  }
+
+  for (const [index, record] of records.entries()) {
+    record.message.messageId = hydratedIds[index];
+  }
+
+  applyMessageActionFlags(records);
+  return true;
+}
+
+function carryCodexMessageIdentityCacheAcrossEdit(
+  filePath: string,
+  previousMtimeMs: number,
+  nextMtimeMs: number
+): void {
+  const cached = getCodexMessageIdentityCache(filePath, previousMtimeMs);
+  if (!cached) {
+    return;
+  }
+
+  codexMessageIdentityCache.set(filePath, {
+    mtimeMs: nextMtimeMs,
+    orderedMessageIds: [...cached.orderedMessageIds],
+    lineByMessageId: new Map(cached.lineByMessageId),
+  });
+  setPersistedCodexMessageIdentity(filePath, {
+    mtimeMs: nextMtimeMs,
+    orderedMessageIds: [...cached.orderedMessageIds],
+    lineByMessageId: new Map(cached.lineByMessageId),
+  });
+}
+
+function carryCodexMessageIdentityCacheAcrossDelete(
+  filePath: string,
+  previousMtimeMs: number,
+  nextMtimeMs: number,
+  deletedMessageIds: string[]
+): void {
+  const cached = getCodexMessageIdentityCache(filePath, previousMtimeMs);
+  if (!cached) {
+    return;
+  }
+
+  const deletedSet = new Set(deletedMessageIds);
+  const deletedLineNumbers = deletedMessageIds
+    .map((messageId) => cached.lineByMessageId.get(messageId))
+    .filter((lineNumber): lineNumber is number => Number.isInteger(lineNumber))
+    .sort((a, b) => a - b);
+
+  const nextOrderedMessageIds = cached.orderedMessageIds.filter((messageId) => !deletedSet.has(messageId));
+  const nextLineByMessageId = new Map<string, number>();
+
+  for (const messageId of nextOrderedMessageIds) {
+    const lineNumber = cached.lineByMessageId.get(messageId);
+    if (!lineNumber) continue;
+    const shift = deletedLineNumbers.filter((deletedLine) => deletedLine < lineNumber).length;
+    nextLineByMessageId.set(messageId, lineNumber - shift);
+  }
+
+  codexMessageIdentityCache.set(filePath, {
+    mtimeMs: nextMtimeMs,
+    orderedMessageIds: nextOrderedMessageIds,
+    lineByMessageId: nextLineByMessageId,
+  });
+  setPersistedCodexMessageIdentity(filePath, {
+    mtimeMs: nextMtimeMs,
+    orderedMessageIds: nextOrderedMessageIds,
+    lineByMessageId: nextLineByMessageId,
+  });
+}
+
+function buildMessageRecords(
+  entries: JsonlLine<CodexEntry>[],
+  options?: {
+    filePath?: string;
+    mtimeMs?: number;
+  }
+): MessageRecord<CodexEntry>[] {
   const records: MessageRecord<CodexEntry>[] = [];
   for (const entry of entries) {
     const value = entry.value;
@@ -89,7 +302,18 @@ function buildMessageRecords(entries: JsonlLine<CodexEntry>[]): MessageRecord<Co
 
     records.push({
       entry: value,
-      sourceKey: createMessageSourceKey(entry.rawLine, "response_item"),
+      sourceKey: createStableMessageSourceKey(
+        "codex",
+        [
+          value.payload.id,
+          value.timestamp,
+          role,
+          value.payload.type,
+          value.payload.kind,
+          value.payload.content?.map((block) => block.type).join(","),
+        ],
+        entry.rawLine
+      ) ?? createMessageSourceKey(entry.rawLine, "codex"),
       lineIndex: entry.lineNumber,
       message: {
         role,
@@ -99,7 +323,21 @@ function buildMessageRecords(entries: JsonlLine<CodexEntry>[]): MessageRecord<Co
     });
   }
 
-  return assignStableMessageIds(records);
+  if (options?.filePath && options.mtimeMs !== undefined) {
+    if (hydrateCodexMessageIdsFromCache(options.filePath, options.mtimeMs, records)) {
+      return records;
+    }
+  }
+
+  const assignedRecords = assignStableMessageIds(records);
+  if (
+    options?.filePath
+    && options.mtimeMs !== undefined
+    && assignedRecords.every((record) => record.lineIndex !== undefined)
+  ) {
+    primeCodexMessageIdentityCache(options.filePath, options.mtimeMs, assignedRecords);
+  }
+  return assignedRecords;
 }
 
 function appendSearchIndexEntry(
@@ -147,23 +385,34 @@ function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items:
 export class CodexProvider implements ConversationProvider {
   name = "codex";
   displayName = "Codex";
+  capabilities = {
+    titleSyncMode: "native",
+    canUpdateTitle: true,
+    canGenerateTitle: true,
+  } as const;
 
   private db: BetterSqlite3.Database | null = null;
   private dbPath: string | null = null;
   private backgroundRefreshes = new Map<string, Promise<void>>();
+  private titleBackfills = new Set<string>();
 
   private getStateDbPath(): string {
     return getProviderPaths("codex").stateDbPath || join(this.getStoragePath(), "..", "state_5.sqlite");
+  }
+
+  private closeDb(): void {
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+    this.dbPath = null;
   }
 
   private getDb(): BetterSqlite3.Database | null {
     const dbPath = this.getStateDbPath();
     if (this.db && this.dbPath === dbPath) return this.db;
 
-    if (this.db) {
-      this.db.close();
-      this.db = null;
-    }
+    this.closeDb();
 
     try {
       this.db = new Database(dbPath, { readonly: true, fileMustExist: true });
@@ -175,16 +424,85 @@ export class CodexProvider implements ConversationProvider {
     }
   }
 
-  // 从 SQLite 查询 model_provider
-  private getModelProvider(sessionId: string): string | undefined {
-    const db = this.getDb();
-    if (!db) return undefined;
+  private getNormalizedStateDbPath(): string {
+    return this.getStateDbPath().replace(/\\/g, "/");
+  }
+
+  private async getListSourceFiles() {
+    const pattern = join(this.getStoragePath(), "**", "*.jsonl").replace(/\\/g, "/");
+    const fileStates = await collectGlobFileStates(pattern);
+
     try {
-      const row = db.prepare("SELECT model_provider FROM threads WHERE id = ?").get(sessionId) as { model_provider: string } | undefined;
-      return row?.model_provider;
+      const fileStat = await stat(this.getStateDbPath());
+      fileStates.push({
+        path: this.getNormalizedStateDbPath(),
+        mtimeMs: fileStat.mtimeMs,
+        size: fileStat.size,
+      });
     } catch {
-      return undefined;
+      // 允许缺失 state db，此时仅依赖 jsonl 目录。
     }
+
+    return fileStates;
+  }
+
+  private getThreadMetadata(sessionId: string): CodexThreadMetadata {
+    const db = this.getDb();
+    if (!db) return {};
+    try {
+      const row = db
+        .prepare("SELECT model_provider, title, first_user_message FROM threads WHERE id = ?")
+        .get(sessionId) as { model_provider: string; title: string | null; first_user_message: string | null } | undefined;
+      return {
+        modelProvider: row?.model_provider,
+        title: row?.title ?? undefined,
+        firstUserMessage: row?.first_user_message ?? undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  private async writeThreadDisplayTitle(
+    sessionId: string,
+    title: string,
+    options?: { updateTitleField?: boolean }
+  ): Promise<void> {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) {
+      throw new Error("标题不能为空");
+    }
+
+    const dbPath = this.getStateDbPath();
+    this.closeDb();
+
+    const db = new Database(dbPath);
+    try {
+      const result = options?.updateTitleField === false
+        ? db.prepare("UPDATE threads SET first_user_message = ? WHERE id = ?").run(normalizedTitle, sessionId)
+        : db.prepare("UPDATE threads SET title = ?, first_user_message = ? WHERE id = ?").run(normalizedTitle, normalizedTitle, sessionId);
+      if (result.changes === 0) {
+        throw new Error(`SQLite 中未找到对话: ${sessionId}`);
+      }
+    } finally {
+      db.close();
+    }
+  }
+
+  private scheduleTitleBackfill(sessionId: string, title: string): void {
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle || this.titleBackfills.has(sessionId)) {
+      return;
+    }
+
+    this.titleBackfills.add(sessionId);
+    void this.writeThreadDisplayTitle(sessionId, normalizedTitle, { updateTitleField: false })
+      .catch((error) => {
+        logProviderError("conversations.title.backfill", this.name, error);
+      })
+      .finally(() => {
+        this.titleBackfills.delete(sessionId);
+      });
   }
 
   getStoragePath(): string {
@@ -205,6 +523,15 @@ export class CodexProvider implements ConversationProvider {
       eagerSearchIndex: options.eagerSearchIndex ?? false,
       allowBackground: true,
     });
+  }
+
+  async getListSourceSignature(): Promise<string | null> {
+    try {
+      const fileStates = await this.getListSourceFiles();
+      return createIndexedListSourceSignature(fileStates);
+    } catch {
+      return null;
+    }
   }
 
   private scheduleBackgroundIndexRefresh(): void {
@@ -234,8 +561,11 @@ export class CodexProvider implements ConversationProvider {
   }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
     const cacheKey = getListCacheKey(this.name, basePath);
+    const fileStates = await this.getListSourceFiles();
+    const sourceSignature = createIndexedListSourceSignature(fileStates);
     const cachedList = getIndexedListCache(cacheKey, undefined, {
       requireSearchReady: options.eagerSearchIndex,
+      sourceSignature,
     });
     if (cachedList) {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
@@ -243,55 +573,169 @@ export class CodexProvider implements ConversationProvider {
 
     const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
     const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
-    const pattern = join(basePath, "**", "*.jsonl").replace(/\\/g, "/");
-    const files = await glob(pattern);
 
     const results: IndexedCacheItem[] = [];
     const filesToRefresh: string[] = [];
 
-    for (const filePath of files) {
+    for (const fileState of fileStates) {
+      const filePath = fileState.path;
+      if (filePath === this.getNormalizedStateDbPath()) {
+        continue;
+      }
       const previousMeta = previousByFilePath.get(filePath);
       if (!previousMeta) {
         filesToRefresh.push(filePath);
         continue;
       }
 
-      try {
-        const fileStat = await stat(filePath);
-        if (
-          fileStat.mtimeMs === previousMeta.meta.updatedAt
-          && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
-        ) {
-          setCache(filePath, fileStat.mtimeMs, previousMeta.meta);
-          results.push(previousMeta);
-        } else {
-          filesToRefresh.push(filePath);
-        }
-      } catch {
+      if (
+        fileState.mtimeMs === previousMeta.meta.updatedAt
+        && fileState.size === previousMeta.meta.fileSize
+        && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
+      ) {
+        setCache(filePath, fileState.mtimeMs, previousMeta.meta);
+        results.push(previousMeta);
+      } else {
         filesToRefresh.push(filePath);
       }
     }
 
-    results.push(...await collectIndexedCacheItemsInBatches(filesToRefresh, 20, async (filePath) => {
-      const meta = await this.extractMeta(filePath);
-      if (!meta) return null;
-      if (!options.eagerSearchIndex) {
-        return { meta };
-      }
-      return {
-        meta,
-        ...(await this.extractSearchIndex(filePath)),
-      };
-    }));
+    results.push(...await collectIndexedCacheItemsInBatches(filesToRefresh, 20, async (filePath) => (
+      this.buildIndexedCacheItem(filePath, {
+        includeSearchIndex: options.eagerSearchIndex,
+        metaHint: previousByFilePath.get(filePath)?.meta,
+      })
+    )));
 
     const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
-    setIndexedListCache(cacheKey, results, { searchReady });
+    setIndexedListCache(cacheKey, results, { searchReady, sourceSignature });
 
     if (!searchReady && options.allowBackground) {
       this.scheduleBackgroundIndexRefresh();
     }
 
     return results.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  private async buildIndexedCacheItem(
+    filePath: string,
+    options: {
+      includeSearchIndex: boolean;
+      metaHint?: ConversationMeta;
+    }
+  ): Promise<IndexedCacheItem | null> {
+    const fileStat = await stat(filePath);
+    const metaHint = options.metaHint;
+
+    if (metaHint && metaHint.updatedAt === fileStat.mtimeMs && metaHint.fileSize === fileStat.size) {
+      setCache(filePath, fileStat.mtimeMs, metaHint);
+      if (!options.includeSearchIndex) {
+        return { meta: metaHint };
+      }
+      return {
+        meta: metaHint,
+        ...(await this.extractSearchIndex(filePath)),
+      };
+    }
+
+    return this.scanConversationFile(filePath, fileStat, options.includeSearchIndex);
+  }
+
+  private async scanConversationFile(
+    filePath: string,
+    fileStat: {
+      mtimeMs: number;
+      size: number;
+      birthtimeMs: number;
+    },
+    includeSearchIndex: boolean
+  ): Promise<IndexedCacheItem | null> {
+    let sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
+    let cwd = "";
+    let defaultTitle = "";
+    let userMessageCount = 0;
+    let messageCount = 0;
+    let firstTimestamp: number | undefined;
+    const searchBuilder = includeSearchIndex ? createConversationSearchIndexBuilder() : null;
+
+    await visitJsonl<CodexEntry>(filePath, (entry) => {
+      if (firstTimestamp === undefined) {
+        const timestamp = Date.parse(entry.timestamp);
+        if (Number.isFinite(timestamp)) {
+          firstTimestamp = timestamp;
+        }
+      }
+
+      if (entry.type === "session_meta") {
+        sessionId = entry.payload?.id || sessionId;
+        cwd = entry.payload?.cwd || cwd;
+        return;
+      }
+
+      if (
+        entry.type === "event_msg"
+        && entry.payload?.type === "user_message"
+        && typeof entry.payload.message === "string"
+      ) {
+        userMessageCount += 1;
+        if (!defaultTitle) {
+          defaultTitle = entry.payload.message.slice(0, 100);
+        }
+        return;
+      }
+
+      if (entry.type !== "response_item") {
+        return;
+      }
+
+      const role = entry.payload?.role;
+      if (role !== "user" && role !== "assistant") {
+        return;
+      }
+
+      messageCount += 1;
+      searchBuilder && appendSearchIndexEntry(searchBuilder, entry);
+    });
+
+    if (messageCount === 0 && userMessageCount === 0) {
+      return null;
+    }
+
+    const normalizedCwd = canonicalizeProjectPath(cwd);
+    const threadMetadata = this.getThreadMetadata(sessionId);
+    const normalizedThreadTitle = threadMetadata.title?.replace(/<[^>]+>/g, "").trim();
+    if (
+      normalizedThreadTitle
+      && threadMetadata.firstUserMessage?.trim() !== normalizedThreadTitle
+    ) {
+      this.scheduleTitleBackfill(sessionId, normalizedThreadTitle);
+    }
+
+    const meta: ConversationMeta = {
+      id: `codex:${sessionId}`,
+      provider: this.name,
+      title: normalizedThreadTitle || defaultTitle.replace(/<[^>]+>/g, "").trim() || "未知对话",
+      project: normalizedCwd,
+      projectKey: normalizedCwd,
+      projectId: normalizedCwd,
+      createdAt: firstTimestamp ?? fileStat.birthtimeMs,
+      updatedAt: fileStat.mtimeMs,
+      messageCount: Math.max(messageCount, userMessageCount),
+      fileSize: fileStat.size,
+      filePath,
+      modelProvider: threadMetadata.modelProvider,
+    };
+
+    setCache(filePath, fileStat.mtimeMs, meta);
+
+    if (!searchBuilder) {
+      return { meta };
+    }
+
+    return {
+      meta,
+      ...searchBuilder.build(),
+    };
   }
 
   private async extractSearchIndex(filePath: string): Promise<ConversationSearchIndex> {
@@ -319,7 +763,7 @@ export class CodexProvider implements ConversationProvider {
       (e) => e.type === "event_msg" && e.payload?.type === "user_message" && e.payload.message
     );
 
-    const title = userMessages[0]?.payload?.message?.slice(0, 100) || "未知对话";
+    const defaultTitle = userMessages[0]?.payload?.message?.slice(0, 100) || "未知对话";
 
     // 快速行计数
     const messageCount = await countLines(
@@ -339,21 +783,28 @@ export class CodexProvider implements ConversationProvider {
     const firstTs = new Date(headEntries[0].timestamp).getTime();
     const normalizedCwd = canonicalizeProjectPath(cwd);
 
-    // 从 SQLite 查询 model_provider
-    const modelProvider = this.getModelProvider(sessionId);
+    const threadMetadata = this.getThreadMetadata(sessionId);
+    const normalizedThreadTitle = threadMetadata.title?.replace(/<[^>]+>/g, "").trim();
+    if (
+      normalizedThreadTitle
+      && threadMetadata.firstUserMessage?.trim() !== normalizedThreadTitle
+    ) {
+      this.scheduleTitleBackfill(sessionId, normalizedThreadTitle);
+    }
 
     const meta: ConversationMeta = {
       id: `codex:${sessionId}`,
       provider: this.name,
-      title: title.replace(/<[^>]+>/g, "").trim() || "未知对话",
+      title: normalizedThreadTitle || defaultTitle.replace(/<[^>]+>/g, "").trim() || "未知对话",
       project: normalizedCwd,
       projectKey: normalizedCwd,
+      projectId: normalizedCwd,
       createdAt: firstTs,
       updatedAt: fileStat.mtimeMs,
       messageCount: Math.max(messageCount, userMessages.length),
       fileSize: fileStat.size,
       filePath,
-      modelProvider,
+      modelProvider: threadMetadata.modelProvider,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
@@ -372,7 +823,37 @@ export class CodexProvider implements ConversationProvider {
 
   private invalidateConversationCaches(filePath: string): void {
     invalidateCache(filePath);
+    invalidateMessageActionIndex(filePath);
+    invalidateCodexMessageIdentityCache(filePath);
     invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  private async resolveMessageLineNumbers(
+    filePath: string,
+    mtimeMs: number,
+    messageIds: string[]
+  ): Promise<number[]> {
+    const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
+    if (cached) return cached;
+
+    const entries = await parseJsonlWithMeta<CodexEntry>(filePath);
+    const records = buildMessageRecords(entries, { filePath, mtimeMs });
+    primeMessageActionIndex(filePath, mtimeMs, records);
+
+    const lineByMessageId = new Map<string, number>();
+    for (const record of records) {
+      if (record.message.messageId && record.lineIndex) {
+        lineByMessageId.set(record.message.messageId, record.lineIndex);
+      }
+    }
+
+    return messageIds.map((messageId) => {
+      const lineNumber = lineByMessageId.get(messageId);
+      if (!lineNumber) {
+        throw new Error(`消息不存在: ${messageId}`);
+      }
+      return lineNumber;
+    });
   }
 
   async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
@@ -392,7 +873,9 @@ export class CodexProvider implements ConversationProvider {
           isEnough: (tailEntries) => buildMessageRecords(tailEntries).length >= requiredMessages,
         })
       : await parseJsonlWithMeta<CodexEntry>(filePath);
-    const messages = buildMessageRecords(entries).map((record) => record.message);
+    const records = buildMessageRecords(entries, { filePath, mtimeMs: fileStat.mtimeMs });
+    primeMessageActionIndex(filePath, fileStat.mtimeMs, records);
+    const messages = records.map((record) => record.message);
 
     const meta = await this.extractMeta(filePath);
     if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
@@ -406,12 +889,14 @@ export class CodexProvider implements ConversationProvider {
     const sessionId = id.replace("codex:", "");
     const filePath = await this.findConversationFilePath(sessionId);
     await unlink(filePath);
+    deletePersistedCodexMessageIdentity(filePath);
     this.invalidateConversationCaches(filePath);
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {
     const sessionId = id.replace("codex:", "");
     const filePath = await this.findConversationFilePath(sessionId);
+    const fileStat = await stat(filePath);
     const newCwd = targetProjectKey.replace(/\//g, "\\");
 
     const content = await readFile(filePath, "utf-8");
@@ -430,40 +915,63 @@ export class CodexProvider implements ConversationProvider {
       return line;
     });
     await writeFile(filePath, newLines.join("\n"), "utf-8");
+    const nextFileStat = await stat(filePath);
+    carryCodexMessageIdentityCacheAcrossEdit(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs);
+    invalidateCache(filePath);
+    invalidateMessageActionIndex(filePath);
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  async updateTitle(id: string, title: string): Promise<void> {
+    if (!id.startsWith("codex:")) {
+      throw new Error("仅支持修改 Codex 对话标题");
+    }
+
+    const normalizedTitle = title.trim();
+    if (!normalizedTitle) {
+      throw new Error("标题不能为空");
+    }
+
+    const sessionId = id.replace("codex:", "");
+    const filePath = await this.findConversationFilePath(sessionId);
+    await this.writeThreadDisplayTitle(sessionId, normalizedTitle);
     this.invalidateConversationCaches(filePath);
   }
 
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
     const sessionId = id.replace("codex:", "");
     const filePath = await this.findConversationFilePath(sessionId);
-    const entries = await parseJsonlWithMeta<CodexEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    const record = records.find((item) => item.message.messageId === messageId);
-
-    if (!record || !record.lineIndex) {
-      throw new Error(`消息不存在: ${messageId}`);
-    }
-
+    const fileStat = await stat(filePath);
+    const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
     const normalizedContent = normalizeUpdatedMessageContent(content);
-    const nextEntry: CodexEntry = {
-      ...record.entry,
-      payload: {
-        ...record.entry.payload,
-        content: [{
-          type: record.message.role === "user" ? "input_text" : "output_text",
-          text: normalizedContent,
-        }],
-      },
-    };
+    await rewriteJsonlFileLine(
+      filePath,
+      lineNumber,
+      (line) => {
+        const entry = JSON.parse(line) as CodexEntry;
+        const role = entry.payload?.role;
+        if (entry.type !== "response_item" || (role !== "user" && role !== "assistant")) {
+          throw new Error(`消息不存在: ${messageId}`);
+        }
 
-    const originalContent = await readFile(filePath, "utf-8");
-    const rewritten = rewriteJsonlLine(
-      originalContent,
-      record.lineIndex,
-      JSON.stringify(nextEntry)
+        const nextEntry: CodexEntry = {
+          ...entry,
+          payload: {
+            ...entry.payload,
+            content: [{
+              type: role === "user" ? "input_text" : "output_text",
+              text: normalizedContent,
+            }],
+          },
+        };
+        return JSON.stringify(nextEntry);
+      }
     );
-    await writeFile(filePath, rewritten, "utf-8");
-    this.invalidateConversationCaches(filePath);
+    const nextFileStat = await stat(filePath);
+    carryCodexMessageIdentityCacheAcrossEdit(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs);
+    invalidateCache(filePath);
+    invalidateMessageActionIndex(filePath);
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
   }
 
   async deleteMessage(id: string, messageId: string): Promise<void> {
@@ -473,27 +981,18 @@ export class CodexProvider implements ConversationProvider {
   async deleteMessages(id: string, messageIds: string[]): Promise<void> {
     const sessionId = id.replace("codex:", "");
     const filePath = await this.findConversationFilePath(sessionId);
+    const fileStat = await stat(filePath);
     const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
     if (uniqueMessageIds.length === 0) {
       throw new Error("待删除消息不能为空");
     }
-
-    const entries = await parseJsonlWithMeta<CodexEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    const lineNumbers: number[] = [];
-
-    for (const messageId of uniqueMessageIds) {
-      const record = records.find((item) => item.message.messageId === messageId);
-      if (!record?.lineIndex) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      lineNumbers.push(record.lineIndex);
-    }
-
-    const originalContent = await readFile(filePath, "utf-8");
-    const rewritten = rewriteJsonlLines(originalContent, lineNumbers);
-    await writeFile(filePath, rewritten, "utf-8");
-    this.invalidateConversationCaches(filePath);
+    const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
+    await rewriteJsonlFileLines(filePath, lineNumbers);
+    const nextFileStat = await stat(filePath);
+    carryCodexMessageIdentityCacheAcrossDelete(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs, uniqueMessageIds);
+    invalidateCache(filePath);
+    invalidateMessageActionIndex(filePath);
+    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
   }
 
   async listProjects(): Promise<string[]> {
@@ -557,11 +1056,7 @@ export class CodexProvider implements ConversationProvider {
     );
 
     const dbPath = this.getStateDbPath();
-    if (this.db) {
-      this.db.close();
-      this.db = null;
-      this.dbPath = null;
-    }
+    this.closeDb();
 
     const db = new Database(dbPath);
     try {

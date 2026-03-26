@@ -10,13 +10,16 @@ import { isSameProjectPath } from "./lib/project";
 import {
   exportConversations,
   deleteConversation,
-  generateAiTitle,
+  deleteConversations,
+  generateAiTitles,
   moveConversation,
   changeModelProvider,
   changeModelProviders,
   getErrorMessage,
 } from "./lib/api";
 import { Sun, Moon, Monitor, Settings2, X, Sparkles, Loader2, CheckCircle2, XCircle } from "lucide-react";
+
+const TITLE_BATCH_SIZE = 5;
 
 interface GenProgress {
   total: number;
@@ -73,6 +76,9 @@ export default function App() {
     searchWarnings,
     reloadAllData,
     refreshConversation,
+    applyLocalTitleChange,
+    applyLocalMessageUpdate,
+    applyLocalMessageDelete,
   } = useConversations({ onNotify: pushToast });
 
   const { theme, resolvedTheme, setTheme } = useTheme();
@@ -162,12 +168,31 @@ export default function App() {
   const confirmDelete = useCallback(async () => {
     if (deleteConfirmIds.length === 0) return;
     try {
-      for (const id of deleteConfirmIds) {
-        await deleteConversation(id);
-      }
+      const result = deleteConfirmIds.length === 1
+        ? await (async () => {
+            await deleteConversation(deleteConfirmIds[0]!);
+            return { success: true, deleted: 1, failed: 0, failures: [] as Array<{ id: string; error: string }> };
+          })()
+        : await deleteConversations(deleteConfirmIds);
+
       deselectAll();
       setDeleteConfirmIds([]);
-      refresh();
+      await refresh();
+
+      if (result.failed > 0) {
+        const preview = result.failures
+          .slice(0, 3)
+          .map((item) => item.error)
+          .join("\n");
+        pushToast({
+          variant: result.deleted > 0 ? "warning" : "error",
+          title: result.deleted > 0
+            ? `批量删除部分完成：成功 ${result.deleted} 条，失败 ${result.failed} 条`
+            : "批量删除失败",
+          description: preview || undefined,
+          duration: 8000,
+        });
+      }
     } catch (error) {
       pushToast({
         variant: "error",
@@ -176,17 +201,6 @@ export default function App() {
       });
     }
   }, [deleteConfirmIds, refresh, deselectAll, pushToast]);
-
-  // 标题更新后同步刷新列表和详情
-  const handleTitleChanged = useCallback(
-    async (id: string) => {
-      await refreshConversation(id, {
-        keepLoadedWindow: true,
-        syncList: true,
-      });
-    },
-    [refreshConversation]
-  );
 
   // 拖拽移动对话到另一个文件夹
   const handleMoveConversation = useCallback(
@@ -308,52 +322,80 @@ export default function App() {
     [conversations, pushToast, reloadAllData, selectedIds]
   );
 
-  const handleConversationChanged = useCallback(
-    async (id: string) => {
-      await refreshConversation(id, {
-        keepLoadedWindow: true,
-        syncList: true,
-      });
-    },
-    [refreshConversation]
-  );
-
   // 批量 AI 生成标题
   const handleBatchGenerate = useCallback(async () => {
     if (selectedIds.size === 0 || batchGenerating) return;
-    const ids = [...selectedIds];
+    const selectedConversations = conversations.filter((item) => selectedIds.has(item.id));
+    const unsupportedConversations = selectedConversations.filter(
+      (item) => item.capabilities?.canGenerateTitle === false
+    );
+    const unsupportedCount = unsupportedConversations.length;
+    const ids = selectedConversations
+      .filter((item) => item.capabilities?.canGenerateTitle !== false)
+      .map((item) => item.id);
+    const disabledReason = unsupportedConversations[0]?.capabilities?.generateTitleDisabledReason;
+
+    if (ids.length === 0) {
+      pushToast({
+        variant: "warning",
+        title: "当前选择不支持批量标题生成",
+        description: disabledReason ?? "当前选中的对话不能修改标题",
+      });
+      return;
+    }
+
+    if (unsupportedCount > 0) {
+      pushToast({
+        variant: "warning",
+        title: "已跳过不支持的对话",
+        description: disabledReason
+          ? `${unsupportedCount} 条对话不支持标题生成：${disabledReason}`
+          : `${unsupportedCount} 条对话不支持标题生成，本次仅处理其他 provider`,
+        duration: 6000,
+      });
+    }
+
     setBatchGenerating(true);
     abortRef.current = false;
     setGenProgress({ total: ids.length, current: 0, currentTitle: "", results: [] });
 
     const results: GenProgress["results"] = [];
-    for (let i = 0; i < ids.length; i++) {
+    for (let i = 0; i < ids.length; i += TITLE_BATCH_SIZE) {
       if (abortRef.current) break;
 
-      const id = ids[i];
-      const conv = conversations.find((c) => c.id === id);
+      const chunk = ids.slice(i, i + TITLE_BATCH_SIZE);
+      const label = chunk
+        .map((id) => conversations.find((c) => c.id === id)?.title || id)
+        .join(" / ");
       setGenProgress((prev) => ({
         ...prev!,
-        current: i + 1,
-        currentTitle: conv?.title || id,
+        current: Math.min(i + 1, ids.length),
+        currentTitle: label,
       }));
 
       try {
-        const res = await generateAiTitle(id);
-        if (res.success) {
-          results.push({ id, title: res.title });
-        } else {
-          results.push({ id, error: res.error || "未知错误" });
-        }
+        const res = await generateAiTitles(chunk);
+        results.push(...res.results.map((item) => ({
+          id: item.id,
+          title: item.title,
+          error: item.error,
+        })));
       } catch (error) {
-        results.push({ id, error: getErrorMessage(error, "请求失败") });
+        const message = getErrorMessage(error, "请求失败");
+        results.push(...chunk.map((id) => ({ id, error: message })));
       }
-      setGenProgress((prev) => ({ ...prev!, results: [...results] }));
+
+      setGenProgress((prev) => ({
+        ...prev!,
+        current: Math.min(i + chunk.length, ids.length),
+        currentTitle: label,
+        results: [...results],
+      }));
     }
 
     await reloadAllData();
     setBatchGenerating(false);
-  }, [selectedIds, batchGenerating, conversations, reloadAllData]);
+  }, [selectedIds, batchGenerating, conversations, reloadAllData, pushToast]);
 
   const handleAbortGenerate = useCallback(() => {
     abortRef.current = true;
@@ -448,8 +490,9 @@ export default function App() {
           onLoadEarlier={loadEarlierMessages}
           onExport={handleExport}
           onDelete={handleDelete}
-          onTitleChanged={handleTitleChanged}
-          onConversationChanged={handleConversationChanged}
+          onTitleChanged={applyLocalTitleChange}
+          onMessageUpdated={applyLocalMessageUpdate}
+          onMessagesDeleted={applyLocalMessageDelete}
           codexModelProviders={codexModelProviders}
           onChangeModelProvider={handleChangeModelProvider}
           onNotify={pushToast}

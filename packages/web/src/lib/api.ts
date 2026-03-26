@@ -105,13 +105,24 @@ export interface ProviderPathMigrationResult {
 }
 
 export type TitleGenerationCli = "iflow" | "codex" | "claude";
+export type TitleSyncMode = "native" | "overlay";
+
+export interface ConversationCapabilities {
+  canUpdateTitle: boolean;
+  canGenerateTitle: boolean;
+  updateTitleDisabledReason?: string;
+  generateTitleDisabledReason?: string;
+}
 
 export interface ConversationMeta {
   id: string;
   provider: string;
   title: string;
+  titleSyncMode?: TitleSyncMode;
+  capabilities?: ConversationCapabilities;
   project: string;
   projectKey: string;
+  projectId?: string;
   createdAt: number;
   updatedAt: number;
   messageCount: number;
@@ -204,6 +215,24 @@ export async function deleteConversation(id: string): Promise<void> {
   await requestJson<{ success: boolean }>(`${BASE}/conversations/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+export interface BatchOperationFailure {
+  id: string;
+  error: string;
+}
+
+export async function deleteConversations(
+  ids: string[]
+): Promise<{ success: boolean; deleted: number; failed: number; failures: BatchOperationFailure[] }> {
+  return requestJson<{ success: boolean; deleted: number; failed: number; failures: BatchOperationFailure[] }>(
+    `${BASE}/conversations/batch-delete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }
+  );
 }
 
 export async function updateConversationMessage(
@@ -317,6 +346,33 @@ export async function generateAiTitle(
     `${BASE}/conversations/${encodeURIComponent(id)}/generate-title`,
     { method: "POST" }
   );
+}
+
+export interface BatchTitleGenerationResult {
+  id: string;
+  title?: string;
+  usedCli?: string;
+  error?: string;
+}
+
+export async function generateAiTitles(
+  ids: string[]
+): Promise<{
+  success: boolean;
+  generated: number;
+  failed: number;
+  results: BatchTitleGenerationResult[];
+}> {
+  return requestJson<{
+    success: boolean;
+    generated: number;
+    failed: number;
+    results: BatchTitleGenerationResult[];
+  }>(`${BASE}/conversations/generate-title/batch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
 }
 
 export interface AvailableCliInfo {
