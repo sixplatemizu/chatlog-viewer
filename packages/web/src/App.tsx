@@ -50,6 +50,7 @@ export default function App() {
     providers,
     conversations,
     total,
+    providerCounts,
     loading,
     activeProviders,
     toggleProvider,
@@ -72,9 +73,12 @@ export default function App() {
     codexModelProviders,
     activeModelProviders,
     toggleModelProvider,
+    codexModelProviderCounts,
+    ensureModelProviderVisible,
     partialSearch,
     searchWarnings,
     reloadAllData,
+    refreshConversation,
     applyLocalTitleChange,
     applyLocalMessageUpdate,
     applyLocalMessageDelete,
@@ -164,6 +168,14 @@ export default function App() {
     setDeleteConfirmIds([...selectedIds]);
   }, [selectedIds]);
 
+  const handleBatchDeleteEmpty = useCallback(() => {
+    const targetIds = conversations
+      .filter((item) => selectedIds.has(item.id) && item.cleanupCandidate)
+      .map((item) => item.id);
+    if (targetIds.length === 0) return;
+    setDeleteConfirmIds(targetIds);
+  }, [conversations, selectedIds]);
+
   const confirmDelete = useCallback(async () => {
     if (deleteConfirmIds.length === 0) return;
     try {
@@ -246,6 +258,7 @@ export default function App() {
       try {
         const res = await changeModelProvider(id, newProvider);
         if (res.success) {
+          ensureModelProviderVisible(newProvider);
           await reloadAllData();
         } else {
           pushToast({
@@ -262,7 +275,7 @@ export default function App() {
         });
       }
     },
-    [pushToast, reloadAllData]
+    [ensureModelProviderVisible, pushToast, reloadAllData]
   );
 
   const handleBatchChangeModelProvider = useCallback(
@@ -297,6 +310,7 @@ export default function App() {
           targetProvider
         );
         if (res.success) {
+          ensureModelProviderVisible(targetProvider);
           await reloadAllData();
           pushToast({
             variant: "info",
@@ -318,7 +332,7 @@ export default function App() {
         });
       }
     },
-    [conversations, pushToast, reloadAllData, selectedIds]
+    [conversations, ensureModelProviderVisible, pushToast, reloadAllData, selectedIds]
   );
 
   // 批量 AI 生成标题
@@ -463,6 +477,7 @@ export default function App() {
           onSortChange={setSort}
           loading={loading}
           total={total}
+          providerCounts={providerCounts}
           selectedIds={selectedIds}
           onToggleSelect={toggleSelect}
           onSelectAll={selectAll}
@@ -470,11 +485,13 @@ export default function App() {
           onToggleSelectGroup={toggleSelectGroup}
           onBatchExport={handleBatchExport}
           onBatchDelete={handleBatchDelete}
+          onBatchDeleteEmpty={handleBatchDeleteEmpty}
           onBatchGenerate={handleBatchGenerate}
           onBatchChangeModelProvider={handleBatchChangeModelProvider}
           batchGenerating={batchGenerating}
           onMoveConversation={handleMoveConversation}
           codexModelProviders={codexModelProviders}
+          codexModelProviderCounts={codexModelProviderCounts}
           activeModelProviders={activeModelProviders}
           onToggleModelProvider={toggleModelProvider}
           partialSearch={partialSearch}
@@ -490,6 +507,7 @@ export default function App() {
           onExport={handleExport}
           onDelete={handleDelete}
           onTitleChanged={applyLocalTitleChange}
+          onRefreshConversation={(id) => refreshConversation(id, { keepLoadedWindow: true, syncList: true, silent: true })}
           onMessageUpdated={applyLocalMessageUpdate}
           onMessagesDeleted={applyLocalMessageDelete}
           codexModelProviders={codexModelProviders}
@@ -520,8 +538,8 @@ export default function App() {
             <h3 className="text-base font-semibold mb-2">确认删除</h3>
             <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
               {deleteConfirmIds.length === 1
-                ? "删除后无法恢复，确定要删除这个对话吗？"
-                : `确定要删除选中的 ${deleteConfirmIds.length} 条对话吗？此操作无法恢复。`}
+                ? "删除后无法恢复。若该记录底层已不存在，本次会自动清理残留项。"
+                : `确定要删除或清理选中的 ${deleteConfirmIds.length} 条对话记录吗？此操作无法恢复。`}
             </p>
             <div className="flex justify-end gap-2">
               <button

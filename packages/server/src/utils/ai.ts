@@ -7,7 +7,7 @@ import { getProviderConfigPath } from "./provider-paths.js";
 
 const execAsync = promisify(exec);
 
-type CliToolName = "codex" | "iflow" | "claude";
+type CliToolName = "codex" | "claude";
 type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh";
 
 interface CliTool {
@@ -15,6 +15,7 @@ interface CliTool {
   command: string;
   freshArgs: string[];
   resumeArgs?: string[];
+  healthcheckArgs: string[];
   timeoutMs?: number;
 }
 
@@ -24,13 +25,7 @@ const CLI_TOOLS: CliTool[] = [
     command: "codex",
     freshArgs: ["exec", "--skip-git-repo-check", "--color", "never", "-"],
     resumeArgs: ["exec", "resume", "--last", "--skip-git-repo-check", "-"],
-    timeoutMs: 30_000,
-  },
-  {
-    name: "iflow",
-    command: "iflow",
-    freshArgs: ["-p", ""],
-    resumeArgs: ["-c", "-p", ""],
+    healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
   },
   {
@@ -38,6 +33,7 @@ const CLI_TOOLS: CliTool[] = [
     command: "claude",
     freshArgs: ["-p", ""],
     resumeArgs: ["-c", "-p", ""],
+    healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
   },
 ];
@@ -68,6 +64,40 @@ async function detectAvailableCli(): Promise<CliTool[]> {
     }
   }
   return available;
+}
+
+async function checkCliHealth(tool: CliTool): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const child = spawn(tool.command, tool.healthcheckArgs, {
+      cwd: process.cwd(),
+      env: { ...process.env },
+      shell: process.platform === "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(value);
+    };
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish(false);
+    }, 5_000);
+
+    child.once("error", () => {
+      finish(false);
+    });
+    child.stdout.resume();
+    child.stderr.resume();
+    child.once("close", (code) => {
+      finish(code === 0);
+    });
+  });
 }
 
 function orderToolsByPriority(tools: CliTool[], priority?: readonly string[]): CliTool[] {
@@ -204,10 +234,12 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
 
 async function runCliTool(
   tool: CliTool,
-  prompt: string
+  prompt: string,
+  options?: { reuseSession?: boolean }
 ): Promise<{ stdout: string; mode: CliRunMode }> {
   const workDir = await ensureCliSessionDir(tool.name);
-  const hasSession = await hasPersistedSession(tool.name);
+  const allowReuseSession = options?.reuseSession ?? false;
+  const hasSession = allowReuseSession ? await hasPersistedSession(tool.name) : false;
 
   if (hasSession && tool.resumeArgs) {
     try {
@@ -234,7 +266,7 @@ async function runCliTool(
 
 export async function generateTitle(
   messages: Message[],
-  options?: { priority?: string[] }
+  options?: { priority?: string[]; reuseSession?: boolean }
 ): Promise<{
   title: string;
   usedCli: string;
@@ -244,7 +276,7 @@ export async function generateTitle(
     options?.priority
   );
   if (tools.length === 0) {
-    throw new Error("没有可用的 AI CLI 工具（需要 iflow、claude 或 codex）");
+    throw new Error("没有可用的 AI CLI 工具（需要 claude 或 codex）");
   }
 
   const context = buildContext(messages);
@@ -253,7 +285,9 @@ export async function generateTitle(
 
   for (const tool of tools) {
     try {
-      const result = await runCliTool(tool, fullPrompt);
+      const result = await runCliTool(tool, fullPrompt, {
+        reuseSession: options?.reuseSession,
+      });
       console.log(`[AI] 调用 ${tool.name} (${result.mode})`);
       const title = extractCleanOutput(result.stdout);
       console.log(`[AI] ${tool.name} 输出: "${title}"`);
@@ -284,13 +318,24 @@ export async function resetSession(toolName?: CliToolName): Promise<void> {
   await rm(getTitleSessionBaseDir(), { recursive: true, force: true });
 }
 
-export async function getAvailableClis(): Promise<{ name: string; available: boolean; hasSession: boolean }[]> {
+export async function getAvailableClis(): Promise<Array<{
+  name: string;
+  discoverable: boolean;
+  healthy: boolean;
+  hasSession: boolean;
+}>> {
   const availableTools = await detectAvailableCli();
-  const availableNames = new Set(availableTools.map((tool) => tool.name));
+  const availableByName = new Map(availableTools.map((tool) => [tool.name, tool]));
 
-  return await Promise.all(CLI_TOOLS.map(async (tool) => ({
-    name: tool.name,
-    available: availableNames.has(tool.name),
-    hasSession: await hasPersistedSession(tool.name),
-  })));
+  return await Promise.all(CLI_TOOLS.map(async (tool) => {
+    const availableTool = availableByName.get(tool.name);
+    const discoverable = !!availableTool;
+
+    return {
+      name: tool.name,
+      discoverable,
+      healthy: availableTool ? await checkCliHealth(availableTool) : false,
+      hasSession: await hasPersistedSession(tool.name),
+    };
+  }));
 }

@@ -146,7 +146,47 @@ describe("ConversationList", () => {
     expect(screen.getAllByText("~/desktop/code_area/r-bioinfo")).toHaveLength(1);
   });
 
-  it("同一路径跨 provider 分组时会显示 provider 标识，避免误判为同一目录", () => {
+  it("不同内容状态会显示不同标记", () => {
+    const conversations = [
+      createConversation({
+        id: "claude-code:cleanup-1",
+        provider: "claude-code",
+        title: "Claude 残留",
+        cleanupCandidate: true,
+      }),
+      createConversation({
+        id: "codex:meta-1",
+        provider: "codex",
+        title: "Codex metadata",
+        contentStatus: "metadata-only",
+      }),
+      createConversation({
+        id: "claude-code:history-1",
+        provider: "claude-code",
+        title: "Claude history",
+        contentStatus: "history-only",
+      }),
+    ];
+
+    render(
+      <ConversationList
+        conversations={conversations}
+        selectedId={null}
+        onSelect={() => {}}
+        loading={false}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onToggleSelectGroup={() => {}}
+        onDrop={() => {}}
+      />
+    );
+
+    expect(screen.getByText("残留")).toBeInTheDocument();
+    expect(screen.getByText("仅 metadata")).toBeInTheDocument();
+    expect(screen.getByText("仅 history")).toBeInTheDocument();
+  });
+
+  it("同一路径跨 provider 分组时仍会拆分为两个分组", () => {
     const conversations = [
       createConversation({
         id: "codex:1",
@@ -177,7 +217,8 @@ describe("ConversationList", () => {
       />
     );
 
-    expect(screen.getByText("Codex")).toBeInTheDocument();
-    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.getAllByText("~/desktop/code_area/r-bioinfo")).toHaveLength(2);
+    expect(screen.getByText("Codex 会话")).toBeInTheDocument();
+    expect(screen.getByText("Claude 会话")).toBeInTheDocument();
   });
 });

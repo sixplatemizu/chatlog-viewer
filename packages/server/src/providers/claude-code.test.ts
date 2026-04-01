@@ -214,9 +214,47 @@ test("Claude Code 在 eagerSearchIndex 模式下会为 transcript 一次构建�
   }
 });
 
-test("Claude Code 消息在连续编辑和删除其它消息后保持稳定 messageId", async () => {
+test("Claude Code move 会拒绝越界的目标目录", async () => {
   const fixture = await createProviderFixture();
   const sessionId = "55555555-5555-4555-8555-555555555555";
+  const projectKey = "C--Users-tester-Desktop-code_area-chatlog-viewer";
+  const projectDir = join(fixture.storagePath, projectKey);
+  const transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "user",
+          uuid: "claude-move-1",
+          sessionId,
+          cwd: "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+          timestamp: "2026-03-03T00:00:00.000Z",
+          message: {
+            role: "user",
+            content: "移动测试",
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf-8"
+    );
+
+    await assert.rejects(
+      fixture.provider.move(`claude-code:${sessionId}`, "../outside-project"),
+      /目标文件夹不合法/
+    );
+    const content = await readFile(transcriptPath, "utf-8");
+    assert.match(content, /移动测试/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("Claude Code 消息在连续编辑和删除其它消息后保持稳定 messageId", async () => {
+  const fixture = await createProviderFixture();
+  const sessionId = "66666666-6666-4666-8666-666666666666";
   const projectKey = "C--Users-tester-Desktop-code_area-chatlog-viewer";
   const projectDir = join(fixture.storagePath, projectKey);
   const transcriptPath = join(projectDir, `${sessionId}.jsonl`);

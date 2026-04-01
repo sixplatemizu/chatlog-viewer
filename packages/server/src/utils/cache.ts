@@ -1118,7 +1118,6 @@ export function queryConversationIndex(options: {
   cacheKeys: string[];
   search?: string;
   sort?: "updatedAt" | "createdAt" | "provider";
-  modelProviders?: string[];
 }): ConversationMeta[] {
   if (options.cacheKeys.length === 0) return [];
 
@@ -1184,16 +1183,6 @@ export function queryConversationIndex(options: {
           )
         `);
         params.push(lowerPattern, lowerPattern, lowerPattern, lowerPattern);
-      }
-    }
-
-    if (options.modelProviders) {
-      if (options.modelProviders.length === 0) {
-        whereClauses.push("(conversation_index.provider != 'codex' OR conversation_index.model_provider IS NULL OR conversation_index.model_provider = '')");
-      } else {
-        const mpPlaceholders = options.modelProviders.map(() => "?").join(", ");
-        whereClauses.push(`(conversation_index.provider != 'codex' OR conversation_index.model_provider IS NULL OR conversation_index.model_provider = '' OR conversation_index.model_provider IN (${mpPlaceholders}))`);
-        params.push(...options.modelProviders);
       }
     }
 

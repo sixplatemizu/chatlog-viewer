@@ -46,7 +46,6 @@ const SOURCE_STYLES = {
 } as const;
 
 const TITLE_GENERATION_CLI_LABELS: Record<TitleGenerationCli, string> = {
-  iflow: "iFlow",
   codex: "Codex",
   claude: "Claude Code",
 };
@@ -293,7 +292,8 @@ function TitleGenerationPriorityCard({
       <div className="space-y-2">
         {priority.map((cli, index) => {
           const cliState = cliStates[cli];
-          const available = cliState?.available ?? false;
+          const discoverable = cliState?.discoverable ?? false;
+          const healthy = cliState?.healthy ?? false;
           const hasSession = cliState?.hasSession ?? false;
 
           return (
@@ -311,12 +311,23 @@ function TitleGenerationPriorityCard({
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
                   <span
                     className={`rounded-full border px-2 py-0.5 text-[10px] ${
-                      available
-                        ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+                      discoverable
+                        ? "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-700 dark:bg-sky-900/30 dark:text-sky-300"
                         : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
                     }`}
                   >
-                    {available ? "CLI 可用" : "CLI 未检测到"}
+                    {discoverable ? "命令已发现" : "命令未发现"}
+                  </span>
+                  <span
+                    className={`rounded-full border px-2 py-0.5 text-[10px] ${
+                      healthy
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+                        : (discoverable
+                          ? "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-300"
+                          : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300")
+                    }`}
+                  >
+                    {healthy ? "健康可用" : (discoverable ? "健康检查失败" : "未执行健康检查")}
                   </span>
                   <span
                     className={`rounded-full border px-2 py-0.5 text-[10px] ${

@@ -44,6 +44,8 @@ export interface ConversationProvider {
   getStoragePath(): string;
 }
 
+export type ConversationContentStatus = "full" | "history-only" | "metadata-only";
+
 export interface ConversationMeta {
   id: string;
   provider: string;
@@ -59,6 +61,10 @@ export interface ConversationMeta {
   fileSize: number;         // 文件体积（字节）
   filePath: string;
   modelProvider?: string;   // Codex 的 model_provider（如 right、custom 等）
+  transcriptMissing?: boolean;
+  contentStatus?: ConversationContentStatus; // 当前能提供的内容层级：完整 transcript、history 回退或仅 metadata
+  titleGenerationHint?: string; // transcript 缺失时用于 AI 标题生成的元数据提示
+  cleanupCandidate?: boolean; // 标记为可直接清理的残留记录，不等于 metadata-only
 }
 
 export interface Conversation extends ConversationMeta {

@@ -24,6 +24,7 @@ interface SidebarProps {
   onSortChange: (value: string) => void;
   loading: boolean;
   total: number;
+  providerCounts: Record<string, number>;
   selectedIds: Set<string>;
   onToggleSelect: (id: string) => void;
   onSelectAll: () => void;
@@ -31,11 +32,13 @@ interface SidebarProps {
   onToggleSelectGroup: (ids: string[]) => void;
   onBatchExport: () => void;
   onBatchDelete: () => void;
+  onBatchDeleteEmpty: () => void;
   onBatchGenerate: () => void;
   onBatchChangeModelProvider: (modelProvider: string) => void;
   batchGenerating: boolean;
   onMoveConversation: (convId: string, targetProjectKey: string, srcProvider: string, targetProvider: string) => void;
   codexModelProviders: CodexModelProvider[];
+  codexModelProviderCounts: Record<string, number>;
   activeModelProviders: Set<string>;
   onToggleModelProvider: (name: string) => void;
   partialSearch: boolean;
@@ -55,6 +58,7 @@ export function Sidebar({
   onSortChange,
   loading,
   total,
+  providerCounts,
   selectedIds,
   onToggleSelect,
   onSelectAll,
@@ -62,11 +66,13 @@ export function Sidebar({
   onToggleSelectGroup,
   onBatchExport,
   onBatchDelete,
+  onBatchDeleteEmpty,
   onBatchGenerate,
   onBatchChangeModelProvider,
   batchGenerating,
   onMoveConversation,
   codexModelProviders,
+  codexModelProviderCounts,
   activeModelProviders,
   onToggleModelProvider,
   partialSearch,
@@ -75,19 +81,10 @@ export function Sidebar({
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
   const [batchModelProviderOverride, setBatchModelProviderOverride] = useState("");
 
-  const providerCounts = useMemo(() => {
+  const activeProviderCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const conv of conversations) {
       counts.set(conv.provider, (counts.get(conv.provider) ?? 0) + 1);
-    }
-    return counts;
-  }, [conversations]);
-
-  const codexProviderCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const conv of conversations) {
-      if (conv.provider !== "codex" || !conv.modelProvider) continue;
-      counts.set(conv.modelProvider, (counts.get(conv.modelProvider) ?? 0) + 1);
     }
     return counts;
   }, [conversations]);
@@ -96,13 +93,13 @@ export function Sidebar({
     const parts = providers
       .filter((p) => p.available && activeProviders.has(p.name))
       .map((p) => {
-        const count = providerCounts.get(p.name) ?? 0;
+        const count = activeProviderCounts.get(p.name) ?? 0;
         return count > 0 ? `${p.displayName}: ${count}` : "";
       })
       .filter(Boolean);
 
     return parts.length > 0 ? `共 ${total} 条对话 | ${parts.join(" | ")}` : `共 ${total} 条对话`;
-  }, [activeProviders, providerCounts, providers, total]);
+  }, [activeProviderCounts, activeProviders, providers, total]);
 
   const selectedConversations = useMemo(
     () => conversations.filter((item) => selectedIds.has(item.id)),
@@ -110,6 +107,10 @@ export function Sidebar({
   );
   const unsupportedBatchTitleConversations = useMemo(
     () => selectedConversations.filter((item) => item.capabilities?.canGenerateTitle === false),
+    [selectedConversations]
+  );
+  const cleanupOnlySelectedConversations = useMemo(
+    () => selectedConversations.filter((item) => item.cleanupCandidate),
     [selectedConversations]
   );
   const batchTitleGenerationSupported = selectedConversations.length > 0 && unsupportedBatchTitleConversations.length === 0;
@@ -215,7 +216,8 @@ export function Sidebar({
                 }
               `}
             >
-              {p.displayName}
+              <span>{p.displayName}</span>
+              <span className="ml-1 opacity-70">{providerCounts[p.name] ?? 0}</span>
             </button>
           ))}
         </div>
@@ -238,7 +240,7 @@ export function Sidebar({
                   `}
                 >
                   {mp.name}
-                  <span className="ml-0.5 opacity-60">{codexProviderCounts.get(mp.name) ?? 0}</span>
+                  <span className="ml-0.5 opacity-60">{codexModelProviderCounts[mp.name] ?? mp.count ?? 0}</span>
                 </button>
               ))}
             </div>
@@ -292,6 +294,15 @@ export function Sidebar({
                 <Download className="w-3 h-3" />
                 导出
               </button>
+              {cleanupOnlySelectedConversations.length > 0 && (
+                <button
+                  onClick={onBatchDeleteEmpty}
+                  className="flex items-center gap-1 px-2.5 py-1 text-xs bg-amber-500 text-white rounded hover:bg-amber-600 transition-colors"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  清理残留
+                </button>
+              )}
               <button
                 onClick={onBatchDelete}
                 className="flex items-center gap-1 px-2.5 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
@@ -307,6 +318,12 @@ export function Sidebar({
               </button>
             </div>
           </div>
+
+          {cleanupOnlySelectedConversations.length > 0 && (
+            <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              已选 {cleanupOnlySelectedConversations.length} 条残留记录，可直接一键清理。
+            </div>
+          )}
 
           {unsupportedBatchTitleConversations.length > 0 && (
             <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">

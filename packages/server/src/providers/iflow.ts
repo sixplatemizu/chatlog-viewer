@@ -110,6 +110,37 @@ function getListCacheKey(providerName: string, storagePath: string): string {
   return `${providerName}::${storagePath}::indexed`;
 }
 
+function resolveProjectDirectory(basePath: string, targetProjectKey: string): {
+  normalizedProjectKey: string;
+  targetProjectDir: string;
+} {
+  const normalizedProjectKey = normalizePath(targetProjectKey).trim();
+  if (!normalizedProjectKey) {
+    throw new Error("目标文件夹不能为空");
+  }
+  if (
+    normalizedProjectKey === "."
+    || normalizedProjectKey === ".."
+    || normalizedProjectKey.includes("/")
+  ) {
+    throw new Error("目标文件夹不合法");
+  }
+
+  const normalizedBasePath = normalizePath(basePath);
+  const targetProjectDir = normalizePath(join(basePath, normalizedProjectKey));
+  if (
+    targetProjectDir !== normalizedBasePath
+    && !targetProjectDir.startsWith(`${normalizedBasePath}/`)
+  ) {
+    throw new Error("目标文件夹不合法");
+  }
+
+  return {
+    normalizedProjectKey,
+    targetProjectDir,
+  };
+}
+
 function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
   const limit = options?.limit;
   const before = options?.before ?? 0;
@@ -391,7 +422,12 @@ export class IFlowProvider implements ConversationProvider {
       };
     }
 
-    return this.scanConversationFile(filePath, fileStat, options.includeSearchIndex);
+    if (!options.includeSearchIndex) {
+      const meta = await this.extractMeta(filePath);
+      return meta ? { meta } : null;
+    }
+
+    return this.scanConversationFile(filePath, fileStat, true);
   }
 
   private async scanConversationFile(
@@ -618,6 +654,7 @@ export class IFlowProvider implements ConversationProvider {
       messageCount,
       fileSize: fileStat.size,
       filePath,
+      contentStatus: "full",
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
@@ -627,11 +664,14 @@ export class IFlowProvider implements ConversationProvider {
   private async findConversationFilePath(sessionId: string): Promise<string> {
     const basePath = this.getStoragePath();
     const pattern = join(basePath, "*", `${sessionId}.jsonl`).replace(/\\/g, "/");
-    const files = await glob(pattern);
+    const files = [...new Set((await glob(pattern)).map((item) => item.replace(/\\/g, "/")))];
     if (files.length === 0) {
       throw new Error(`对话不存在: iflow:${sessionId}`);
     }
-    return files[0];
+    if (files.length > 1) {
+      throw new Error(`定位到多个同名对话文件: iflow:${sessionId}`);
+    }
+    return files[0]!;
   }
 
   private invalidateConversationCaches(filePath: string): void {
@@ -713,9 +753,9 @@ export class IFlowProvider implements ConversationProvider {
     const basePath = this.getStoragePath();
     const srcFile = await this.findConversationFilePath(sessionId);
     const fileName = srcFile.split(/[/\\]/).pop()!;
-    const targetDir = join(basePath, targetProjectKey);
-    await mkdir(targetDir, { recursive: true });
-    const destFile = join(targetDir, fileName);
+    const { targetProjectDir } = resolveProjectDirectory(basePath, targetProjectKey);
+    await mkdir(targetProjectDir, { recursive: true });
+    const destFile = join(targetProjectDir, fileName);
 
     if (srcFile.replace(/\\/g, "/") === destFile.replace(/\\/g, "/")) return;
     await rename(srcFile, destFile);

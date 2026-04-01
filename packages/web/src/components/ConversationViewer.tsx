@@ -35,6 +35,7 @@ interface Props {
   onExport: (id: string) => void;
   onDelete: (id: string) => void;
   onTitleChanged: (id: string, title: string) => void | Promise<void>;
+  onRefreshConversation?: (id: string) => void | Promise<void>;
   onMessageUpdated: (id: string, messageId: string, content: string) => void | Promise<void>;
   onMessagesDeleted: (id: string, messageIds: string[]) => void | Promise<void>;
   onNotify: (toast: ToastPayload) => void;
@@ -97,6 +98,7 @@ export function ConversationViewer({
   onExport,
   onDelete,
   onTitleChanged,
+  onRefreshConversation,
   onMessageUpdated,
   onMessagesDeleted,
   onNotify,
@@ -131,6 +133,9 @@ export function ConversationViewer({
   const titleUpdateDisabledReason = conversation?.capabilities?.updateTitleDisabledReason;
   const canUpdateTitle = conversation?.capabilities?.canUpdateTitle ?? true;
   const canGenerateTitle = conversation?.capabilities?.canGenerateTitle ?? canUpdateTitle;
+  const isMetadataOnlyConversation = !!conversation && conversation.contentStatus === "metadata-only";
+  const isHistoryOnlyConversation = !!conversation && conversation.contentStatus === "history-only";
+  const isCleanupOnlyConversation = !!conversation && !!conversation.cleanupCandidate;
 
   const messageKeys = useMemo(
     () => loadedMessages.map((msg, index) => msg.messageId ?? `${index}-${msg.timestamp ?? "na"}-${msg.role}`),
@@ -225,11 +230,14 @@ export function ConversationViewer({
       const result = await generateAiTitle(conversation.id);
       if (result.success) {
         setGenStatus(
-          titleSyncInfo
-            ? `已通过 ${result.usedCli} 生成，${titleSyncInfo.statusSuffix}`
-            : `已通过 ${result.usedCli} 生成`
+          isMetadataOnlyConversation
+            ? `已通过 ${result.usedCli} 基于 metadata 生成标题`
+            : titleSyncInfo
+              ? `已通过 ${result.usedCli} 生成，${titleSyncInfo.statusSuffix}`
+              : `已通过 ${result.usedCli} 生成`
         );
         await onTitleChanged(conversation.id, result.title);
+        await onRefreshConversation?.(conversation.id);
         setTimeout(() => setGenStatus(""), 3000);
       } else {
         setGenStatus(`失败: ${result.error}`);
@@ -456,6 +464,26 @@ export function ConversationViewer({
                   仅对当前已加载且支持删除的消息生效
                 </span>
               )}
+              {isCleanupOnlyConversation && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  当前对话已退化为残留记录，可直接清理
+                </span>
+              )}
+              {isMetadataOnlyConversation && (
+                <span className="text-sky-600 dark:text-sky-400">
+                  当前仅保留 metadata，可改标题、删会话、切换 provider，但无法查看真实消息正文
+                </span>
+              )}
+              {isHistoryOnlyConversation && (
+                <span className="text-indigo-600 dark:text-indigo-400">
+                  当前仅保留 history 回退内容，不是完整 transcript
+                </span>
+              )}
+              {isMetadataOnlyConversation && conversation.titleGenerationHint && (
+                <span className="text-sky-600 dark:text-sky-400">
+                  AI 标题将基于 metadata 生成，不是基于完整消息正文
+                </span>
+              )}
               {!canUpdateTitle && titleUpdateDisabledReason && (
                 <span className="text-amber-600 dark:text-amber-400">
                   {titleUpdateDisabledReason}
@@ -532,7 +560,7 @@ export function ConversationViewer({
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              删除
+              {isCleanupOnlyConversation ? "清理残留记录" : "删除"}
             </button>
           </div>
         </div>

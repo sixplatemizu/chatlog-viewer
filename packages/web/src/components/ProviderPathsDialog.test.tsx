@@ -33,7 +33,7 @@ function createSettings(overrides?: Partial<ProviderPathSettings>): ProviderPath
   return {
     configPath: "/tmp/chatlog-viewer/config.json",
     ai: {
-      titleGenerationCliPriority: ["iflow", "codex", "claude"],
+      titleGenerationCliPriority: ["codex", "claude"],
     },
     providers: [
       {
@@ -57,9 +57,8 @@ describe("ProviderPathsDialog", () => {
     mockResetAllAiCliSessions.mockReset();
     mockUpdateProviderPathSettings.mockReset();
     mockFetchAvailableClis.mockResolvedValue([
-      { name: "iflow", available: true, hasSession: true },
-      { name: "codex", available: true, hasSession: false },
-      { name: "claude", available: false, hasSession: false },
+      { name: "codex", discoverable: true, healthy: true, hasSession: false },
+      { name: "claude", discoverable: false, healthy: false, hasSession: false },
     ]);
   });
 
@@ -82,7 +81,7 @@ describe("ProviderPathsDialog", () => {
           },
         },
         ai: {
-          titleGenerationCliPriority: ["iflow", "codex", "claude"],
+          titleGenerationCliPriority: ["codex", "claude"],
         },
       });
 
@@ -168,16 +167,32 @@ describe("ProviderPathsDialog", () => {
     expect(screen.queryByLabelText("保存时自动迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。")).toBeNull();
   });
 
+  it("会显示更准确的 CLI 发现与健康状态", async () => {
+    mockFetchProviderPathSettings.mockResolvedValue(createSettings());
+
+    render(
+      <ProviderPathsDialog
+        open
+        onClose={() => {}}
+        onNotify={() => {}}
+      />
+    );
+
+    await screen.findByText("命令已发现");
+    expect(screen.getByText("健康可用")).toBeInTheDocument();
+    expect(screen.getByText("命令未发现")).toBeInTheDocument();
+  });
+
   it("允许调整标题生成 CLI 优先级并保存到 API", async () => {
     const settings = createSettings();
 
     mockFetchProviderPathSettings.mockResolvedValue(settings);
     mockUpdateProviderPathSettings.mockImplementation(async (payload) => {
-      expect(payload.ai?.titleGenerationCliPriority).toEqual(["codex", "iflow", "claude"]);
+      expect(payload.ai?.titleGenerationCliPriority).toEqual(["claude", "codex"]);
       return {
         ...settings,
         ai: {
-          titleGenerationCliPriority: ["codex", "iflow", "claude"],
+          titleGenerationCliPriority: ["claude", "codex"],
         },
       };
     });
@@ -191,7 +206,7 @@ describe("ProviderPathsDialog", () => {
     );
 
     await screen.findByText("AI 标题生成优先级");
-    fireEvent.click(screen.getByLabelText("下移 iFlow"));
+    fireEvent.click(screen.getByLabelText("下移 Codex"));
     fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
 
     await waitFor(() => {
@@ -206,14 +221,12 @@ describe("ProviderPathsDialog", () => {
     mockResetAiCliSession.mockResolvedValue({ success: true });
     mockFetchAvailableClis
       .mockResolvedValueOnce([
-        { name: "iflow", available: true, hasSession: true },
-        { name: "codex", available: true, hasSession: false },
-        { name: "claude", available: false, hasSession: false },
+        { name: "codex", discoverable: true, healthy: true, hasSession: true },
+        { name: "claude", discoverable: false, healthy: false, hasSession: false },
       ])
       .mockResolvedValueOnce([
-        { name: "iflow", available: true, hasSession: false },
-        { name: "codex", available: true, hasSession: false },
-        { name: "claude", available: false, hasSession: false },
+        { name: "codex", discoverable: true, healthy: true, hasSession: false },
+        { name: "claude", discoverable: false, healthy: false, hasSession: false },
       ]);
 
     render(
@@ -224,11 +237,11 @@ describe("ProviderPathsDialog", () => {
       />
     );
 
-    await screen.findByLabelText("重置 iFlow 标题会话");
-    fireEvent.click(screen.getByLabelText("重置 iFlow 标题会话"));
+    await screen.findByLabelText("重置 Codex 标题会话");
+    fireEvent.click(screen.getByLabelText("重置 Codex 标题会话"));
 
     await waitFor(() => {
-      expect(mockResetAiCliSession).toHaveBeenCalledWith("iflow");
+      expect(mockResetAiCliSession).toHaveBeenCalledWith("codex");
     });
 
     expect(onNotify).toHaveBeenCalledWith(expect.objectContaining({

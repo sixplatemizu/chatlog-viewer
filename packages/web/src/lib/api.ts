@@ -104,8 +104,9 @@ export interface ProviderPathMigrationResult {
   message: string;
 }
 
-export type TitleGenerationCli = "iflow" | "codex" | "claude";
+export type TitleGenerationCli = "codex" | "claude";
 export type TitleSyncMode = "native" | "overlay";
+export type ConversationContentStatus = "full" | "history-only" | "metadata-only";
 
 export interface ConversationCapabilities {
   canUpdateTitle: boolean;
@@ -129,6 +130,10 @@ export interface ConversationMeta {
   fileSize: number;
   filePath: string;
   modelProvider?: string;
+  transcriptMissing?: boolean;
+  contentStatus?: ConversationContentStatus;
+  titleGenerationHint?: string;
+  cleanupCandidate?: boolean;
 }
 
 export interface Message {
@@ -151,6 +156,8 @@ export interface Conversation extends ConversationMeta {
 export interface ConversationListResponse {
   total: number;
   conversations: ConversationMeta[];
+  providerCounts?: Record<string, number>;
+  codexModelProviderCounts?: Record<string, number>;
   partialSearch?: boolean;
   warnings?: string[];
 }
@@ -183,7 +190,7 @@ export async function fetchConversations(params: {
   signal?: AbortSignal;
 }): Promise<ConversationListResponse> {
   const qs = new URLSearchParams();
-  if (params.provider) qs.set("provider", params.provider);
+  if (params.provider !== undefined) qs.set("provider", params.provider);
   if (params.search) qs.set("search", params.search);
   if (params.sort) qs.set("sort", params.sort);
   if (params.modelProvider !== undefined) qs.set("modelProvider", params.modelProvider);
@@ -211,8 +218,8 @@ export async function fetchConversation(
   });
 }
 
-export async function deleteConversation(id: string): Promise<void> {
-  await requestJson<{ success: boolean }>(`${BASE}/conversations/${encodeURIComponent(id)}`, {
+export async function deleteConversation(id: string): Promise<{ success: boolean; cleanedStale?: boolean }> {
+  return requestJson<{ success: boolean; cleanedStale?: boolean }>(`${BASE}/conversations/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
 }
@@ -377,7 +384,8 @@ export async function generateAiTitles(
 
 export interface AvailableCliInfo {
   name: TitleGenerationCli;
-  available: boolean;
+  discoverable: boolean;
+  healthy: boolean;
   hasSession: boolean;
 }
 

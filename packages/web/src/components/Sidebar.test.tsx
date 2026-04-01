@@ -13,6 +13,12 @@ const providers: ProviderInfo[] = [
   { name: "iflow", displayName: "iFlow", available: true, storagePath: "/tmp/iflow" },
 ];
 
+const emptyProviderCounts = {
+  codex: 0,
+  "claude-code": 0,
+  iflow: 0,
+};
+
 function createConversation(partial: Partial<ConversationMeta> & Pick<ConversationMeta, "id" | "provider">): ConversationMeta {
   return {
     id: partial.id,
@@ -27,10 +33,104 @@ function createConversation(partial: Partial<ConversationMeta> & Pick<Conversati
     fileSize: partial.fileSize ?? 1,
     filePath: partial.filePath ?? "/tmp/project/session.jsonl",
     modelProvider: partial.modelProvider,
+    transcriptMissing: partial.transcriptMissing,
+    contentStatus: partial.contentStatus,
+    cleanupCandidate: partial.cleanupCandidate,
+    titleGenerationHint: partial.titleGenerationHint,
   };
 }
 
 describe("Sidebar", () => {
+  it("未选择 provider 时回退显示 provider 列表中的对话数", () => {
+    render(
+      <Sidebar
+        providers={providers}
+        activeProviders={new Set(["codex", "claude-code"])}
+        toggleProvider={() => {}}
+        conversations={[
+          createConversation({ id: "codex:1", provider: "codex", modelProvider: "openai" }),
+          createConversation({ id: "codex:2", provider: "codex", modelProvider: "openai" }),
+          createConversation({ id: "codex:3", provider: "codex", modelProvider: "azure" }),
+        ]}
+        selectedId={null}
+        onSelect={() => {}}
+        search=""
+        onSearchChange={() => {}}
+        sort="updatedAt"
+        onSortChange={() => {}}
+        loading={false}
+        total={3}
+        providerCounts={{ codex: 3, "claude-code": 0, iflow: 0 }}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onSelectAll={() => {}}
+        onDeselectAll={() => {}}
+        onToggleSelectGroup={() => {}}
+        onBatchExport={() => {}}
+        onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
+        onBatchGenerate={() => {}}
+        onBatchChangeModelProvider={() => {}}
+        batchGenerating={false}
+        onMoveConversation={() => {}}
+        codexModelProviderCounts={{}}
+        codexModelProviders={[
+          { name: "openai", count: 2 },
+          { name: "azure", count: 1 },
+        ]}
+        activeModelProviders={new Set()}
+        onToggleModelProvider={() => {}}
+        partialSearch={false}
+        searchWarnings={[]}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: /openai\s*2/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /azure\s*1/ })).toBeInTheDocument();
+  });
+
+  it("工具筛选按钮会显示各 provider 总对话数", () => {
+    render(
+      <Sidebar
+        providers={providers}
+        activeProviders={new Set(["codex", "claude-code", "iflow"])}
+        toggleProvider={() => {}}
+        conversations={[]}
+        selectedId={null}
+        onSelect={() => {}}
+        search=""
+        onSearchChange={() => {}}
+        sort="updatedAt"
+        onSortChange={() => {}}
+        loading={false}
+        total={0}
+        providerCounts={{ codex: 5, "claude-code": 3, iflow: 1 }}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onSelectAll={() => {}}
+        onDeselectAll={() => {}}
+        onToggleSelectGroup={() => {}}
+        onBatchExport={() => {}}
+        onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
+        onBatchGenerate={() => {}}
+        onBatchChangeModelProvider={() => {}}
+        batchGenerating={false}
+        onMoveConversation={() => {}}
+        codexModelProviderCounts={{}}
+        codexModelProviders={[]}
+        activeModelProviders={new Set()}
+        onToggleModelProvider={() => {}}
+        partialSearch={false}
+        searchWarnings={[]}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: /Codex\s*5/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Claude Code\s*3/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /iFlow\s*1/ })).toBeInTheDocument();
+  });
+
   it("全部选中 Codex 对话时显示批量 provider 切换控件", () => {
     const onBatchChangeModelProvider = vi.fn();
 
@@ -51,6 +151,7 @@ describe("Sidebar", () => {
         onSortChange={() => {}}
         loading={false}
         total={2}
+        providerCounts={emptyProviderCounts}
         selectedIds={new Set(["codex:1", "codex:2"])}
         onToggleSelect={() => {}}
         onSelectAll={() => {}}
@@ -58,11 +159,12 @@ describe("Sidebar", () => {
         onToggleSelectGroup={() => {}}
         onBatchExport={() => {}}
         onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={onBatchChangeModelProvider}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviders={[
+        codexModelProviderCounts={{}} codexModelProviders={[
           { name: "openai", count: 2 },
           { name: "azure", count: 1 },
         ]}
@@ -78,6 +180,50 @@ describe("Sidebar", () => {
     fireEvent.click(screen.getByRole("button", { name: "切换 Provider" }));
 
     expect(onBatchChangeModelProvider).toHaveBeenCalledWith("azure");
+  });
+
+  it("未选择 provider 时回退显示 Codex provider 总数", () => {
+    render(
+      <Sidebar
+        providers={providers}
+        activeProviders={new Set(["codex"])}
+        toggleProvider={() => {}}
+        conversations={[]}
+        selectedId={null}
+        onSelect={() => {}}
+        search=""
+        onSearchChange={() => {}}
+        sort="updatedAt"
+        onSortChange={() => {}}
+        loading={false}
+        total={3}
+        providerCounts={emptyProviderCounts}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onSelectAll={() => {}}
+        onDeselectAll={() => {}}
+        onToggleSelectGroup={() => {}}
+        onBatchExport={() => {}}
+        onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
+        onBatchGenerate={() => {}}
+        onBatchChangeModelProvider={() => {}}
+        batchGenerating={false}
+        onMoveConversation={() => {}}
+        codexModelProviderCounts={{}}
+        codexModelProviders={[
+          { name: "openai", count: 2 },
+          { name: "azure", count: 1 },
+        ]}
+        activeModelProviders={new Set(["openai", "azure"])}
+        onToggleModelProvider={() => {}}
+        partialSearch={false}
+        searchWarnings={[]}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: /openai/i })).toHaveTextContent("openai2");
+    expect(screen.getByRole("button", { name: /azure/i })).toHaveTextContent("azure1");
   });
 
   it("混选其他 CLI 对话时显示不支持提示", () => {
@@ -98,6 +244,7 @@ describe("Sidebar", () => {
         onSortChange={() => {}}
         loading={false}
         total={2}
+        providerCounts={emptyProviderCounts}
         selectedIds={new Set(["codex:1", "claude-code:1"])}
         onToggleSelect={() => {}}
         onSelectAll={() => {}}
@@ -105,11 +252,12 @@ describe("Sidebar", () => {
         onToggleSelectGroup={() => {}}
         onBatchExport={() => {}}
         onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviderCounts={{}} codexModelProviders={[{ name: "openai", count: 1 }]}
         activeModelProviders={new Set(["openai"])}
         onToggleModelProvider={() => {}}
         partialSearch={false}
@@ -119,6 +267,52 @@ describe("Sidebar", () => {
 
     expect(screen.queryByRole("combobox", { name: "批量切换 Codex provider" })).not.toBeInTheDocument();
     expect(screen.getByText("批量 provider 切换目前仅支持 Codex 对话")).toBeInTheDocument();
+  });
+
+  it("仅选中 cleanupCandidate 时显示批量清理入口", () => {
+    const onBatchDeleteEmpty = vi.fn();
+
+    render(
+      <Sidebar
+        providers={providers}
+        activeProviders={new Set(["codex", "iflow"])}
+        toggleProvider={() => {}}
+        conversations={[
+          createConversation({ id: "codex:1", provider: "codex", cleanupCandidate: true, transcriptMissing: true, messageCount: 0 }),
+          createConversation({ id: "iflow:1", provider: "iflow", messageCount: 0 }),
+        ]}
+        selectedId={null}
+        onSelect={() => {}}
+        search=""
+        onSearchChange={() => {}}
+        sort="updatedAt"
+        onSortChange={() => {}}
+        loading={false}
+        total={2}
+        providerCounts={emptyProviderCounts}
+        selectedIds={new Set(["codex:1", "iflow:1"])}
+        onToggleSelect={() => {}}
+        onSelectAll={() => {}}
+        onDeselectAll={() => {}}
+        onToggleSelectGroup={() => {}}
+        onBatchExport={() => {}}
+        onBatchDelete={() => {}}
+        onBatchDeleteEmpty={onBatchDeleteEmpty}
+        onBatchGenerate={() => {}}
+        onBatchChangeModelProvider={() => {}}
+        batchGenerating={false}
+        onMoveConversation={() => {}}
+        codexModelProviderCounts={{}} codexModelProviders={[{ name: "openai", count: 1 }]}
+        activeModelProviders={new Set(["openai"])}
+        onToggleModelProvider={() => {}}
+        partialSearch={false}
+        searchWarnings={[]}
+      />
+    );
+
+    expect(screen.getByText("已选 1 条残留记录，可直接一键清理。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "清理残留" }));
+    expect(onBatchDeleteEmpty).toHaveBeenCalledTimes(1);
   });
 
   it("选中 iFlow 对话时会禁用批量 AI 标题按钮", () => {
@@ -148,6 +342,7 @@ describe("Sidebar", () => {
         onSortChange={() => {}}
         loading={false}
         total={2}
+        providerCounts={emptyProviderCounts}
         selectedIds={new Set(["codex:1", "iflow:1"])}
         onToggleSelect={() => {}}
         onSelectAll={() => {}}
@@ -155,11 +350,12 @@ describe("Sidebar", () => {
         onToggleSelectGroup={() => {}}
         onBatchExport={() => {}}
         onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviderCounts={{}} codexModelProviders={[{ name: "openai", count: 1 }]}
         activeModelProviders={new Set(["openai"])}
         onToggleModelProvider={() => {}}
         partialSearch={false}

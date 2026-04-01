@@ -1,6 +1,6 @@
 import type { Message } from "../providers/types.js";
 
-export const SEARCH_INDEX_VERSION = 3;
+export const SEARCH_INDEX_VERSION = 4;
 
 const SEARCH_TEXT_MAX_LENGTH = 256 * 1024;
 const SEARCH_PART_MAX_LENGTH = 12 * 1024;
@@ -8,7 +8,10 @@ const SEARCH_PART_SAMPLE_WINDOW_COUNT = 3;
 const SEARCH_PART_DISTRIBUTION_LIMIT = 48;
 const SEARCH_WINDOW_SEPARATOR = "\n\n...\n\n";
 const SEARCH_PRIORITY_RATIOS = [0, 0.5, 1, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875];
-const SEARCH_CHUNK_MAX_LENGTH = 4096;
+const SEARCH_CHUNK_BASE_MAX_LENGTH = 4096;
+const SEARCH_CHUNK_MAX_LENGTH_LIMIT = 16 * 1024;
+const SEARCH_CHUNK_TARGET_COUNT = 256;
+const SEARCH_CHUNK_SEPARATOR = "\n\n";
 const SEARCH_CHUNK_OVERLAP = 256;
 
 export interface ConversationSearchIndex {
@@ -182,22 +185,75 @@ function splitIntoChunks(text: string, maxLength: number, overlap: number): stri
   return chunks;
 }
 
+function resolveSearchChunkMaxLength(parts: string[]): number {
+  const totalLength = parts.reduce(
+    (sum, part, index) => sum + part.length + (index > 0 ? SEARCH_CHUNK_SEPARATOR.length : 0),
+    0
+  );
+  if (totalLength <= SEARCH_CHUNK_BASE_MAX_LENGTH * SEARCH_CHUNK_TARGET_COUNT) {
+    return SEARCH_CHUNK_BASE_MAX_LENGTH;
+  }
+
+  const dynamicLength = Math.ceil(totalLength / SEARCH_CHUNK_TARGET_COUNT);
+  return Math.max(
+    SEARCH_CHUNK_BASE_MAX_LENGTH,
+    Math.min(SEARCH_CHUNK_MAX_LENGTH_LIMIT, dynamicLength)
+  );
+}
+
+function pushUniqueChunk(chunks: string[], seen: Set<string>, chunk: string): void {
+  const normalized = chunk.trim();
+  if (!normalized || seen.has(normalized)) {
+    return;
+  }
+
+  seen.add(normalized);
+  chunks.push(normalized);
+}
+
 function buildConversationSearchChunksFromParts(parts: string[]): string[] {
-  if (parts.length === 0) {
+  const normalizedParts = parts
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (normalizedParts.length === 0) {
     return [];
   }
 
+  const chunkMaxLength = resolveSearchChunkMaxLength(normalizedParts);
   const seen = new Set<string>();
   const chunks: string[] = [];
+  let bufferedChunk = "";
 
-  for (const part of parts) {
-    for (const chunk of splitIntoChunks(part, SEARCH_CHUNK_MAX_LENGTH, SEARCH_CHUNK_OVERLAP)) {
-      if (seen.has(chunk)) continue;
-      seen.add(chunk);
-      chunks.push(chunk);
+  const flushBufferedChunk = () => {
+    if (!bufferedChunk) return;
+    pushUniqueChunk(chunks, seen, bufferedChunk);
+    bufferedChunk = "";
+  };
+
+  for (const part of normalizedParts) {
+    if (part.length > chunkMaxLength) {
+      flushBufferedChunk();
+      for (const chunk of splitIntoChunks(part, chunkMaxLength, SEARCH_CHUNK_OVERLAP)) {
+        pushUniqueChunk(chunks, seen, chunk);
+      }
+      continue;
     }
+
+    const candidate = bufferedChunk
+      ? `${bufferedChunk}${SEARCH_CHUNK_SEPARATOR}${part}`
+      : part;
+
+    if (candidate.length <= chunkMaxLength) {
+      bufferedChunk = candidate;
+      continue;
+    }
+
+    flushBufferedChunk();
+    bufferedChunk = part;
   }
 
+  flushBufferedChunk();
   return chunks;
 }
 

@@ -4,12 +4,12 @@ import { homedir } from "os";
 import { posix, win32 } from "path";
 
 export type ResolvedProviderName = "claude-code" | "codex" | "iflow";
-export type TitleGenerationCli = "iflow" | "codex" | "claude";
+export type TitleGenerationCli = "codex" | "claude";
 type PathKind = "file" | "directory";
 type EnvLike = Record<string, string | undefined>;
 export type ProviderPathSource = "env" | "config" | "auto" | "default";
 
-const TITLE_GENERATION_CLI_ORDER: TitleGenerationCli[] = ["iflow", "codex", "claude"];
+const TITLE_GENERATION_CLI_ORDER: TitleGenerationCli[] = ["codex", "claude"];
 const TITLE_GENERATION_CLI_SET = new Set<TitleGenerationCli>(TITLE_GENERATION_CLI_ORDER);
 
 export interface ProviderPathConfig {

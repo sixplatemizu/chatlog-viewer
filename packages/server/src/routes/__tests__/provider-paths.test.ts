@@ -122,7 +122,7 @@ test("配置文件路径支持环境变量覆盖", () => {
 test("标题生成 CLI 优先级会归一化并补齐缺失项", () => {
   assert.deepEqual(
     normalizeTitleGenerationCliPriority(["codex", "iflow", "codex"]),
-    ["codex", "iflow", "claude"]
+    ["codex", "claude"]
   );
 });
 
@@ -147,7 +147,7 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
       baseDir,
       {
         ai: {
-          titleGenerationCliPriority: ["codex", "iflow", "claude"],
+          titleGenerationCliPriority: ["codex", "claude"],
         },
       }
     );
@@ -162,7 +162,7 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
     assert.equal(saved.providers?.codex?.storagePath, "/data/codex/sessions");
     assert.equal(saved.providers?.codex?.stateDbPath, "/data/codex/state_5.sqlite");
     assert.equal(saved.providers?.["claude-code"]?.storagePath, "/data/claude/projects");
-    assert.deepEqual(saved.ai?.titleGenerationCliPriority, ["codex", "iflow", "claude"]);
+    assert.deepEqual(saved.ai?.titleGenerationCliPriority, ["codex", "claude"]);
 
     await updateProviderConfigs(
       {
@@ -178,7 +178,7 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
     const loaded = getAppConfig(env, baseDir);
     assert.equal(loaded.config.providers?.codex, undefined);
     assert.equal(loaded.config.providers?.["claude-code"]?.storagePath, "/data/claude/projects");
-    assert.deepEqual(getTitleGenerationCliPriority(env, baseDir), ["codex", "iflow", "claude"]);
+    assert.deepEqual(getTitleGenerationCliPriority(env, baseDir), ["codex", "claude"]);
   } finally {
     await rm(baseDir, { recursive: true, force: true });
   }

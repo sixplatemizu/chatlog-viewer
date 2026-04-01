@@ -6,6 +6,7 @@ import {
   fetchCodexProviders,
   getErrorMessage,
   isAbortError,
+  ApiError,
   type ProviderInfo,
   type ConversationMeta,
   type Conversation,
@@ -38,6 +39,27 @@ function resolveActiveModelProviders(
 
   const preserved = availableNames.filter((name) => current.has(name));
   return new Set(preserved.length > 0 ? preserved : availableNames);
+}
+
+function buildModelProviderCountMap(
+  modelProviders: CodexModelProvider[]
+): Record<string, number> {
+  return Object.fromEntries(modelProviders.map((provider) => [provider.name, provider.count]));
+}
+
+function buildProviderCountMap(providerList: ProviderInfo[]): Record<string, number> {
+  return Object.fromEntries(providerList.map((provider) => [provider.name, 0]));
+}
+
+function buildConversationProviderCountMap(
+  providerList: ProviderInfo[],
+  conversations: ConversationMeta[]
+): Record<string, number> {
+  const counts = buildProviderCountMap(providerList);
+  for (const conversation of conversations) {
+    counts[conversation.provider] = (counts[conversation.provider] ?? 0) + 1;
+  }
+  return counts;
 }
 
 function getModelProviderParam(
@@ -76,11 +98,16 @@ function normalizeClientMessageContent(content: string): string {
   return content.replace(/\r\n/g, "\n").trim();
 }
 
+function removeConversationItem(items: ConversationMeta[], id: string): ConversationMeta[] {
+  return items.filter((item) => item.id !== id);
+}
+
 export function useConversations(options: UseConversationsOptions = {}) {
   const { onNotify } = options;
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   const [total, setTotal] = useState(0);
+  const [providerCounts, setProviderCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
   const [activeProviders, setActiveProviders] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
@@ -94,6 +121,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
   const [activeModelProviders, setActiveModelProviders] = useState<Set<string>>(new Set());
   const [partialSearch, setPartialSearch] = useState(false);
   const [searchWarnings, setSearchWarnings] = useState<string[]>([]);
+  const [codexModelProviderCounts, setCodexModelProviderCounts] = useState<Record<string, number>>({});
   const detailAbortRef = useRef<AbortController | null>(null);
   const activeProvidersRef = useRef(activeProviders);
   const activeModelProvidersRef = useRef(activeModelProviders);
@@ -134,7 +162,12 @@ export function useConversations(options: UseConversationsOptions = {}) {
 
     setProviders(providerList);
     setActiveProviders(nextActiveProviders);
+    setProviderCounts((prev) => ({
+      ...buildProviderCountMap(providerList),
+      ...prev,
+    }));
     setCodexModelProviders(modelProviders);
+    setCodexModelProviderCounts(buildModelProviderCountMap(modelProviders));
     setActiveModelProviders(nextActiveModelProviders);
     activeProvidersRef.current = nextActiveProviders;
     activeModelProvidersRef.current = nextActiveModelProviders;
@@ -186,22 +219,9 @@ export function useConversations(options: UseConversationsOptions = {}) {
     const currentModelProviders = overrides?.modelProviders ?? codexModelProviders;
     const currentActiveModelProviders = overrides?.activeModelProviderSet ?? activeModelProviders;
 
-    if (currentProviders.length > 0 && currentActiveProviders.size === 0) {
-      setConversations([]);
-      setTotal(0);
-      setPartialSearch(false);
-      setSearchWarnings([]);
-      setLoading(false);
-      return {
-        total: 0,
-        conversations: [] as ConversationMeta[],
-        partialSearch: false,
-        warnings: [],
-      } satisfies ConversationListResponse;
-    }
-
-    const providerParam =
-      currentProviders.length > 0 ? Array.from(currentActiveProviders).join(",") : undefined;
+    const providerParam = currentProviders.length > 0
+      ? Array.from(currentActiveProviders).join(",")
+      : undefined;
     const modelProviderParam = getModelProviderParam(
       currentActiveProviders,
       currentActiveModelProviders,
@@ -218,8 +238,14 @@ export function useConversations(options: UseConversationsOptions = {}) {
       });
       setConversations(data.conversations);
       setTotal(data.total);
+      setProviderCounts(
+        data.providerCounts ?? buildConversationProviderCountMap(currentProviders, data.conversations)
+      );
       setPartialSearch(!!data.partialSearch);
       setSearchWarnings(data.warnings ?? []);
+      setCodexModelProviderCounts(
+        data.codexModelProviderCounts ?? buildModelProviderCountMap(currentModelProviders)
+      );
       return data;
     } catch (error) {
       if (!isAbortError(error)) {
@@ -311,9 +337,26 @@ export function useConversations(options: UseConversationsOptions = {}) {
         }
       } catch (error) {
         if (!isAbortError(error)) {
-          notifyError("加载对话详情失败", error, "加载对话详情失败");
-          if (!preserveView) {
-            setConversation(null);
+          if (error instanceof ApiError && error.status === 404) {
+            setConversations((prev) => removeConversationItem(prev, id));
+            setSelectedIds((prev) => {
+              if (!prev.has(id)) return prev;
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+            setSelectedId((prev) => (prev === id ? null : prev));
+            setConversation((prev) => (prev?.id === id ? null : prev));
+            onNotify?.({
+              variant: "warning",
+              title: "已自动清理失效对话记录",
+              description: "该对话底层文件已不存在，列表中的残留记录已移除。",
+            });
+          } else {
+            notifyError("加载对话详情失败", error, "加载对话详情失败");
+            if (!preserveView) {
+              setConversation(null);
+            }
           }
         }
       } finally {
@@ -326,7 +369,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
         }
       }
     },
-    [conversation, notifyError]
+    [conversation, notifyError, onNotify]
   );
 
   const refreshConversation = useCallback(
@@ -522,6 +565,18 @@ export function useConversations(options: UseConversationsOptions = {}) {
     });
   }, []);
 
+  const ensureModelProviderVisible = useCallback((name: string) => {
+    const normalized = name.trim();
+    if (!normalized) return;
+
+    setActiveModelProviders((prev) => {
+      if (prev.has(normalized)) return prev;
+      const next = new Set(prev);
+      next.add(normalized);
+      return next;
+    });
+  }, []);
+
   // 多选操作
   const toggleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -557,6 +612,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
     providers,
     conversations,
     total,
+    providerCounts,
     loading,
     activeProviders,
     toggleProvider,
@@ -579,6 +635,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
     codexModelProviders,
     activeModelProviders,
     toggleModelProvider,
+    ensureModelProviderVisible,
+    codexModelProviderCounts,
     partialSearch,
     searchWarnings,
     reloadProviders: loadProviderData,

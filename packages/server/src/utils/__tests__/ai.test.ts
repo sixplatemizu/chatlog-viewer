@@ -124,10 +124,13 @@ test("首次生成标题会创建固定会话并写入 session 状态", async ()
 
   try {
     const before = await getAvailableClis();
+    assert.equal(findCli(before, "codex")?.discoverable, true);
+    assert.equal(findCli(before, "codex")?.healthy, true);
     assert.equal(findCli(before, "codex")?.hasSession, false);
 
     const result = await generateTitle(SAMPLE_MESSAGES, {
       priority: ["codex"],
+      reuseSession: true,
     });
 
     assert.equal(result.title, "新建会话标题");
@@ -139,6 +142,8 @@ test("首次生成标题会创建固定会话并写入 session 状态", async ()
     assert.ok((calls[0]?.inputLength ?? 0) > 0);
 
     const after = await getAvailableClis();
+    assert.equal(findCli(after, "codex")?.discoverable, true);
+    assert.equal(findCli(after, "codex")?.healthy, true);
     assert.equal(findCli(after, "codex")?.hasSession, true);
 
     await resetSession("codex");
@@ -160,6 +165,7 @@ test("已有固定会话时会优先复用 resume 会话", async () => {
 
     const result = await generateTitle(SAMPLE_MESSAGES, {
       priority: ["codex"],
+      reuseSession: true,
     });
 
     assert.equal(result.title, "复用会话标题");
@@ -182,6 +188,7 @@ test("session 标记失效时会自动回退到 fresh 模式", async () => {
 
     const result = await generateTitle(SAMPLE_MESSAGES, {
       priority: ["codex"],
+      reuseSession: true,
     });
 
     assert.equal(result.title, "新建会话标题");
@@ -192,6 +199,8 @@ test("session 标记失效时会自动回退到 fresh 模式", async () => {
     assert.equal(calls[1]?.isResume, false);
 
     const available = await getAvailableClis();
+    assert.equal(findCli(available, "codex")?.discoverable, true);
+    assert.equal(findCli(available, "codex")?.healthy, true);
     assert.equal(findCli(available, "codex")?.hasSession, true);
   } finally {
     env.restoreEnv();

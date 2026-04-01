@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createConversationRoutes } from "../conversations.js";
+import { buildTitleGenerationMessages, createConversationRoutes } from "../conversations.js";
 import {
   invalidateListCache,
   setIndexedListCache,
@@ -186,7 +186,7 @@ test("支持原生标题持久化的 provider 会调用 updateTitle 并清理 ov
   assert.equal(data.conversations[0]?.title, "同步到原生存储");
 });
 
-test("列表接口会把旧 overlay 标题回填到支持原生标题的 provider", async () => {
+test("列表接口会显示旧 overlay 标题但不回填到支持原生标题的 provider", async () => {
   const sourceConversations = [
     createConversationMeta({
       id: "codex:legacy-title",
@@ -218,14 +218,11 @@ test("列表接口会把旧 overlay 标题回填到支持原生标题的 provide
 
   const data = (await res.json()) as { total: number; conversations: ConversationMeta[] };
   assert.equal(data.conversations[0]?.title, "旧覆盖标题");
-  assert.deepEqual(receivedCalls, [{
-    id: "codex:legacy-title",
-    title: "旧覆盖标题",
-  }]);
-  assert.equal(await getTitle("codex:legacy-title"), null);
+  assert.deepEqual(receivedCalls, []);
+  assert.equal(await getTitle("codex:legacy-title"), "旧覆盖标题");
 });
 
-test("详情接口会把旧 overlay 标题回填到支持原生标题的 provider", async () => {
+test("详情接口会显示旧 overlay 标题但不回填到支持原生标题的 provider", async () => {
   const sourceConversations = [
     createConversationMeta({
       id: "codex:legacy-detail",
@@ -261,11 +258,8 @@ test("详情接口会把旧 overlay 标题回填到支持原生标题的 provide
 
   const data = await res.json() as Conversation;
   assert.equal(data.title, "详情覆盖标题");
-  assert.deepEqual(receivedCalls, [{
-    id: "codex:legacy-detail",
-    title: "详情覆盖标题",
-  }]);
-  assert.equal(await getTitle("codex:legacy-detail"), null);
+  assert.deepEqual(receivedCalls, []);
+  assert.equal(await getTitle("codex:legacy-detail"), "详情覆盖标题");
 });
 
 test("列表和详情接口会返回标题同步模式", async () => {
@@ -475,6 +469,109 @@ test("批量 AI 标题生成会跳过 iFlow 并返回禁用错误", async () => 
   });
 });
 
+test("Codex metadata-only 对话生成 AI 标题时会优先使用 metadata hint", () => {
+  const messages = buildTitleGenerationMessages({
+    ...createConversationMeta({
+      id: "codex:state-only-title",
+      provider: "codex",
+      title: "State DB 标题",
+      transcriptMissing: true,
+      titleGenerationHint: "当前对话缺少 transcript，请仅根据以下 metadata 生成标题：\n现有标题: State DB 标题\n首条用户消息摘要: State DB 首条消息\n项目目录: C:/Users/tester/Desktop/code_area/chatlog-viewer\nCodex provider: custom",
+      messageCount: 0,
+    }),
+    messages: [{
+      role: "system",
+      content: "当前仅保留 metadata，未找到 transcript 文件。",
+    }],
+  });
+
+  assert.deepEqual(messages, [{
+    role: "user",
+    content: "当前对话缺少 transcript，请仅根据以下 metadata 生成标题：\n现有标题: State DB 标题\n首条用户消息摘要: State DB 首条消息\n项目目录: C:/Users/tester/Desktop/code_area/chatlog-viewer\nCodex provider: custom",
+  }]);
+});
+
+test("无 modelProvider 筛选时会返回完整的 Codex provider 计数", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      conversations: [
+        createConversationMeta({
+          id: "codex:openai-1",
+          provider: "codex",
+          modelProvider: "openai",
+        }),
+        createConversationMeta({
+          id: "codex:openai-2",
+          provider: "codex",
+          modelProvider: "openai",
+        }),
+        createConversationMeta({
+          id: "codex:azure-1",
+          provider: "codex",
+          modelProvider: "azure",
+        }),
+      ],
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations?provider=codex");
+  assert.equal(res.status, 200);
+
+  const data = (await res.json()) as {
+    total: number;
+    conversations: ConversationMeta[];
+    codexModelProviderCounts: Record<string, number>;
+  };
+  assert.equal(data.total, 3);
+  assert.deepEqual(data.codexModelProviderCounts, {
+    openai: 2,
+    azure: 1,
+  });
+});
+
+test("modelProvider 筛选后仍返回筛选前的 Codex provider 计数", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      conversations: [
+        createConversationMeta({
+          id: "codex:openai-1",
+          provider: "codex",
+          modelProvider: "openai",
+        }),
+        createConversationMeta({
+          id: "codex:openai-2",
+          provider: "codex",
+          modelProvider: "openai",
+        }),
+        createConversationMeta({
+          id: "codex:azure-1",
+          provider: "codex",
+          modelProvider: "azure",
+        }),
+      ],
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations?provider=codex&modelProvider=openai");
+  assert.equal(res.status, 200);
+
+  const data = (await res.json()) as {
+    total: number;
+    conversations: ConversationMeta[];
+    codexModelProviderCounts: Record<string, number>;
+  };
+  assert.equal(data.total, 2);
+  assert.deepEqual(data.conversations.map((item) => item.id).sort(), ["codex:openai-1", "codex:openai-2"]);
+  assert.deepEqual(data.codexModelProviderCounts, {
+    openai: 2,
+    azure: 1,
+  });
+});
+
 test("空 modelProvider 过滤会排除所有带 modelProvider 的 Codex 对话", async () => {
   const app = createConversationRoutes([
     createProvider({
@@ -510,12 +607,19 @@ test("空 modelProvider 过滤会排除所有带 modelProvider 的 Codex 对话"
   );
   assert.equal(res.status, 200);
 
-  const data = (await res.json()) as { total: number; conversations: ConversationMeta[] };
+  const data = (await res.json()) as {
+    total: number;
+    conversations: ConversationMeta[];
+    codexModelProviderCounts: Record<string, number>;
+  };
   assert.equal(data.total, 2);
   assert.deepEqual(
     data.conversations.map((item) => item.id).sort(),
     ["claude-code:1", "codex:without-provider"]
   );
+  assert.deepEqual(data.codexModelProviderCounts, {
+    openai: 1,
+  });
 });
 
 test("详情接口会把 limit 和 before 透传给 provider.read", async () => {
@@ -709,7 +813,7 @@ test("批量 model provider 切换接口会拒绝混合非 Codex 对话", async 
   assert.equal(data.error, "批量切换 model provider 仅支持 Codex 对话");
 });
 
-test("删除接口对不存在对话返回 404", async () => {
+test("删除接口对不存在对话会自动清理残留记录", async () => {
   const app = createConversationRoutes([
     createProvider({
       name: "codex",
@@ -723,13 +827,14 @@ test("删除接口对不存在对话返回 404", async () => {
   const res = await app.request("http://localhost/conversations/codex%3Amissing", {
     method: "DELETE",
   });
-  assert.equal(res.status, 404);
+  assert.equal(res.status, 200);
 
-  const data = await res.json() as { error: string };
-  assert.equal(data.error, "对话不存在: codex:missing");
+  const data = await res.json() as { success: boolean; cleanedStale?: boolean };
+  assert.equal(data.success, true);
+  assert.equal(data.cleanedStale, true);
 });
 
-test("批量删除接口会汇总成功和失败结果", async () => {
+test("批量删除接口会自动跳过已失效的残留记录", async () => {
   const deletedIds: string[] = [];
   const app = createConversationRoutes([
     createProvider({
@@ -759,14 +864,11 @@ test("批量删除接口会汇总成功和失败结果", async () => {
     failed: number;
     failures: Array<{ id: string; error: string }>;
   };
-  assert.equal(data.success, false);
-  assert.equal(data.deleted, 2);
-  assert.equal(data.failed, 1);
+  assert.equal(data.success, true);
+  assert.equal(data.deleted, 3);
+  assert.equal(data.failed, 0);
   assert.deepEqual(deletedIds.sort(), ["codex:ok-1", "codex:ok-2"]);
-  assert.deepEqual(data.failures, [{
-    id: "codex:missing",
-    error: "对话不存在: codex:missing",
-  }]);
+  assert.deepEqual(data.failures, []);
 });
 
 test("刷新 provider 后会优先使用新索引结果", async () => {
@@ -900,6 +1002,76 @@ test("底层文件 signature 变化后会跳过旧 indexed cache 并触发 provi
   assert.equal(data.conversations[0]?.id, "codex:refreshed");
 
   invalidateListCache(cacheKey);
+});
+
+test("/projects 会优先复用 fresh indexed cache 中的项目列表", async () => {
+  let listProjectsCalls = 0;
+
+  const provider = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    getListSourceSignature: async () => "projects-signature-v1",
+    listProjects: async () => {
+      listProjectsCalls += 1;
+      return ["fallback-project"];
+    },
+  });
+
+  const cacheKey = `codex::${provider.getStoragePath()}::indexed`;
+  setIndexedListCache(cacheKey, [
+    createConversationMeta({
+      id: "codex:project-1",
+      provider: "codex",
+      projectKey: "C:/Users/tester/Desktop/code_area/r-bioinfo",
+      project: "C:/Users/tester/Desktop/code_area/r-bioinfo",
+    }),
+    createConversationMeta({
+      id: "codex:project-2",
+      provider: "codex",
+      projectKey: "C:/Users/tester/Desktop/code_area/r-bioinfo",
+      project: "C:/Users/tester/Desktop/code_area/r-bioinfo/subdir",
+    }),
+  ], { sourceSignature: "projects-signature-v1" });
+
+  const app = createConversationRoutes([provider]);
+  const res = await app.request("http://localhost/projects?provider=codex");
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as Array<{ provider: string; projectKey: string; displayName: string }>;
+  assert.equal(listProjectsCalls, 0);
+  assert.deepEqual(data, [{
+    provider: "codex",
+    projectKey: "C:/Users/tester/Desktop/code_area/r-bioinfo",
+    displayName: "C:/Users/tester/Desktop/code_area/r-bioinfo/subdir",
+  }]);
+
+  invalidateListCache(cacheKey);
+});
+
+test("/projects 在 indexed cache 不可用时会回退到 provider.listProjects", async () => {
+  let listProjectsCalls = 0;
+
+  const provider = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    getListSourceSignature: async () => "projects-signature-v2",
+    listProjects: async () => {
+      listProjectsCalls += 1;
+      return ["fallback-project"];
+    },
+  });
+
+  const app = createConversationRoutes([provider]);
+  const res = await app.request("http://localhost/projects?provider=codex");
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as Array<{ provider: string; projectKey: string; displayName: string }>;
+  assert.equal(listProjectsCalls, 1);
+  assert.deepEqual(data, [{
+    provider: "codex",
+    projectKey: "fallback-project",
+    displayName: "fallback-project",
+  }]);
 });
 
 test("搜索降级到标题和目录匹配时会返回 partialSearch 提示", async () => {

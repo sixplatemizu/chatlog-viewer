@@ -66,6 +66,19 @@ test("search index 会同时返回摘要文本和完整 chunk 列表", () => {
   assert.ok(result.searchChunks?.some((chunk) => chunk.includes("middle-marker")));
 });
 
+test("大量短消息会被合并成更少的 search chunk，降低索引行数", () => {
+  const messages = Array.from({ length: 120 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" as const : "assistant" as const,
+    content: `short-message-${index + 1}-${"x".repeat(180)}`,
+  }));
+
+  const chunks = buildConversationSearchChunks(messages);
+
+  assert.ok(chunks.length < messages.length / 4);
+  assert.ok(chunks.some((chunk) => chunk.includes("short-message-1-")));
+  assert.ok(chunks.some((chunk) => chunk.includes("short-message-120-")));
+});
+
 test("流式 search index builder 与批量构建结果保持一致", () => {
   const messages = [
     {

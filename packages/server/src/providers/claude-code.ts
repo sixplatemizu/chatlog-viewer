@@ -182,6 +182,37 @@ function getListCacheKey(providerName: string, storagePath: string): string {
   return `${providerName}::${storagePath}::indexed`;
 }
 
+function resolveProjectDirectory(basePath: string, targetProjectKey: string): {
+  normalizedProjectKey: string;
+  targetProjectDir: string;
+} {
+  const normalizedProjectKey = normalizePath(targetProjectKey).trim();
+  if (!normalizedProjectKey) {
+    throw new Error("目标文件夹不能为空");
+  }
+  if (
+    normalizedProjectKey === "."
+    || normalizedProjectKey === ".."
+    || normalizedProjectKey.includes("/")
+  ) {
+    throw new Error("目标文件夹不合法");
+  }
+
+  const normalizedBasePath = normalizePath(basePath);
+  const targetProjectDir = normalizePath(join(basePath, normalizedProjectKey));
+  if (
+    targetProjectDir !== normalizedBasePath
+    && !targetProjectDir.startsWith(`${normalizedBasePath}/`)
+  ) {
+    throw new Error("目标文件夹不合法");
+  }
+
+  return {
+    normalizedProjectKey,
+    targetProjectDir,
+  };
+}
+
 function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
   const limit = options?.limit;
   const before = options?.before ?? 0;
@@ -261,6 +292,15 @@ function getPreferredSessionKey(source: ClaudeCodeSessionSource): string {
   return source.transcriptPath
     || source.sessionDirPath
     || source.key;
+}
+
+function isClaudeCleanupCandidate(source: ClaudeCodeSessionSource): boolean {
+  if (source.transcriptPath) {
+    return false;
+  }
+
+  const historyMessageCount = source.historySession?.messages.length ?? 0;
+  return historyMessageCount === 0;
 }
 
 function pickHistorySession(
@@ -585,18 +625,20 @@ export class ClaudeCodeProvider implements ConversationProvider {
       };
     }
 
+    if (!options.includeSearchIndex) {
+      const meta = await this.extractMeta(source);
+      return meta ? { meta } : null;
+    }
+
     if (!source.transcriptPath) {
       const meta = await this.buildHintOnlyMeta(source);
-      if (!options.includeSearchIndex) {
-        return { meta };
-      }
       return {
         meta,
         ...(await this.extractSearchIndex(source)),
       };
     }
 
-    return this.scanTranscriptSource(source, options.includeSearchIndex);
+    return this.scanTranscriptSource(source, true);
   }
 
   private async scanTranscriptSource(
@@ -1016,6 +1058,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     if (cached) return cached;
 
     const project = normalizePath(source.projectPathHint || source.projectKey) || source.projectKey;
+    const historyMessageCount = source.historySession?.messages.length ?? 0;
     const meta: ConversationMeta = {
       id: `claude-code:${source.sessionId}`,
       provider: this.name,
@@ -1028,6 +1071,8 @@ export class ClaudeCodeProvider implements ConversationProvider {
       messageCount: source.messageCountHint ?? source.historySession?.messageCount ?? 0,
       fileSize: source.fileSizeHint,
       filePath: source.key,
+      contentStatus: historyMessageCount > 0 ? "history-only" : "metadata-only",
+      cleanupCandidate: isClaudeCleanupCandidate(source),
     };
 
     setCache(source.key, source.updatedAtHint, meta);
@@ -1123,6 +1168,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
       messageCount,
       fileSize: fileStat.size,
       filePath: source.key,
+      contentStatus: "full",
     };
 
     setCache(source.key, source.updatedAtHint, meta);
@@ -1310,11 +1356,19 @@ export class ClaudeCodeProvider implements ConversationProvider {
       await rm(source.sessionDirPath, { recursive: true, force: true });
       changed = true;
     }
-    if (!changed) {
+
+    await this.removeSessionIndexEntry(source.indexPath, sessionId);
+
+    if (
+      !changed
+      && !source.historySession
+      && !source.displayTitleHint
+      && !source.firstPromptHint
+      && !source.messageCountHint
+    ) {
       throw new Error(`对话不存在: ${id}`);
     }
 
-    await this.removeSessionIndexEntry(source.indexPath, sessionId);
     this.invalidateConversationCaches(source.key);
   }
 
@@ -1322,7 +1376,10 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const sessionId = id.replace("claude-code:", "");
     const source = await this.findConversationSource(sessionId);
     const basePath = this.getStoragePath();
-    const targetProjectDir = normalizePath(join(basePath, targetProjectKey));
+    const {
+      normalizedProjectKey,
+      targetProjectDir,
+    } = resolveProjectDirectory(basePath, targetProjectKey);
     await mkdir(targetProjectDir, { recursive: true });
 
     let nextTranscriptPath = source.transcriptPath;
@@ -1347,7 +1404,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     await this.upsertSessionIndexEntry({
       ...source,
       key: nextTranscriptPath || nextSessionDirPath || normalizePath(join(targetProjectDir, `${sessionId}.session`)),
-      projectKey: targetProjectKey,
+      projectKey: normalizedProjectKey,
       projectDirPath: targetProjectDir,
       indexPath: normalizePath(join(targetProjectDir, "sessions-index.json")),
       transcriptPath: nextTranscriptPath,

@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations } from "./useConversations";
-import type { Conversation, ConversationListResponse, ConversationMeta } from "../lib/api";
+import { ApiError, type Conversation, type ConversationListResponse, type ConversationMeta } from "../lib/api";
 
 const {
   mockFetchProviders,
@@ -139,6 +139,116 @@ describe("useConversations", () => {
     expect(result.current.conversation?.title).toBe("新的本地标题");
     expect(result.current.conversations[0]?.title).toBe("新的本地标题");
     expect(mockFetchConversation).not.toHaveBeenCalled();
+  });
+
+  it("初始化时会用 Codex provider 列表填充 provider 计数", async () => {
+    mockFetchCodexProviders.mockResolvedValue([
+      { name: "v", count: 2 },
+      { name: "custom", count: 1 },
+    ]);
+    mockFetchConversations.mockResolvedValue({
+      total: 3,
+      conversations: [createConversation("codex:1")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.activeModelProviders.size).toBe(2);
+    });
+
+    expect(result.current.codexModelProviderCounts).toEqual({
+      v: 2,
+      custom: 1,
+    });
+  });
+
+  it("列表接口缺少 provider 计数字段时会回退到当前 provider 列表计数", async () => {
+    mockFetchCodexProviders.mockResolvedValue([
+      { name: "v", count: 2 },
+      { name: "custom", count: 1 },
+    ]);
+    mockFetchConversations.mockResolvedValue({
+      total: 1,
+      conversations: [createConversation("codex:1")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.conversations).toHaveLength(1);
+    });
+
+    expect(result.current.codexModelProviderCounts).toEqual({
+      v: 2,
+      custom: 1,
+    });
+  });
+
+  it("ensureModelProviderVisible 会把新 provider 加入当前过滤集合", async () => {
+    mockFetchCodexProviders.mockResolvedValue([
+      { name: "v", count: 1 },
+      { name: "custom", count: 1 },
+    ]);
+    mockFetchConversations.mockResolvedValue({
+      total: 1,
+      conversations: [createConversation("codex:1")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.activeModelProviders.size).toBe(2);
+    });
+
+    act(() => {
+      result.current.toggleModelProvider("custom");
+    });
+
+    expect([...result.current.activeModelProviders]).toEqual(["v"]);
+
+    act(() => {
+      result.current.ensureModelProviderVisible("custom");
+    });
+
+    expect(new Set(result.current.activeModelProviders)).toEqual(new Set(["v", "custom"]));
+  });
+
+  it("详情 404 时会自动清理失效对话记录", async () => {
+    mockFetchConversations.mockResolvedValue({
+      total: 2,
+      conversations: [createConversation("codex:1"), createConversation("codex:2")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+    mockFetchConversation.mockRejectedValueOnce(new ApiError("对话不存在: codex:1", 404));
+
+    const onNotify = vi.fn();
+    const { result } = renderHook(() => useConversations({ onNotify }));
+
+    await waitFor(() => {
+      expect(result.current.conversations).toHaveLength(2);
+    });
+
+    await act(async () => {
+      await result.current.selectConversation("codex:1");
+    });
+
+    await waitFor(() => {
+      expect(result.current.conversations.map((item) => item.id)).toEqual(["codex:2"]);
+    });
+    expect(result.current.selectedId).toBeNull();
+    expect(result.current.conversation).toBeNull();
+    expect(onNotify).toHaveBeenCalledWith(expect.objectContaining({
+      variant: "warning",
+      title: "已自动清理失效对话记录",
+    }));
   });
 
   it("消息编辑会先本地更新，再后台静默校正", async () => {

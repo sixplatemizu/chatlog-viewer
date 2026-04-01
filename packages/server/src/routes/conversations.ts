@@ -5,12 +5,14 @@ import type {
   ConversationMeta,
   ConversationCapabilities,
   TitleSyncMode,
+  Conversation,
+  Message,
 } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
 import { generateTitle, getAvailableClis, resetSession } from "../utils/ai.js";
-import { hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
-import { getErrorMessage, getErrorStatus } from "../utils/errors.js";
+import { getIndexedListSnapshot, hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
+import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {
   getAppConfig,
@@ -26,7 +28,7 @@ import {
 } from "../utils/provider-paths.js";
 
 const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "iflow"]);
-const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["iflow", "codex", "claude"]);
+const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["codex", "claude"]);
 
 function isResolvedProviderName(name: string): name is ResolvedProviderName {
   return RESOLVED_PROVIDER_NAMES.has(name as ResolvedProviderName);
@@ -43,6 +45,64 @@ function normalizeOptionalPathInput(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function normalizeProjectDisplayPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
+}
+
+function getProjectDisplayScore(project: string, projectKey: string): number {
+  const normalizedProject = normalizeProjectDisplayPath(project);
+  const normalizedProjectKey = normalizeProjectDisplayPath(projectKey);
+  if (!normalizedProject || normalizedProject === normalizedProjectKey) return 0;
+
+  const parts = normalizedProject.split("/").filter(Boolean);
+  if (parts.length === 0) return 0;
+  if (parts.length === 3 && /^[A-Za-z]:$/.test(parts[0] || "") && parts[1] === "Users") {
+    return 1;
+  }
+  return parts.length + 10;
+}
+
+function pickBetterProjectDisplayName(current: string, candidate: string, projectKey: string): string {
+  const normalizedCurrent = normalizeProjectDisplayPath(current || projectKey);
+  const normalizedCandidate = normalizeProjectDisplayPath(candidate || projectKey);
+  if (!normalizedCurrent) return normalizedCandidate;
+  if (!normalizedCandidate) return normalizedCurrent;
+
+  const currentScore = getProjectDisplayScore(normalizedCurrent, projectKey);
+  const candidateScore = getProjectDisplayScore(normalizedCandidate, projectKey);
+  if (candidateScore > currentScore) return normalizedCandidate;
+  if (candidateScore === currentScore && normalizedCandidate.length > normalizedCurrent.length) {
+    return normalizedCandidate;
+  }
+  return normalizedCurrent;
+}
+
+function buildProjectInfosFromConversations(
+  providerName: string,
+  conversations: ConversationMeta[]
+): Array<{ provider: string; projectKey: string; displayName: string }> {
+  const projects = new Map<string, string>();
+
+  for (const conversation of conversations) {
+    const projectKey = conversation.projectKey?.trim() || conversation.project?.trim();
+    if (!projectKey) continue;
+
+    const currentDisplayName = projects.get(projectKey) ?? projectKey;
+    projects.set(
+      projectKey,
+      pickBetterProjectDisplayName(currentDisplayName, conversation.project || projectKey, projectKey)
+    );
+  }
+
+  return [...projects.entries()]
+    .map(([projectKey, displayName]) => ({
+      provider: providerName,
+      projectKey,
+      displayName,
+    }))
+    .sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
 function resolveProviderTitleSyncMode(provider: ConversationProvider | undefined): TitleSyncMode {
@@ -124,8 +184,6 @@ async function persistConversationTitle(
 }
 
 async function resolveConversationTitle(
-  provider: ConversationProvider,
-  id: string,
   currentTitle: string,
   customTitle: string | null | undefined
 ): Promise<string> {
@@ -134,23 +192,46 @@ async function resolveConversationTitle(
     return currentTitle;
   }
 
-  if (!provider.updateTitle) {
-    return normalizedCustomTitle;
-  }
-
-  if (normalizedCustomTitle === currentTitle) {
-    await deleteTitle(id);
-    return currentTitle;
-  }
-
-  try {
-    await provider.updateTitle(id, normalizedCustomTitle);
-    await deleteTitle(id);
-  } catch (error) {
-    logProviderError("conversations.title.sync", provider.name, error);
-  }
-
   return normalizedCustomTitle;
+}
+
+export function buildTitleGenerationMessages(conversation: Conversation): Message[] {
+  const realMessages = conversation.messages.filter((message) => {
+    if (message.role === "tool") return false;
+    if (message.role === "system" && conversation.transcriptMissing) return false;
+    return !!message.content.trim();
+  });
+
+  if (realMessages.length > 0) {
+    return realMessages;
+  }
+
+  if (conversation.titleGenerationHint?.trim()) {
+    return [{
+      role: "user",
+      content: conversation.titleGenerationHint.trim(),
+    }];
+  }
+
+  return conversation.messages.filter((message) => !!message.content.trim());
+}
+
+async function deleteConversationWithCleanup(
+  provider: ConversationProvider,
+  id: string
+): Promise<{ cleanedStale: boolean }> {
+  try {
+    await provider.delete(id);
+    await deleteTitle(id);
+    return { cleanedStale: false };
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+
+    await deleteTitle(id);
+    return { cleanedStale: true };
+  }
 }
 
 export function createConversationRoutes(providers: ConversationProvider[]) {
@@ -299,16 +380,13 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const modelProviderFilter = c.req.query("modelProvider");
     const requireSearchReady = !!search;
 
-    let activeProviders = providers;
-    if (providerFilter !== undefined) {
-      const providerNames = providerFilter
-        .split(",")
-        .map((name) => name.trim())
-        .filter(Boolean);
-      activeProviders = providerNames.length > 0
-        ? providers.filter((p) => providerNames.includes(p.name))
-        : [];
-    }
+    const providerNames = providerFilter !== undefined
+      ? providerFilter
+          .split(",")
+          .map((name) => name.trim())
+          .filter(Boolean)
+      : null;
+    const activeProviderNameSet = new Set(providerNames ?? providers.map((provider) => provider.name));
 
     const customTitles = await getAllTitles();
     const indexedCacheKeys: string[] = [];
@@ -318,11 +396,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       ? modelProviderFilter.split(",").map((name) => name.trim()).filter(Boolean)
       : undefined;
 
-    for (const provider of activeProviders) {
+    for (const provider of providers) {
+      const shouldReportWarning = activeProviderNameSet.has(provider.name);
       try {
         const cacheKey = getProviderListCacheKey(provider);
         if (!(await provider.detect())) {
-          if (requireSearchReady) {
+          if (requireSearchReady && shouldReportWarning) {
             searchWarnings.add(`${provider.displayName} 当前不可用，搜索结果可能不完整`);
           }
           continue;
@@ -338,47 +417,41 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
           indexedCacheKeys.push(cacheKey);
         } else {
           refreshedByProvider.set(provider.name, refreshedItems);
-          if (requireSearchReady) {
+          if (requireSearchReady && shouldReportWarning) {
             searchWarnings.add(`${provider.displayName} 搜索索引尚未就绪，当前仅匹配标题和目录`);
           }
         }
       } catch (error) {
         logProviderError("conversations.list", provider.name, error);
-        if (requireSearchReady) {
+        if (requireSearchReady && shouldReportWarning) {
           searchWarnings.add(`${provider.displayName} 刷新失败，搜索结果可能不完整`);
         }
       }
     }
 
-    const indexedConversations = queryConversationIndex({
+    const indexedConversationsBase = queryConversationIndex({
       cacheKeys: indexedCacheKeys,
       search,
       sort: sort === "createdAt" || sort === "provider" ? sort : "updatedAt",
-      modelProviders: parsedModelProviders,
     });
 
     const indexedProviderSet = new Set(
       indexedCacheKeys.map((cacheKey) => cacheKey.split("::")[0])
     );
+    const filterByModelProviders = (item: ConversationMeta): boolean => {
+      if (item.provider !== "codex") return true;
+      if (!item.modelProvider) return true;
+      if (modelProviderFilter === undefined) return true;
+      if (!parsedModelProviders || parsedModelProviders.length === 0) return false;
+      return parsedModelProviders.includes(item.modelProvider);
+    };
+
     let filteredRefreshed = [...refreshedByProvider.entries()].flatMap(([providerName, items]) => {
       if (indexedProviderSet.has(providerName)) {
         return [];
       }
       return items;
     });
-
-    if (modelProviderFilter !== undefined) {
-      if (parsedModelProviders && parsedModelProviders.length > 0) {
-        const mpSet = new Set(parsedModelProviders);
-        filteredRefreshed = filteredRefreshed.filter((item) => {
-          if (item.provider !== "codex") return true;
-          if (!item.modelProvider) return true;
-          return mpSet.has(item.modelProvider);
-        });
-      } else {
-        filteredRefreshed = filteredRefreshed.filter((item) => item.provider !== "codex" || !item.modelProvider);
-      }
-    }
 
     if (search) {
       filteredRefreshed = filteredRefreshed.filter(
@@ -388,12 +461,32 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       );
     }
 
-    const filtered = (await Promise.all([...indexedConversations, ...filteredRefreshed]
+    const baseConversations = [...indexedConversationsBase, ...filteredRefreshed];
+
+    // Codex provider facet 依赖当前搜索结果，但不受 modelProvider 自身筛选影响。
+    const codexModelProviderCounts: Record<string, number> = {};
+    for (const item of baseConversations) {
+      if (item.provider === "codex" && item.modelProvider) {
+        codexModelProviderCounts[item.modelProvider] = (codexModelProviderCounts[item.modelProvider] ?? 0) + 1;
+      }
+    }
+
+    const providerFacetBase = modelProviderFilter !== undefined
+      ? baseConversations.filter(filterByModelProviders)
+      : baseConversations;
+    const providerCounts: Record<string, number> = {};
+    for (const item of providerFacetBase) {
+      providerCounts[item.provider] = (providerCounts[item.provider] ?? 0) + 1;
+    }
+
+    const filteredBase = providerFilter !== undefined
+      ? providerFacetBase.filter((item) => activeProviderNameSet.has(item.provider))
+      : providerFacetBase;
+
+    const filtered = (await Promise.all(filteredBase
       .map(async (conv) => {
         const provider = providerByName.get(conv.provider);
-        const resolvedTitle = provider
-          ? await resolveConversationTitle(provider, conv.id, conv.title, customTitles[conv.id])
-          : (customTitles[conv.id] ?? conv.title);
+        const resolvedTitle = await resolveConversationTitle(conv.title, customTitles[conv.id]);
         const capabilities = resolveConversationCapabilities(provider);
 
         return {
@@ -414,6 +507,8 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     return c.json({
       total: filtered.length,
       conversations: filtered,
+      providerCounts,
+      codexModelProviderCounts,
       partialSearch: requireSearchReady && searchWarnings.size > 0,
       warnings: [...searchWarnings],
     });
@@ -437,8 +532,6 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         before: Number.isFinite(before) && before! >= 0 ? before : undefined,
       });
       const resolvedTitle = await resolveConversationTitle(
-        provider,
-        id,
         conversation.title,
         await getTitle(id)
       );
@@ -553,8 +646,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         throw new Error("未知的 provider");
       }
 
-      await provider.delete(id);
-      await deleteTitle(id);
+      await deleteConversationWithCleanup(provider, id);
       return id;
     }));
 
@@ -582,9 +674,8 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
 
     try {
-      await provider.delete(id);
-      await deleteTitle(id);
-      return c.json({ success: true });
+      const result = await deleteConversationWithCleanup(provider, id);
+      return c.json({ success: true, cleanedStale: result.cleanedStale });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
@@ -617,7 +708,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
     try {
       const conversation = await provider.read(id);
-      const result = await generateTitle(conversation.messages, {
+      const result = await generateTitle(buildTitleGenerationMessages(conversation), {
         priority: getTitleGenerationCliPriority(),
       });
       await persistConversationTitle(provider, id, result.title);
@@ -660,7 +751,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
       try {
         const conversation = await provider.read(id);
-        const result = await generateTitle(conversation.messages, {
+        const result = await generateTitle(buildTitleGenerationMessages(conversation), {
           priority: getTitleGenerationCliPriority(),
         });
         await persistConversationTitle(provider, id, result.title);
@@ -712,8 +803,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
     for (const p of providers) {
       if (providerFilter && p.name !== providerFilter) continue;
-      if (!p.listProjects) continue;
+
       try {
+        const cacheKey = getProviderListCacheKey(p);
+        const sourceSignature = (await p.getListSourceSignature?.()) ?? undefined;
+        if (hasFreshIndexedListCache(cacheKey, undefined, { sourceSignature })) {
+          const cachedItems = getIndexedListSnapshot(cacheKey);
+          if (cachedItems) {
+            result.push(...buildProjectInfosFromConversations(p.name, cachedItems));
+            continue;
+          }
+        }
+
+        if (!p.listProjects) continue;
         const projects = await p.listProjects();
         for (const pk of projects) {
           result.push({

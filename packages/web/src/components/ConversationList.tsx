@@ -17,14 +17,6 @@ const PROVIDER_BADGE: Record<string, string> = {
   opencode: "bg-cyan-500",
 };
 
-const PROVIDER_LABEL: Record<string, string> = {
-  "claude-code": "Claude Code",
-  codex: "Codex",
-  iflow: "iFlow",
-  "gemini-cli": "Gemini CLI",
-  opencode: "OpenCode",
-};
-
 const FOLDER_COLOR: Record<string, string> = {
   "claude-code": "text-orange-400",
   codex: "text-green-400",
@@ -216,6 +208,21 @@ const ConversationRow = memo(function ConversationRow({
               {conv.modelProvider}
             </span>
           )}
+          {conv.contentStatus === "metadata-only" && (
+            <span className="text-[9px] px-1.5 py-0 rounded-full bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-900/30 dark:text-sky-300 dark:border-sky-700 flex-shrink-0 leading-4">
+              仅 metadata
+            </span>
+          )}
+          {conv.contentStatus === "history-only" && (
+            <span className="text-[9px] px-1.5 py-0 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300 dark:border-indigo-700 flex-shrink-0 leading-4">
+              仅 history
+            </span>
+          )}
+          {conv.cleanupCandidate && (
+            <span className="text-[9px] px-1.5 py-0 rounded-full bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-700 flex-shrink-0 leading-4">
+              残留
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2 mt-0.5">
           <span className="text-xs text-gray-400">
@@ -248,29 +255,6 @@ export const ConversationList = memo(function ConversationList({
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
 
   const groups = useMemo(() => groupByProject(conversations), [conversations]);
-  const duplicateProjectGroupKeys = useMemo(() => {
-    const providersByDisplayPath = new Map<string, Set<string>>();
-
-    for (const group of groups) {
-      const displayPathKey = canonicalizeProjectPath(
-        getProjectPathHint(group.displayPath, group.projectKey)
-      ) || normalizeProjectPath(getProjectPathHint(group.displayPath, group.projectKey)).toLowerCase();
-      const providers = providersByDisplayPath.get(displayPathKey) ?? new Set<string>();
-      providers.add(group.provider);
-      providersByDisplayPath.set(displayPathKey, providers);
-    }
-
-    return new Set(
-      groups
-        .filter((group) => {
-          const displayPathKey = canonicalizeProjectPath(
-            getProjectPathHint(group.displayPath, group.projectKey)
-          ) || normalizeProjectPath(getProjectPathHint(group.displayPath, group.projectKey)).toLowerCase();
-          return (providersByDisplayPath.get(displayPathKey)?.size ?? 0) > 1;
-        })
-        .map((group) => group.key)
-    );
-  }, [groups]);
   const groupSelectionState = useMemo(() => {
     const selectedCountByGroup = new Map<string, number>();
 
@@ -355,7 +339,6 @@ export const ConversationList = memo(function ConversationList({
         const allChecked = selectedCount > 0 && selectedCount === group.ids.length;
         const someChecked = selectedCount > 0 && selectedCount < group.ids.length;
         const isDragTarget = dragOverKey === group.key;
-        const showProviderLabel = duplicateProjectGroupKeys.has(group.key);
 
         return (
           <div
@@ -390,11 +373,6 @@ export const ConversationList = memo(function ConversationList({
               <span className="text-xs font-medium text-gray-600 dark:text-gray-300 truncate">
                 {displayName}
               </span>
-              {showProviderLabel && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-gray-300 text-gray-500 dark:border-gray-600 dark:text-gray-300 flex-shrink-0">
-                  {PROVIDER_LABEL[group.provider] || group.provider}
-                </span>
-              )}
               <span className="text-xs text-gray-400 ml-auto flex-shrink-0">
                 {group.conversations.length}
               </span>
