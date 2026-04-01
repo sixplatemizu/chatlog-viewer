@@ -10,7 +10,6 @@ import {
   type ProviderInfo,
   type ConversationMeta,
   type Conversation,
-  type ConversationListResponse,
   type CodexModelProvider,
 } from "../lib/api";
 import type { ToastPayload } from "../components/ToastViewport";
