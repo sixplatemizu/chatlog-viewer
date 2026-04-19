@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { createConversationRoutes } from "./routes/conversations.js";
+import { createSettingsRoutes } from "./routes/settings.js";
 import { createExportRoutes } from "./routes/export.js";
 import { ClaudeCodeProvider } from "./providers/claude-code.js";
 import { CodexProvider } from "./providers/codex.js";
@@ -75,6 +76,7 @@ export function createApp(providers: ConversationProvider[] = createDefaultProvi
   }));
 
   app.route("/api", createConversationRoutes(providers));
+  app.route("/api", createSettingsRoutes(providers));
   app.route("/api", createExportRoutes(providers));
   app.get("/api/health", (c) => c.json({ status: "ok" }));
 
