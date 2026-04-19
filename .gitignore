@@ -3,3 +3,5 @@ dist/
 .pnpmrc.json
 *.tsbuildinfo
 .ace-tool/
+packages/server/codex.calls.log
+packages/server/codex.session
