@@ -13,6 +13,7 @@ import {
   deleteConversations,
   generateAiTitles,
   moveConversation,
+  moveConversations,
   changeModelProvider,
   changeModelProviders,
   getErrorMessage,
@@ -335,6 +336,65 @@ export default function App() {
     [conversations, ensureModelProviderVisible, pushToast, reloadAllData, selectedIds]
   );
 
+  // 批量移动到同 provider 下的另一个文件夹
+  const handleBatchMove = useCallback(
+    async (targetProjectKey: string) => {
+      const key = targetProjectKey.trim();
+      if (!key || selectedIds.size === 0) return;
+
+      const selectedConversations = conversations.filter((item) => selectedIds.has(item.id));
+      if (selectedConversations.length === 0) return;
+
+      const providerNames = new Set(selectedConversations.map((item) => item.provider));
+      if (providerNames.size > 1) {
+        pushToast({
+          variant: "warning",
+          title: "不支持跨工具批量移动",
+          description: "请只选择同一 CLI 的对话后再批量移动",
+        });
+        return;
+      }
+
+      if (selectedConversations.every((item) => item.projectKey === key)) {
+        pushToast({
+          variant: "info",
+          title: "无需移动",
+          description: "已选对话都在该目录下",
+        });
+        return;
+      }
+
+      try {
+        const res = await moveConversations(
+          selectedConversations.map((item) => item.id),
+          key
+        );
+        if (res.success) {
+          await reloadAllData();
+          pushToast({
+            variant: "info",
+            title: "批量移动完成",
+            description: `已移动 ${res.moved} 条对话`,
+          });
+        } else {
+          pushToast({
+            variant: "error",
+            title: "部分对话移动失败",
+            description: `成功 ${res.moved} 条，失败 ${res.failed} 条${res.failures[0]?.error ? `：${res.failures[0].error}` : ""}`,
+          });
+          await reloadAllData();
+        }
+      } catch (error) {
+        pushToast({
+          variant: "error",
+          title: "批量移动失败",
+          description: getErrorMessage(error, "批量移动失败"),
+        });
+      }
+    },
+    [conversations, pushToast, reloadAllData, selectedIds]
+  );
+
   // 批量 AI 生成标题
   const handleBatchGenerate = useCallback(async () => {
     if (selectedIds.size === 0 || batchGenerating) return;
@@ -488,6 +548,7 @@ export default function App() {
           onBatchDeleteEmpty={handleBatchDeleteEmpty}
           onBatchGenerate={handleBatchGenerate}
           onBatchChangeModelProvider={handleBatchChangeModelProvider}
+          onBatchMove={handleBatchMove}
           batchGenerating={batchGenerating}
           onMoveConversation={handleMoveConversation}
           codexModelProviders={codexModelProviders}

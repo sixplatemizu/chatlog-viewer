@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles, ArrowRightLeft } from "lucide-react";
+import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles, ArrowRightLeft, FolderOpen } from "lucide-react";
 import type { ProviderInfo, ConversationMeta } from "../lib/api";
 import { ConversationList } from "./ConversationList";
 
@@ -35,6 +35,7 @@ interface SidebarProps {
   onBatchDeleteEmpty: () => void;
   onBatchGenerate: () => void;
   onBatchChangeModelProvider: (modelProvider: string) => void;
+  onBatchMove: (targetProjectKey: string) => void;
   batchGenerating: boolean;
   onMoveConversation: (convId: string, targetProjectKey: string, srcProvider: string, targetProvider: string) => void;
   codexModelProviders: string[];
@@ -69,6 +70,7 @@ export function Sidebar({
   onBatchDeleteEmpty,
   onBatchGenerate,
   onBatchChangeModelProvider,
+  onBatchMove,
   batchGenerating,
   onMoveConversation,
   codexModelProviders,
@@ -164,6 +166,42 @@ export function Sidebar({
     codexModelProviders,
     preferredBatchModelProvider,
   ]);
+
+  // 批量移动：仅在全部选中对话来自同一 provider 时可用；目标文件夹从当前列表派生。
+  const [batchMoveTargetOverride, setBatchMoveTargetOverride] = useState("");
+  const selectedProviders = useMemo(
+    () => new Set(selectedConversations.map((item) => item.provider)),
+    [selectedConversations]
+  );
+  const batchMoveProvider = selectedProviders.size === 1 ? [...selectedProviders][0] ?? "" : "";
+  const batchMoveTargets = useMemo(() => {
+    if (!batchMoveProvider) return [] as Array<{ projectKey: string; displayName: string }>;
+    const selectedKeys = new Set(selectedConversations.map((item) => item.projectKey));
+    const seen = new Map<string, string>();
+    for (const conv of conversations) {
+      if (conv.provider !== batchMoveProvider) continue;
+      if (!conv.projectKey) continue;
+      // 不把"全部选中对话的源文件夹"作为目标候选
+      if (selectedKeys.size === 1 && selectedKeys.has(conv.projectKey)) continue;
+      if (!seen.has(conv.projectKey)) {
+        seen.set(conv.projectKey, conv.project || conv.projectKey);
+      }
+    }
+    return [...seen.entries()]
+      .map(([projectKey, displayName]) => ({ projectKey, displayName }))
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }, [batchMoveProvider, conversations, selectedConversations]);
+  const batchMoveSupported = batchMoveProvider !== "" && batchMoveTargets.length > 0;
+  const batchMoveTarget = useMemo(() => {
+    if (!batchMoveSupported) return "";
+    if (
+      batchMoveTargetOverride
+      && batchMoveTargets.some((item) => item.projectKey === batchMoveTargetOverride)
+    ) {
+      return batchMoveTargetOverride;
+    }
+    return batchMoveTargets[0]?.projectKey ?? "";
+  }, [batchMoveSupported, batchMoveTargetOverride, batchMoveTargets]);
 
   return (
     <div className="w-80 border-r border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col h-full">
@@ -364,6 +402,37 @@ export function Sidebar({
           {!batchModelProviderSupported && hasSelectedNonCodexConversation && (
             <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
               批量 provider 切换目前仅支持 Codex 对话
+            </div>
+          )}
+
+          {batchMoveSupported && (
+            <div className="mt-2 flex items-center gap-1.5 rounded-lg border border-blue-200 bg-white/80 px-2 py-2 dark:border-blue-800 dark:bg-gray-800/80">
+              <FolderOpen className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+              <select
+                aria-label="批量移动目标文件夹"
+                value={batchMoveTarget}
+                onChange={(e) => setBatchMoveTargetOverride(e.target.value)}
+                className="min-w-0 flex-1 rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 outline-none transition focus:ring-2 focus:ring-blue-400 dark:border-blue-700 dark:bg-blue-900/30 dark:text-blue-300"
+              >
+                {batchMoveTargets.map((item) => (
+                  <option key={item.projectKey} value={item.projectKey}>
+                    {item.displayName}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={() => onBatchMove(batchMoveTarget)}
+                disabled={!batchMoveTarget}
+                className="rounded-md bg-blue-600 px-2.5 py-1 text-xs text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                移动到
+              </button>
+            </div>
+          )}
+
+          {!batchMoveSupported && selectedProviders.size > 1 && (
+            <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              批量移动仅支持来自同一 CLI 的对话
             </div>
           )}
         </div>

@@ -793,6 +793,59 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     }
   });
 
+  // 批量移动对话到同一 provider 下的指定项目文件夹
+  app.post("/conversations/move/batch", async (c) => {
+    const body = await c.req.json<{ ids?: unknown; targetProjectKey?: unknown }>();
+    if (!Array.isArray(body?.ids)) {
+      return c.json({ error: "ids 必须是数组" }, 400);
+    }
+    if (typeof body.targetProjectKey !== "string" || !body.targetProjectKey.trim()) {
+      return c.json({ error: "目标文件夹不能为空" }, 400);
+    }
+
+    const ids = [...new Set(
+      body.ids
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )];
+    if (ids.length === 0) {
+      return c.json({ error: "待移动对话不能为空" }, 400);
+    }
+
+    // 要求所有对话来自同一 provider —— 不同 provider 的 projectKey 语义不一致。
+    const providerNames = new Set(ids.map((id) => id.split(":")[0]));
+    if (providerNames.size > 1) {
+      return c.json({ error: "批量移动仅支持来自同一 CLI 的对话" }, 400);
+    }
+
+    const providerName = [...providerNames][0];
+    const provider = providers.find((p) => p.name === providerName);
+    if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    if (!provider.move) return c.json({ error: `${provider.displayName} 不支持移动对话` }, 400);
+
+    const targetProjectKey = body.targetProjectKey.trim();
+    const settled = await Promise.allSettled(ids.map(async (id) => {
+      await provider.move!(id, targetProjectKey);
+      return id;
+    }));
+
+    const failures = settled.flatMap((result, index) => {
+      if (result.status === "fulfilled") return [];
+      return [{
+        id: ids[index] || "",
+        error: getErrorMessage(result.reason),
+      }];
+    });
+
+    return c.json({
+      success: failures.length === 0,
+      moved: ids.length - failures.length,
+      failed: failures.length,
+      failures,
+    });
+  });
+
   // 列出某个 provider 的所有项目文件夹
   app.get("/projects", async (c) => {
     const providerFilter = c.req.query("provider");

@@ -433,6 +433,20 @@ export async function moveConversation(
   );
 }
 
+export async function moveConversations(
+  ids: string[],
+  targetProjectKey: string
+): Promise<{ success: boolean; moved: number; failed: number; failures: BatchOperationFailure[] }> {
+  return requestJson<{ success: boolean; moved: number; failed: number; failures: BatchOperationFailure[] }>(
+    `${BASE}/conversations/move/batch`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids, targetProjectKey }),
+    }
+  );
+}
+
 export async function fetchCodexProviders(signal?: AbortSignal): Promise<string[]> {
   return requestJson<string[]>(`${BASE}/codex-providers`, { signal });
 }
