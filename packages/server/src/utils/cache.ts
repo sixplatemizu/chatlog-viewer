@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, statSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { createRequire } from "module";
@@ -1313,5 +1313,35 @@ export function invalidateListCache(cacheKey: string): void {
     database.prepare("DELETE FROM conversation_search_chunk WHERE cache_key = ?").run(cacheKey);
   } catch {
     // 忽略持久化层失败
+  }
+}
+
+// 压缩缓存 DB：回收 FTS5 删除墓碑 + VACUUM。
+// FTS5 的 DELETE trigger 只写 tombstone，长期积累会让 *_fts_data 表膨胀到
+// 远大于实际内容体积。启动时执行一次 optimize + VACUUM 可以把空间回收到合理水位。
+export function compactCacheDb(): { before: number; after: number } | null {
+  try {
+    const path = getDbPath();
+    const statBefore = statSync(path);
+    const database = getDb();
+
+    // FTS5 optimize 需要在非事务上下文里执行
+    try {
+      database.exec("INSERT INTO conversation_index_fts(conversation_index_fts) VALUES('optimize')");
+    } catch {
+      // FTS 表可能尚未创建（测试 / 首次启动）
+    }
+    try {
+      database.exec("INSERT INTO conversation_search_chunk_fts(conversation_search_chunk_fts) VALUES('optimize')");
+    } catch {
+      // 同上
+    }
+
+    database.exec("VACUUM");
+
+    const statAfter = statSync(path);
+    return { before: statBefore.size, after: statAfter.size };
+  } catch {
+    return null;
   }
 }

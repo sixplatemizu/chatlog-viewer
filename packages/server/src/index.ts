@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { createApp, DEFAULT_SERVER_HOSTNAME } from "./app.js";
+import { compactCacheDb } from "./utils/cache.js";
 
 const app = createApp();
 const parsedPort = Number.parseInt(process.env.PORT || "3456", 10);
@@ -10,4 +11,17 @@ serve({
   fetch: app.fetch,
   hostname: DEFAULT_SERVER_HOSTNAME,
   port,
+});
+
+// 启动后异步压缩缓存 DB，回收 FTS5 墓碑。不阻塞请求处理。
+setImmediate(() => {
+  const result = compactCacheDb();
+  if (result) {
+    const beforeMb = (result.before / 1024 / 1024).toFixed(1);
+    const afterMb = (result.after / 1024 / 1024).toFixed(1);
+    const saved = ((result.before - result.after) / 1024 / 1024).toFixed(1);
+    if (result.before - result.after > 1024 * 1024) {
+      console.log(`缓存压缩完成: ${beforeMb} MB → ${afterMb} MB（回收 ${saved} MB）`);
+    }
+  }
 });
