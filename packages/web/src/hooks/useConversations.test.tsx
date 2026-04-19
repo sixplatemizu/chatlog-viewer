@@ -141,14 +141,15 @@ describe("useConversations", () => {
     expect(mockFetchConversation).not.toHaveBeenCalled();
   });
 
-  it("初始化时会用 Codex provider 列表填充 provider 计数", async () => {
+  it("列表接口返回 codexModelProviderCounts 时写入 state", async () => {
     mockFetchCodexProviders.mockResolvedValue([
-      { name: "v", count: 2 },
-      { name: "custom", count: 1 },
+      "v",
+      "custom",
     ]);
     mockFetchConversations.mockResolvedValue({
       total: 3,
       conversations: [createConversation("codex:1")],
+      codexModelProviderCounts: { v: 2, custom: 1 },
       partialSearch: false,
       warnings: [],
     } satisfies ConversationListResponse);
@@ -165,10 +166,10 @@ describe("useConversations", () => {
     });
   });
 
-  it("列表接口缺少 provider 计数字段时会回退到当前 provider 列表计数", async () => {
+  it("列表接口缺少 provider 计数字段时 state 为空对象", async () => {
     mockFetchCodexProviders.mockResolvedValue([
-      { name: "v", count: 2 },
-      { name: "custom", count: 1 },
+      "v",
+      "custom",
     ]);
     mockFetchConversations.mockResolvedValue({
       total: 1,
@@ -183,16 +184,13 @@ describe("useConversations", () => {
       expect(result.current.conversations).toHaveLength(1);
     });
 
-    expect(result.current.codexModelProviderCounts).toEqual({
-      v: 2,
-      custom: 1,
-    });
+    expect(result.current.codexModelProviderCounts).toEqual({});
   });
 
   it("ensureModelProviderVisible 会把新 provider 加入当前过滤集合", async () => {
     mockFetchCodexProviders.mockResolvedValue([
-      { name: "v", count: 1 },
-      { name: "custom", count: 1 },
+      "v",
+      "custom",
     ]);
     mockFetchConversations.mockResolvedValue({
       total: 1,

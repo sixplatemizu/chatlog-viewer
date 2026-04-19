@@ -84,7 +84,7 @@ describe("ConversationViewer", () => {
         onMessageUpdated={() => {}}
         onMessagesDeleted={onMessagesDeleted}
         onNotify={onNotify}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
       />
     );
@@ -127,7 +127,7 @@ describe("ConversationViewer", () => {
         onMessageUpdated={() => {}}
         onMessagesDeleted={() => {}}
         onNotify={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
       />
     );
@@ -168,7 +168,7 @@ describe("ConversationViewer", () => {
         onMessageUpdated={() => {}}
         onMessagesDeleted={() => {}}
         onNotify={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
       />
     );
@@ -207,7 +207,7 @@ describe("ConversationViewer", () => {
         onMessageUpdated={() => {}}
         onMessagesDeleted={() => {}}
         onNotify={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
       />
     );
@@ -245,7 +245,7 @@ describe("ConversationViewer", () => {
         onMessageUpdated={() => {}}
         onMessagesDeleted={() => {}}
         onNotify={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
       />
     );
@@ -327,7 +327,7 @@ describe("ConversationViewer", () => {
         onMessageUpdated={() => {}}
         onMessagesDeleted={() => {}}
         onNotify={() => {}}
-        codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
       />
     );

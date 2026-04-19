@@ -433,13 +433,8 @@ export async function moveConversation(
   );
 }
 
-export interface CodexModelProvider {
-  name: string;
-  count: number;
-}
-
-export async function fetchCodexProviders(signal?: AbortSignal): Promise<CodexModelProvider[]> {
-  return requestJson<CodexModelProvider[]>(`${BASE}/codex-providers`, { signal });
+export async function fetchCodexProviders(signal?: AbortSignal): Promise<string[]> {
+  return requestJson<string[]>(`${BASE}/codex-providers`, { signal });
 }
 
 export async function changeModelProvider(

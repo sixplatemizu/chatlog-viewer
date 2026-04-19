@@ -13,7 +13,7 @@ import {
   Loader2,
   ArrowRightLeft,
 } from "lucide-react";
-import type { Conversation, CodexModelProvider, TitleSyncMode } from "../lib/api";
+import type { Conversation, TitleSyncMode } from "../lib/api";
 import {
   updateTitle,
   generateAiTitle,
@@ -39,7 +39,7 @@ interface Props {
   onMessageUpdated: (id: string, messageId: string, content: string) => void | Promise<void>;
   onMessagesDeleted: (id: string, messageIds: string[]) => void | Promise<void>;
   onNotify: (toast: ToastPayload) => void;
-  codexModelProviders: CodexModelProvider[];
+  codexModelProviders: string[];
   onChangeModelProvider: (id: string, newProvider: string) => void;
 }
 
@@ -448,9 +448,9 @@ export function ConversationViewer({
                     title="切换 Codex Model Provider"
                     style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 24 24' fill='none' stroke='%2322c55e' stroke-width='3'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
                   >
-                    {codexModelProviders.map((mp) => (
-                      <option key={mp.name} value={mp.name}>
-                        {mp.name}
+                    {codexModelProviders.map((name) => (
+                      <option key={name} value={name}>
+                        {name}
                       </option>
                     ))}
                   </select>

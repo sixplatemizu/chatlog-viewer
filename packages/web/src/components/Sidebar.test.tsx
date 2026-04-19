@@ -41,7 +41,7 @@ function createConversation(partial: Partial<ConversationMeta> & Pick<Conversati
 }
 
 describe("Sidebar", () => {
-  it("未选择 provider 时回退显示 provider 列表中的对话数", () => {
+  it("Codex provider pill 显示 codexModelProviderCounts 中的对话数", () => {
     render(
       <Sidebar
         providers={providers}
@@ -73,10 +73,10 @@ describe("Sidebar", () => {
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviderCounts={{}}
+        codexModelProviderCounts={{ openai: 2, azure: 1 }}
         codexModelProviders={[
-          { name: "openai", count: 2 },
-          { name: "azure", count: 1 },
+          "openai",
+          "azure",
         ]}
         activeModelProviders={new Set()}
         onToggleModelProvider={() => {}}
@@ -165,8 +165,8 @@ describe("Sidebar", () => {
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{}} codexModelProviders={[
-          { name: "openai", count: 2 },
-          { name: "azure", count: 1 },
+          "openai",
+          "azure",
         ]}
         activeModelProviders={new Set(["openai", "azure"])}
         onToggleModelProvider={() => {}}
@@ -182,7 +182,7 @@ describe("Sidebar", () => {
     expect(onBatchChangeModelProvider).toHaveBeenCalledWith("azure");
   });
 
-  it("未选择 provider 时回退显示 Codex provider 总数", () => {
+  it("Codex provider pill 使用列表接口返回的 codexModelProviderCounts", () => {
     render(
       <Sidebar
         providers={providers}
@@ -210,10 +210,10 @@ describe("Sidebar", () => {
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviderCounts={{}}
+        codexModelProviderCounts={{ openai: 2, azure: 1 }}
         codexModelProviders={[
-          { name: "openai", count: 2 },
-          { name: "azure", count: 1 },
+          "openai",
+          "azure",
         ]}
         activeModelProviders={new Set(["openai", "azure"])}
         onToggleModelProvider={() => {}}
@@ -257,7 +257,7 @@ describe("Sidebar", () => {
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviderCounts={{}} codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviderCounts={{}} codexModelProviders={["openai"]}
         activeModelProviders={new Set(["openai"])}
         onToggleModelProvider={() => {}}
         partialSearch={false}
@@ -302,7 +302,7 @@ describe("Sidebar", () => {
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviderCounts={{}} codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviderCounts={{}} codexModelProviders={["openai"]}
         activeModelProviders={new Set(["openai"])}
         onToggleModelProvider={() => {}}
         partialSearch={false}
@@ -355,7 +355,7 @@ describe("Sidebar", () => {
         onBatchChangeModelProvider={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
-        codexModelProviderCounts={{}} codexModelProviders={[{ name: "openai", count: 1 }]}
+        codexModelProviderCounts={{}} codexModelProviders={["openai"]}
         activeModelProviders={new Set(["openai"])}
         onToggleModelProvider={() => {}}
         partialSearch={false}

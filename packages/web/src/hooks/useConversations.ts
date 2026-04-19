@@ -10,7 +10,6 @@ import {
   type ProviderInfo,
   type ConversationMeta,
   type Conversation,
-  type CodexModelProvider,
 } from "../lib/api";
 import type { ToastPayload } from "../components/ToastViewport";
 
@@ -31,19 +30,12 @@ function resolveActiveProviders(current: Set<string>, providerList: ProviderInfo
 
 function resolveActiveModelProviders(
   current: Set<string>,
-  modelProviders: CodexModelProvider[]
+  modelProviders: string[]
 ): Set<string> {
-  const availableNames = modelProviders.map((provider) => provider.name);
-  if (current.size === 0) return new Set(availableNames);
+  if (current.size === 0) return new Set(modelProviders);
 
-  const preserved = availableNames.filter((name) => current.has(name));
-  return new Set(preserved.length > 0 ? preserved : availableNames);
-}
-
-function buildModelProviderCountMap(
-  modelProviders: CodexModelProvider[]
-): Record<string, number> {
-  return Object.fromEntries(modelProviders.map((provider) => [provider.name, provider.count]));
+  const preserved = modelProviders.filter((name) => current.has(name));
+  return new Set(preserved.length > 0 ? preserved : modelProviders);
 }
 
 function buildProviderCountMap(providerList: ProviderInfo[]): Record<string, number> {
@@ -64,7 +56,7 @@ function buildConversationProviderCountMap(
 function getModelProviderParam(
   activeProviders: Set<string>,
   activeModelProviders: Set<string>,
-  modelProviders: CodexModelProvider[]
+  modelProviders: string[]
 ): string | undefined {
   if (!activeProviders.has("codex") || modelProviders.length === 0) {
     return undefined;
@@ -116,7 +108,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [codexModelProviders, setCodexModelProviders] = useState<CodexModelProvider[]>([]);
+  const [codexModelProviders, setCodexModelProviders] = useState<string[]>([]);
   const [activeModelProviders, setActiveModelProviders] = useState<Set<string>>(new Set());
   const [partialSearch, setPartialSearch] = useState(false);
   const [searchWarnings, setSearchWarnings] = useState<string[]>([]);
@@ -166,7 +158,6 @@ export function useConversations(options: UseConversationsOptions = {}) {
       ...prev,
     }));
     setCodexModelProviders(modelProviders);
-    setCodexModelProviderCounts(buildModelProviderCountMap(modelProviders));
     setActiveModelProviders(nextActiveModelProviders);
     activeProvidersRef.current = nextActiveProviders;
     activeModelProvidersRef.current = nextActiveModelProviders;
@@ -207,7 +198,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
     overrides?: {
       providerList?: ProviderInfo[];
       activeProviderSet?: Set<string>;
-      modelProviders?: CodexModelProvider[];
+      modelProviders?: string[];
       activeModelProviderSet?: Set<string>;
     }
   ) => {
@@ -242,9 +233,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
       );
       setPartialSearch(!!data.partialSearch);
       setSearchWarnings(data.warnings ?? []);
-      setCodexModelProviderCounts(
-        data.codexModelProviderCounts ?? buildModelProviderCountMap(currentModelProviders)
-      );
+      setCodexModelProviderCounts(data.codexModelProviderCounts ?? {});
       return data;
     } catch (error) {
       if (!isAbortError(error)) {

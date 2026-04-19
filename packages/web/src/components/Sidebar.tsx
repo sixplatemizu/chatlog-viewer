@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles, ArrowRightLeft } from "lucide-react";
-import type { ProviderInfo, ConversationMeta, CodexModelProvider } from "../lib/api";
+import type { ProviderInfo, ConversationMeta } from "../lib/api";
 import { ConversationList } from "./ConversationList";
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -37,7 +37,7 @@ interface SidebarProps {
   onBatchChangeModelProvider: (modelProvider: string) => void;
   batchGenerating: boolean;
   onMoveConversation: (convId: string, targetProjectKey: string, srcProvider: string, targetProvider: string) => void;
-  codexModelProviders: CodexModelProvider[];
+  codexModelProviders: string[];
   codexModelProviderCounts: Record<string, number>;
   activeModelProviders: Set<string>;
   onToggleModelProvider: (name: string) => void;
@@ -80,6 +80,19 @@ export function Sidebar({
 }: SidebarProps) {
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
   const [batchModelProviderOverride, setBatchModelProviderOverride] = useState("");
+
+  // Codex 筛选标签名单：以 SQLite 列表为基础，并补上仅在实际对话中出现的 provider。
+  const filterablePillNames = useMemo(() => {
+    const names: string[] = [...codexModelProviders];
+    const seen = new Set(names);
+    for (const name of Object.keys(codexModelProviderCounts)) {
+      if (!seen.has(name)) {
+        names.push(name);
+        seen.add(name);
+      }
+    }
+    return names;
+  }, [codexModelProviderCounts, codexModelProviders]);
 
   const footerText = useMemo(() => {
     const parts = providers
@@ -131,16 +144,16 @@ export function Sidebar({
     if (codexModelProviders.length === 0) return "";
     if (selectedCodexModelProviders.length === 1) {
       const currentProvider = selectedCodexModelProviders[0];
-      return codexModelProviders.find((item) => item.name !== currentProvider)?.name ?? currentProvider;
+      return codexModelProviders.find((name) => name !== currentProvider) ?? currentProvider;
     }
-    return codexModelProviders[0]?.name ?? "";
+    return codexModelProviders[0] ?? "";
   }, [codexModelProviders, selectedCodexModelProviders]);
 
   const batchModelProvider = useMemo(() => {
     if (!batchModelProviderSupported) return "";
     if (
       batchModelProviderOverride
-      && codexModelProviders.some((item) => item.name === batchModelProviderOverride)
+      && codexModelProviders.includes(batchModelProviderOverride)
     ) {
       return batchModelProviderOverride;
     }
@@ -214,28 +227,28 @@ export function Sidebar({
           ))}
         </div>
 
-        {activeProviders.has("codex") && codexModelProviders.length > 0 && (
+        {activeProviders.has("codex") && filterablePillNames.length > 0 && (
           <div className="mt-2 pt-2 border-t border-gray-100 dark:border-gray-600">
             <div className="text-[10px] text-gray-400 dark:text-gray-500 mb-1.5">Codex Provider</div>
             <div className="flex flex-wrap gap-1">
-              {codexModelProviders.map((mp) => (
+              {filterablePillNames.map((name) => (
                 <button
-                  key={mp.name}
-                  onClick={() => onToggleModelProvider(mp.name)}
+                  key={name}
+                  onClick={() => onToggleModelProvider(name)}
                   className={`
                     text-[10px] px-2 py-0.5 rounded-full border transition-all
                     ${
-                      activeModelProviders.has(mp.name)
+                      activeModelProviders.has(name)
                         ? "bg-green-50 text-green-700 border-green-300 dark:bg-green-900/30 dark:text-green-300 dark:border-green-700"
                         : "bg-gray-50 dark:bg-gray-700 text-gray-400 border-gray-200 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600"
                     }
                   `}
                 >
-                  {mp.name}
-                  <span className="ml-0.5 opacity-60">{codexModelProviderCounts[mp.name] ?? mp.count ?? 0}</span>
+                  {name}
+                  <span className="ml-0.5 opacity-60">{codexModelProviderCounts[name] ?? 0}</span>
                 </button>
               ))}
-            </div>
+          </div>
           </div>
         )}
 
@@ -332,9 +345,9 @@ export function Sidebar({
                 onChange={(e) => setBatchModelProviderOverride(e.target.value)}
                 className="min-w-0 flex-1 rounded-md border border-green-200 bg-green-50 px-2 py-1 text-xs text-green-700 outline-none transition focus:ring-2 focus:ring-green-400 dark:border-green-700 dark:bg-green-900/30 dark:text-green-300"
               >
-                {codexModelProviders.map((item) => (
-                  <option key={item.name} value={item.name}>
-                    {item.name}
+                {codexModelProviders.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
                   </option>
                 ))}
               </select>

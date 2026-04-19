@@ -457,6 +457,8 @@ export class CodexProvider implements ConversationProvider {
 
   private db: BetterSqlite3.Database | null = null;
   private dbPath: string | null = null;
+  private writeDb: BetterSqlite3.Database | null = null;
+  private writeDbPath: string | null = null;
   private backgroundRefreshes = new Map<string, Promise<void>>();
 
   private getStateDbPath(): string {
@@ -469,6 +471,30 @@ export class CodexProvider implements ConversationProvider {
       this.db = null;
     }
     this.dbPath = null;
+    this.closeWriteDb();
+  }
+
+  private closeWriteDb(): void {
+    if (this.writeDb) {
+      this.writeDb.close();
+      this.writeDb = null;
+    }
+    this.writeDbPath = null;
+  }
+
+  // 写入前统一通过该方法获取 writable handle。
+  // 同一个 dbPath 会在进程生命周期内复用；切换路径时重建。
+  // 打开写连接前关闭 readonly handle 避免锁冲突。
+  private getWriteDb(options: { fileMustExist?: boolean } = {}): BetterSqlite3.Database {
+    const dbPath = this.getStateDbPath();
+    if (this.writeDb && this.writeDbPath === dbPath) return this.writeDb;
+
+    this.closeWriteDb();
+    this.closeDb();
+
+    this.writeDb = new Database(dbPath, options.fileMustExist ? { fileMustExist: true } : undefined);
+    this.writeDbPath = dbPath;
+    return this.writeDb;
   }
 
   private getDb(): BetterSqlite3.Database | null {
@@ -548,54 +574,47 @@ export class CodexProvider implements ConversationProvider {
   }
 
   private deleteThreadFromStateDb(sessionId: string): boolean {
-    const dbPath = this.getStateDbPath();
-    this.closeDb();
-
     let db: BetterSqlite3.Database;
     try {
-      db = new Database(dbPath, { fileMustExist: true });
+      db = this.getWriteDb({ fileMustExist: true });
     } catch {
       return false;
     }
 
-    try {
-      const tableNames = new Set(
-        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).
-          map((row) => row.name)
-      );
-      const relatedDeletes = [
-        { table: "thread_dynamic_tools", columns: ["thread_id"] },
-        { table: "stage1_outputs", columns: ["thread_id"] },
-        { table: "thread_spawn_edges", columns: ["child_thread_id", "parent_thread_id"] },
-        { table: "agent_job_items", columns: ["assigned_thread_id"] },
-        { table: "logs", columns: ["thread_id"] },
-      ];
+    const tableNames = new Set(
+      (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).
+        map((row) => row.name)
+    );
+    const relatedDeletes = [
+      { table: "thread_dynamic_tools", columns: ["thread_id"] },
+      { table: "stage1_outputs", columns: ["thread_id"] },
+      { table: "thread_spawn_edges", columns: ["child_thread_id", "parent_thread_id"] },
+      { table: "agent_job_items", columns: ["assigned_thread_id"] },
+      { table: "logs", columns: ["thread_id"] },
+    ];
 
-      const deleteTransaction = db.transaction((targetSessionId: string) => {
-        let changes = 0;
+    const deleteTransaction = db.transaction((targetSessionId: string) => {
+      let changes = 0;
 
-        for (const item of relatedDeletes) {
-          if (!tableNames.has(item.table)) continue;
-          const columns = this.getTableColumns(db, item.table);
-          for (const column of item.columns) {
-            if (!columns.has(column)) continue;
-            const result = db.prepare(`DELETE FROM ${item.table} WHERE ${column} = ?`).run(targetSessionId);
-            changes += result.changes;
-          }
-        }
-
-        if (tableNames.has("threads") && this.getTableColumns(db, "threads").has("id")) {
-          const result = db.prepare("DELETE FROM threads WHERE id = ?").run(targetSessionId);
+      for (const item of relatedDeletes) {
+        if (!tableNames.has(item.table)) continue;
+        const columns = this.getTableColumns(db, item.table);
+        for (const column of item.columns) {
+          if (!columns.has(column)) continue;
+          const result = db.prepare(`DELETE FROM ${item.table} WHERE ${column} = ?`).run(targetSessionId);
           changes += result.changes;
         }
+      }
 
-        return changes;
-      });
+      if (tableNames.has("threads") && this.getTableColumns(db, "threads").has("id")) {
+        const result = db.prepare("DELETE FROM threads WHERE id = ?").run(targetSessionId);
+        changes += result.changes;
+      }
 
-      return deleteTransaction(sessionId) > 0;
-    } finally {
-      db.close();
-    }
+      return changes;
+    });
+
+    return deleteTransaction(sessionId) > 0;
   }
 
   private listThreadsFromStateDb(): CodexThreadRow[] {
@@ -701,19 +720,12 @@ export class CodexProvider implements ConversationProvider {
       throw new Error("标题不能为空");
     }
 
-    const dbPath = this.getStateDbPath();
-    this.closeDb();
-
-    const db = new Database(dbPath);
-    try {
-      const result = options?.updateTitleField === false
-        ? db.prepare("UPDATE threads SET first_user_message = ? WHERE id = ?").run(normalizedTitle, sessionId)
-        : db.prepare("UPDATE threads SET title = ?, first_user_message = ? WHERE id = ?").run(normalizedTitle, normalizedTitle, sessionId);
-      if (result.changes === 0) {
-        throw new Error(`SQLite 中未找到对话: ${sessionId}`);
-      }
-    } finally {
-      db.close();
+    const db = this.getWriteDb();
+    const result = options?.updateTitleField === false
+      ? db.prepare("UPDATE threads SET first_user_message = ? WHERE id = ?").run(normalizedTitle, sessionId)
+      : db.prepare("UPDATE threads SET title = ?, first_user_message = ? WHERE id = ?").run(normalizedTitle, normalizedTitle, sessionId);
+    if (result.changes === 0) {
+      throw new Error(`SQLite 中未找到对话: ${sessionId}`);
     }
   }
 
@@ -1128,41 +1140,34 @@ export class CodexProvider implements ConversationProvider {
       rolloutPath?: string | null;
     }
   ): boolean {
-    const dbPath = this.getStateDbPath();
-    this.closeDb();
-
     let db: BetterSqlite3.Database;
     try {
-      db = new Database(dbPath, { fileMustExist: true });
+      db = this.getWriteDb({ fileMustExist: true });
     } catch {
       return false;
     }
 
-    try {
-      const columns = this.getTableColumns(db, "threads");
-      if (columns.size === 0) return false;
+    const columns = this.getTableColumns(db, "threads");
+    if (columns.size === 0) return false;
 
-      const assignments: string[] = [];
-      const values: unknown[] = [];
+    const assignments: string[] = [];
+    const values: unknown[] = [];
 
-      if (updates.cwd !== undefined && columns.has("cwd")) {
-        assignments.push("cwd = ?");
-        values.push(formatCodexStoredPath(updates.cwd) ?? updates.cwd);
-      }
-
-      if (updates.rolloutPath !== undefined && columns.has("rollout_path")) {
-        assignments.push("rollout_path = ?");
-        values.push(updates.rolloutPath ? formatCodexStoredPath(updates.rolloutPath) ?? updates.rolloutPath : "");
-      }
-
-      if (assignments.length === 0) return false;
-
-      values.push(sessionId);
-      const result = db.prepare(`UPDATE threads SET ${assignments.join(", ")} WHERE id = ?`).run(...values);
-      return result.changes > 0;
-    } finally {
-      db.close();
+    if (updates.cwd !== undefined && columns.has("cwd")) {
+      assignments.push("cwd = ?");
+      values.push(formatCodexStoredPath(updates.cwd) ?? updates.cwd);
     }
+
+    if (updates.rolloutPath !== undefined && columns.has("rollout_path")) {
+      assignments.push("rollout_path = ?");
+      values.push(updates.rolloutPath ? formatCodexStoredPath(updates.rolloutPath) ?? updates.rolloutPath : "");
+    }
+
+    if (assignments.length === 0) return false;
+
+    values.push(sessionId);
+    const result = db.prepare(`UPDATE threads SET ${assignments.join(", ")} WHERE id = ?`).run(...values);
+    return result.changes > 0;
   }
 
   private findThreadFromStateDb(sessionId: string): CodexThreadRow | null {
@@ -1514,13 +1519,16 @@ export class CodexProvider implements ConversationProvider {
     return [...cwds];
   }
 
-  // 列出所有 model_provider 及对话数
-  listModelProviders(): { name: string; count: number }[] {
+  // 列出 SQLite 中存在的 model_provider 名称（用于迁移目标列表）。
+  // 不返回计数：SQLite 会保留大量空 session，估值远高于实际有效对话数。
+  listModelProviders(): string[] {
     const db = this.getDb();
     if (!db) return [];
     try {
-      const rows = db.prepare("SELECT model_provider, COUNT(*) as count FROM threads GROUP BY model_provider ORDER BY count DESC").all() as { model_provider: string; count: number }[];
-      return rows.map((r) => ({ name: r.model_provider, count: r.count }));
+      const rows = db
+        .prepare("SELECT DISTINCT model_provider FROM threads ORDER BY model_provider")
+        .all() as { model_provider: string }[];
+      return rows.map((r) => r.model_provider);
     } catch {
       return [];
     }
@@ -1560,25 +1568,18 @@ export class CodexProvider implements ConversationProvider {
       })
     );
 
-    const dbPath = this.getStateDbPath();
-    this.closeDb();
-
-    const db = new Database(dbPath);
-    try {
-      const updateStatement = db.prepare("UPDATE threads SET model_provider = ? WHERE id = ?");
-      const updateMany = db.transaction((targetSessionIds: string[]) => {
-        for (const sessionId of targetSessionIds) {
-          const result = updateStatement.run(normalizedProvider, sessionId);
-          if (result.changes === 0) {
-            throw new Error(`SQLite 中未找到对话: ${sessionId}`);
-          }
+    const db = this.getWriteDb();
+    const updateStatement = db.prepare("UPDATE threads SET model_provider = ? WHERE id = ?");
+    const updateMany = db.transaction((targetSessionIds: string[]) => {
+      for (const sessionId of targetSessionIds) {
+        const result = updateStatement.run(normalizedProvider, sessionId);
+        if (result.changes === 0) {
+          throw new Error(`SQLite 中未找到对话: ${sessionId}`);
         }
-      });
+      }
+    });
 
-      updateMany(sessionIds);
-    } finally {
-      db.close();
-    }
+    updateMany(sessionIds);
 
     for (const filePath of new Set(filePaths.filter((item): item is string => !!item))) {
       invalidateCache(filePath);
