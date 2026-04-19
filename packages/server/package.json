@@ -10,10 +10,10 @@
     "bench:search-index": "tsx src/bench/search-index.ts"
   },
   "dependencies": {
-    "hono": "^4.7.5",
-    "@hono/node-server": "^1.14.1",
+    "@hono/node-server": "^1.19.14",
+    "better-sqlite3": "^11.8.1",
     "glob": "^11.0.1",
-    "better-sqlite3": "^11.8.1"
+    "hono": "^4.12.14"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
