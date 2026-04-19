@@ -379,7 +379,7 @@ export function ConversationViewer({
   return (
     <div className="flex-1 flex flex-col h-full min-w-0 bg-white dark:bg-gray-900">
       <div className="border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-4 py-3 flex-shrink-0">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             {editing ? (
               <div className="flex items-center gap-2">
@@ -417,13 +417,13 @@ export function ConversationViewer({
               </div>
             )}
 
-            <div className="flex items-center gap-3 mt-1 text-xs text-gray-500 dark:text-gray-400">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-gray-500 dark:text-gray-400">
               <span
-                className="flex items-center gap-1"
+                className="flex items-center gap-1 min-w-0 max-w-full"
                 title={getProjectPathHint(conversation.project, conversation.projectKey)}
               >
-                <FolderOpen className="w-3.5 h-3.5" />
-                {getProjectName(conversation.project, conversation.projectKey)}
+                <FolderOpen className="w-3.5 h-3.5 flex-shrink-0" />
+                <span className="truncate">{getProjectName(conversation.project, conversation.projectKey)}</span>
               </span>
               <span className="flex items-center gap-1">
                 <Clock className="w-3.5 h-3.5" />
@@ -491,7 +491,7 @@ export function ConversationViewer({
               )}
             </div>
           </div>
-          <div className="flex items-center gap-2 ml-3 flex-shrink-0">
+          <div className="flex flex-wrap items-center gap-2 flex-shrink-0">
             {selectionMode ? (
               <>
                 <button

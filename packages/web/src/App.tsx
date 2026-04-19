@@ -80,6 +80,20 @@ export default function App() {
   const [providerPathsOpen, setProviderPathsOpen] = useState(false);
   const [exportIds, setExportIds] = useState<string[]>([]);
   const [deleteConfirmIds, setDeleteConfirmIds] = useState<string[]>([]);
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return 320;
+    const stored = Number.parseInt(window.localStorage.getItem("chatlog-viewer:sidebar-width") ?? "", 10);
+    return Number.isFinite(stored) && stored >= 240 && stored <= 640 ? stored : 320;
+  });
+
+  const handleSidebarWidthChange = useCallback((next: number) => {
+    setSidebarWidth(next);
+    try {
+      window.localStorage.setItem("chatlog-viewer:sidebar-width", String(next));
+    } catch {
+      // localStorage 不可用时忽略
+    }
+  }, []);
 
   const {
     batchGenerating,
@@ -350,6 +364,8 @@ export default function App() {
           onBatchGenerate={handleBatchGenerate}
           onBatchChangeModelProvider={handleBatchChangeModelProvider}
           onBatchMove={handleBatchMove}
+          width={sidebarWidth}
+          onWidthChange={handleSidebarWidthChange}
           batchGenerating={batchGenerating}
           onMoveConversation={handleMoveConversation}
           codexModelProviders={codexModelProviders}

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles, ArrowRightLeft, FolderOpen } from "lucide-react";
 import type { ProviderInfo, ConversationMeta } from "../lib/api";
 import { ConversationList } from "./ConversationList";
@@ -44,7 +44,12 @@ interface SidebarProps {
   onToggleModelProvider: (name: string) => void;
   partialSearch: boolean;
   searchWarnings: string[];
+  width: number;
+  onWidthChange: (width: number) => void;
 }
+
+const MIN_SIDEBAR_WIDTH = 240;
+const MAX_SIDEBAR_WIDTH = 640;
 
 export function Sidebar({
   providers,
@@ -79,6 +84,8 @@ export function Sidebar({
   onToggleModelProvider,
   partialSearch,
   searchWarnings,
+  width,
+  onWidthChange,
 }: SidebarProps) {
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
   const [batchModelProviderOverride, setBatchModelProviderOverride] = useState("");
@@ -203,8 +210,51 @@ export function Sidebar({
     return batchMoveTargets[0]?.projectKey ?? "";
   }, [batchMoveSupported, batchMoveTargetOverride, batchMoveTargets]);
 
+  // 拖拽调节宽度：mousedown 后全局监听 mousemove/mouseup，直到松开鼠标。
+  const [dragging, setDragging] = useState(false);
+  const dragStartRef = useRef<{ x: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    if (!dragging) return;
+
+    const handleMove = (e: MouseEvent) => {
+      if (!dragStartRef.current) return;
+      const delta = e.clientX - dragStartRef.current.x;
+      const next = Math.min(
+        MAX_SIDEBAR_WIDTH,
+        Math.max(MIN_SIDEBAR_WIDTH, dragStartRef.current.startWidth + delta)
+      );
+      onWidthChange(next);
+    };
+
+    const handleUp = () => {
+      setDragging(false);
+      dragStartRef.current = null;
+    };
+
+    document.addEventListener("mousemove", handleMove);
+    document.addEventListener("mouseup", handleUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    return () => {
+      document.removeEventListener("mousemove", handleMove);
+      document.removeEventListener("mouseup", handleUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [dragging, onWidthChange]);
+
+  const handleDragStart = (e: React.MouseEvent) => {
+    dragStartRef.current = { x: e.clientX, startWidth: width };
+    setDragging(true);
+  };
+
   return (
-    <div className="w-80 border-r border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col h-full">
+    <div
+      style={{ width }}
+      className="relative border-r border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex flex-col h-full flex-shrink-0"
+    >
       <div className="p-3 border-b border-gray-200 dark:border-gray-700">
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -443,6 +493,19 @@ export function Sidebar({
           </div>
         </div>
       )}
+
+      <div
+        onMouseDown={handleDragStart}
+        onDoubleClick={() => onWidthChange(320)}
+        role="separator"
+        aria-orientation="vertical"
+        title="拖动调节宽度，双击恢复默认"
+        className={`absolute top-0 right-0 h-full w-1 cursor-col-resize z-20 transition-colors ${
+          dragging
+            ? "bg-blue-400 dark:bg-blue-500"
+            : "hover:bg-blue-300 dark:hover:bg-blue-500/60"
+        }`}
+      />
     </div>
   );
 }

@@ -72,6 +72,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{ openai: 2, azure: 1 }}
@@ -117,6 +119,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{}}
@@ -165,6 +169,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={onBatchChangeModelProvider}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{}} codexModelProviders={[
@@ -212,6 +218,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{ openai: 2, azure: 1 }}
@@ -260,6 +268,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{}} codexModelProviders={["openai"]}
@@ -306,6 +316,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{}} codexModelProviders={["openai"]}
@@ -360,6 +372,8 @@ describe("Sidebar", () => {
         onBatchGenerate={() => {}}
         onBatchChangeModelProvider={() => {}}
         onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
         batchGenerating={false}
         onMoveConversation={() => {}}
         codexModelProviderCounts={{}} codexModelProviders={["openai"]}
