@@ -1166,17 +1166,19 @@ test("Codex move 在 state db 更新失败时会回滚 transcript 迁移", async
 
     provider = new CodexProvider();
     const patchedProvider = provider as unknown as {
-      updateThreadLocation: (sessionId: string, updates: { cwd?: string; rolloutPath?: string | null }) => boolean;
+      sqliteClient: {
+        updateThreadLocation: (sessionId: string, updates: { cwd?: string; rolloutPath?: string | null }) => boolean;
+      };
     };
-    const originalUpdateThreadLocation = patchedProvider.updateThreadLocation.bind(provider);
-    patchedProvider.updateThreadLocation = () => false;
+    const originalUpdateThreadLocation = patchedProvider.sqliteClient.updateThreadLocation.bind(patchedProvider.sqliteClient);
+    patchedProvider.sqliteClient.updateThreadLocation = () => false;
 
     await assert.rejects(
       provider.move(`codex:${sessionId}`, targetProject),
       /未能同步 Codex state db/
     );
 
-    patchedProvider.updateThreadLocation = originalUpdateThreadLocation;
+    patchedProvider.sqliteClient.updateThreadLocation = originalUpdateThreadLocation;
 
     const rolledBackContent = await readFile(sourceFile, "utf-8");
     assert.match(rolledBackContent, /original-project/i);
