@@ -81,25 +81,17 @@ export function Sidebar({
   const allChecked = conversations.length > 0 && selectedIds.size === conversations.length;
   const [batchModelProviderOverride, setBatchModelProviderOverride] = useState("");
 
-  const activeProviderCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const conv of conversations) {
-      counts.set(conv.provider, (counts.get(conv.provider) ?? 0) + 1);
-    }
-    return counts;
-  }, [conversations]);
-
   const footerText = useMemo(() => {
     const parts = providers
       .filter((p) => p.available && activeProviders.has(p.name))
       .map((p) => {
-        const count = activeProviderCounts.get(p.name) ?? 0;
+        const count = providerCounts[p.name] ?? 0;
         return count > 0 ? `${p.displayName}: ${count}` : "";
       })
       .filter(Boolean);
 
     return parts.length > 0 ? `共 ${total} 条对话 | ${parts.join(" | ")}` : `共 ${total} 条对话`;
-  }, [activeProviderCounts, activeProviders, providers, total]);
+  }, [activeProviders, providerCounts, providers, total]);
 
   const selectedConversations = useMemo(
     () => conversations.filter((item) => selectedIds.has(item.id)),

@@ -465,17 +465,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
     // Codex provider facet 依赖当前搜索结果，但不受 modelProvider 自身筛选影响。
     const codexModelProviderCounts: Record<string, number> = {};
+    const providerCounts: Record<string, number> = {};
+    const providerFacetBase: ConversationMeta[] = [];
     for (const item of baseConversations) {
       if (item.provider === "codex" && item.modelProvider) {
         codexModelProviderCounts[item.modelProvider] = (codexModelProviderCounts[item.modelProvider] ?? 0) + 1;
       }
-    }
-
-    const providerFacetBase = modelProviderFilter !== undefined
-      ? baseConversations.filter(filterByModelProviders)
-      : baseConversations;
-    const providerCounts: Record<string, number> = {};
-    for (const item of providerFacetBase) {
+      if (modelProviderFilter !== undefined && !filterByModelProviders(item)) continue;
+      providerFacetBase.push(item);
       providerCounts[item.provider] = (providerCounts[item.provider] ?? 0) + 1;
     }
 
