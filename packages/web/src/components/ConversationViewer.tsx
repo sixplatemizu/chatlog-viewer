@@ -467,7 +467,9 @@ export function ConversationViewer({
                     style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 24 24' fill='none' stroke='%233b82f6' stroke-width='3'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
                   >
                     {folderOptions.some((item) => item.projectKey === conversation.projectKey) ? null : (
-                      <option value={conversation.projectKey}>{conversation.projectKey}</option>
+                      <option value={conversation.projectKey}>
+                        {getProjectName(conversation.project, conversation.projectKey)}
+                      </option>
                     )}
                     {folderOptions.map((item) => (
                       <option key={item.projectKey} value={item.projectKey}>
