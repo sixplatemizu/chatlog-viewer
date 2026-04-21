@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { useConversations } from "./hooks/useConversations";
 import { useBatchActions } from "./hooks/useBatchActions";
 import { useTheme } from "./hooks/useTheme";
@@ -267,6 +267,33 @@ export default function App() {
     [conversations, refresh, pushToast]
   );
 
+  // 详情页下拉直接切换单条对话到其他文件夹
+  const handleChangeFolder = useCallback(
+    async (convId: string, targetProjectKey: string) => {
+      const conv = conversations.find((c) => c.id === convId);
+      if (!conv) return;
+      await handleMoveConversation(convId, targetProjectKey, conv.provider, conv.provider);
+    },
+    [conversations, handleMoveConversation]
+  );
+
+  // 详情页文件夹下拉候选：同 provider 下去重后的所有文件夹（排除当前文件夹）。
+  const folderOptionsForViewer = useMemo(() => {
+    if (!conversation) return [];
+    const seen = new Map<string, string>();
+    for (const item of conversations) {
+      if (item.provider !== conversation.provider) continue;
+      if (!item.projectKey) continue;
+      if (isSameProjectPath(item.projectKey, conversation.projectKey)) continue;
+      if (!seen.has(item.projectKey)) {
+        seen.set(item.projectKey, item.project || item.projectKey);
+      }
+    }
+    return [...seen.entries()]
+      .map(([projectKey, displayName]) => ({ projectKey, displayName }))
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+  }, [conversation, conversations]);
+
   // 修改 Codex 对话的 model_provider
   const handleChangeModelProvider = useCallback(
     async (id: string, newProvider: string) => {
@@ -390,6 +417,8 @@ export default function App() {
           onMessagesDeleted={applyLocalMessageDelete}
           codexModelProviders={codexModelProviders}
           onChangeModelProvider={handleChangeModelProvider}
+          folderOptions={folderOptionsForViewer}
+          onChangeFolder={handleChangeFolder}
           onNotify={pushToast}
         />
       </div>

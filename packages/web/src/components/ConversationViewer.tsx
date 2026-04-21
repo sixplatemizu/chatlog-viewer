@@ -41,6 +41,8 @@ interface Props {
   onNotify: (toast: ToastPayload) => void;
   codexModelProviders: string[];
   onChangeModelProvider: (id: string, newProvider: string) => void;
+  folderOptions: Array<{ projectKey: string; displayName: string }>;
+  onChangeFolder: (id: string, targetProjectKey: string) => void;
 }
 
 const EMPTY_MESSAGES: NonNullable<Conversation["messages"]> = [];
@@ -104,6 +106,8 @@ export function ConversationViewer({
   onNotify,
   codexModelProviders,
   onChangeModelProvider,
+  folderOptions,
+  onChangeFolder,
 }: Props) {
   const virtuosoRef = useRef<VirtuosoHandle | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -430,14 +434,6 @@ export function ConversationViewer({
                 {new Date(conversation.createdAt).toLocaleDateString("zh-CN")}
               </span>
               <span>{totalMessages} 条消息</span>
-              {titleSyncInfo && (
-                <span
-                  className={titleSyncInfo.badgeClassName}
-                  title={titleSyncInfo.description}
-                >
-                  {titleSyncInfo.badgeLabel}
-                </span>
-              )}
               {conversation.provider === "codex" && conversation.modelProvider && (
                 <span className="flex items-center gap-1">
                   <ArrowRightLeft className="w-3 h-3 text-gray-400" />
@@ -451,6 +447,31 @@ export function ConversationViewer({
                     {codexModelProviders.map((name) => (
                       <option key={name} value={name}>
                         {name}
+                      </option>
+                    ))}
+                  </select>
+                </span>
+              )}
+              {folderOptions.length > 0 && (
+                <span className="flex items-center gap-1">
+                  <ArrowRightLeft className="w-3 h-3 text-gray-400" />
+                  <select
+                    value={conversation.projectKey}
+                    onChange={(e) => {
+                      if (e.target.value !== conversation.projectKey) {
+                        onChangeFolder(conversation.id, e.target.value);
+                      }
+                    }}
+                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:border-blue-700 cursor-pointer focus:outline-none focus:ring-1 focus:ring-blue-400 appearance-none pr-4 max-w-[200px]"
+                    title="切换到其他文件夹"
+                    style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 24 24' fill='none' stroke='%233b82f6' stroke-width='3'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
+                  >
+                    {folderOptions.some((item) => item.projectKey === conversation.projectKey) ? null : (
+                      <option value={conversation.projectKey}>{conversation.projectKey}</option>
+                    )}
+                    {folderOptions.map((item) => (
+                      <option key={item.projectKey} value={item.projectKey}>
+                        {item.displayName}
                       </option>
                     ))}
                   </select>

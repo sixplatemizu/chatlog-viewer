@@ -86,6 +86,8 @@ describe("ConversationViewer", () => {
         onNotify={onNotify}
         codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
@@ -129,6 +131,8 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
@@ -143,8 +147,6 @@ describe("ConversationViewer", () => {
     await waitFor(() => {
       expect(onRefreshConversation).toHaveBeenCalledWith("codex:test-1");
     });
-
-    expect(screen.getByText("已同步到 CLI")).toBeInTheDocument();
   });
 
   it("metadata-only 对话会显示 metadata 提示而不是残留清理提示", () => {
@@ -170,6 +172,8 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
@@ -209,6 +213,8 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
@@ -247,6 +253,8 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
@@ -254,7 +262,7 @@ describe("ConversationViewer", () => {
     expect(screen.getByRole("button", { name: "清理残留记录" })).toBeInTheDocument();
   });
 
-  it("iFlow 对话会明确显示仅 viewer 覆盖", () => {
+  it("iFlow 对话禁用标题编辑按钮并提示原因", () => {
     render(
       <ConversationViewer
         conversation={{
@@ -281,10 +289,11 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={[]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
-    expect(screen.getByText("仅 viewer 覆盖")).toBeInTheDocument();
     expect(screen.getByText("iFlow 当前已禁用修改标题")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "AI 标题" })).not.toBeInTheDocument();
   });
@@ -305,6 +314,8 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={[]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
@@ -329,6 +340,8 @@ describe("ConversationViewer", () => {
         onNotify={() => {}}
         codexModelProviders={["openai"]}
         onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
       />
     );
 
