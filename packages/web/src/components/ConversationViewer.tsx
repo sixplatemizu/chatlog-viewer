@@ -462,7 +462,7 @@ export function ConversationViewer({
                         onChangeFolder(conversation.id, e.target.value);
                       }
                     }}
-                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:border-blue-700 cursor-pointer focus:outline-none focus:ring-1 focus:ring-blue-400 appearance-none pr-4 max-w-[200px]"
+                    className="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:border-blue-700 cursor-pointer focus:outline-none focus:ring-1 focus:ring-blue-400 appearance-none pr-4 max-w-[160px] truncate"
                     title="切换到其他文件夹"
                     style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 24 24' fill='none' stroke='%233b82f6' stroke-width='3'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
                   >

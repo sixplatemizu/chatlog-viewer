@@ -7,7 +7,7 @@ import { ConversationViewer } from "./components/ConversationViewer";
 import { ExportDialog } from "./components/ExportDialog";
 import { ProviderPathsDialog } from "./components/ProviderPathsDialog";
 import { ToastViewport, type ToastItem, type ToastPayload } from "./components/ToastViewport";
-import { isSameProjectPath } from "./lib/project";
+import { isSameProjectPath, getProjectName } from "./lib/project";
 import {
   exportConversations,
   deleteConversation,
@@ -286,7 +286,7 @@ export default function App() {
       if (!item.projectKey) continue;
       if (isSameProjectPath(item.projectKey, conversation.projectKey)) continue;
       if (!seen.has(item.projectKey)) {
-        seen.set(item.projectKey, item.project || item.projectKey);
+        seen.set(item.projectKey, getProjectName(item.project, item.projectKey));
       }
     }
     return [...seen.entries()]
