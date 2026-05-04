@@ -105,6 +105,31 @@ test("indexed cache snapshot 会保留并读回 searchChunks", () => {
   invalidateListCache(cacheKey);
 });
 
+test("conversation index 搜索结果会保留完整 meta 标记", () => {
+  const cacheKey = `test-index-meta-json-${Date.now()}`;
+  const meta: ConversationMeta = {
+    ...createConversationMeta("opencode:badge"),
+    provider: "opencode",
+    contentStatus: "full",
+    badges: [{ label: "run/临时", tone: "amber", title: "opencode run" }],
+  };
+
+  setIndexedListCache(cacheKey, [{
+    meta,
+    searchText: "badge-meta-needle",
+  }]);
+
+  const matched = queryConversationIndex({
+    cacheKeys: [cacheKey],
+    search: "badge-meta-needle",
+  });
+
+  assert.deepEqual(matched[0]?.badges, meta.badges);
+  assert.equal(matched[0]?.contentStatus, "full");
+
+  invalidateListCache(cacheKey);
+});
+
 test("conversation index 仅返回当前 cacheKey 的结果，避免旧路径索引串入", () => {
   const oldCacheKey = `test-index-old-${Date.now()}`;
   const newCacheKey = `test-index-new-${Date.now()}`;

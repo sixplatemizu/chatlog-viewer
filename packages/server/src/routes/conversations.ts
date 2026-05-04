@@ -13,7 +13,7 @@ import { generateTitle } from "../utils/ai.js";
 import { getIndexedListSnapshot, hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
 import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
-import { getTitleGenerationCliPriority } from "../utils/provider-paths.js";
+import { getTitleGenerationCliPriority, getTitleGenerationCliSessionReuse } from "../utils/provider-paths.js";
 
 function normalizeProjectDisplayPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
@@ -131,9 +131,14 @@ async function persistConversationTitle(
 }
 
 async function resolveConversationTitle(
+  provider: ConversationProvider | undefined,
   currentTitle: string,
   customTitle: string | null | undefined
 ): Promise<string> {
+  if (resolveProviderTitleSyncMode(provider) === "native") {
+    return currentTitle;
+  }
+
   const normalizedCustomTitle = customTitle?.trim();
   if (!normalizedCustomTitle) {
     return currentTitle;
@@ -313,7 +318,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const filtered = (await Promise.all(filteredBase
       .map(async (conv) => {
         const provider = providerByName.get(conv.provider);
-        const resolvedTitle = await resolveConversationTitle(conv.title, customTitles[conv.id]);
+        const resolvedTitle = await resolveConversationTitle(provider, conv.title, customTitles[conv.id]);
         const capabilities = resolveConversationCapabilities(provider);
 
         return {
@@ -359,6 +364,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         before: Number.isFinite(before) && before! >= 0 ? before : undefined,
       });
       const resolvedTitle = await resolveConversationTitle(
+        provider,
         conversation.title,
         await getTitle(id)
       );
@@ -537,6 +543,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       const conversation = await provider.read(id);
       const result = await generateTitle(buildTitleGenerationMessages(conversation), {
         priority: getTitleGenerationCliPriority(),
+        reuseSession: getTitleGenerationCliSessionReuse(),
       });
       await persistConversationTitle(provider, id, result.title);
       return c.json({ success: true, title: result.title, usedCli: result.usedCli });
@@ -580,6 +587,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         const conversation = await provider.read(id);
         const result = await generateTitle(buildTitleGenerationMessages(conversation), {
           priority: getTitleGenerationCliPriority(),
+          reuseSession: getTitleGenerationCliSessionReuse(),
         });
         await persistConversationTitle(provider, id, result.title);
         results.push({

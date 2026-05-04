@@ -46,6 +46,14 @@ export interface ConversationProvider {
 
 export type ConversationContentStatus = "full" | "history-only" | "metadata-only";
 
+export type ConversationBadgeTone = "gray" | "blue" | "cyan" | "amber" | "rose" | "indigo" | "green";
+
+export interface ConversationBadge {
+  label: string;
+  tone?: ConversationBadgeTone;
+  title?: string;
+}
+
 export interface ConversationMeta {
   id: string;
   provider: string;
@@ -65,6 +73,7 @@ export interface ConversationMeta {
   contentStatus?: ConversationContentStatus; // 当前能提供的内容层级：完整 transcript、history 回退或仅 metadata
   titleGenerationHint?: string; // transcript 缺失时用于 AI 标题生成的元数据提示
   cleanupCandidate?: boolean; // 标记为可直接清理的残留记录，不等于 metadata-only
+  badges?: ConversationBadge[]; // 展示原始记录状态，例如非 TUI 默认可切换、子会话、归档等
 }
 
 export interface Conversation extends ConversationMeta {

@@ -102,7 +102,7 @@ export class CodexSqliteClient {
     this.closeWrite();
     this.closeRead();
 
-    this.writeDb = new Database(dbPath, options.fileMustExist ? { fileMustExist: true } : undefined);
+    this.writeDb = new Database(dbPath, options.fileMustExist === false ? undefined : { fileMustExist: true });
     this.writeDbPath = dbPath;
     return this.writeDb;
   }
@@ -256,12 +256,28 @@ export class CodexSqliteClient {
     title: string,
     options?: { updateTitleField?: boolean }
   ): void {
-    const db = this.getWriteDb();
+    const db = this.getWriteDb({ fileMustExist: true });
+    const columns = this.getTableColumns(db, "threads");
+    if (!columns.has("id") || !columns.has("first_user_message")) {
+      throw new Error("Codex state db 缺少标题字段，无法写入标题");
+    }
+    if (options?.updateTitleField !== false && !columns.has("title")) {
+      throw new Error("Codex state db 缺少 title 字段，无法写入标题");
+    }
+
     const result = options?.updateTitleField === false
       ? db.prepare("UPDATE threads SET first_user_message = ? WHERE id = ?").run(title, sessionId)
       : db.prepare("UPDATE threads SET title = ?, first_user_message = ? WHERE id = ?").run(title, title, sessionId);
     if (result.changes === 0) {
       throw new Error(`SQLite 中未找到对话: ${sessionId}`);
+    }
+
+    const row = options?.updateTitleField === false
+      ? db.prepare("SELECT first_user_message FROM threads WHERE id = ?").get(sessionId) as { title?: string | null; first_user_message: string | null } | undefined
+      : db.prepare("SELECT title, first_user_message FROM threads WHERE id = ?").get(sessionId) as { title?: string | null; first_user_message: string | null } | undefined;
+    const titleMatches = options?.updateTitleField === false || row?.title === title;
+    if (!row || !titleMatches || row.first_user_message !== title) {
+      throw new Error(`Codex state db 标题写入校验失败: ${sessionId}`);
     }
   }
 

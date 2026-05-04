@@ -1,15 +1,16 @@
 # ChatLog Viewer
 
-统一浏览、搜索、整理本机 AI CLI 对话记录的桌面本地 Web 工具，当前默认接入 Claude Code、Codex、iFlow CLI。
+统一浏览、搜索、整理本机 AI CLI 对话记录的桌面本地 Web 工具，当前默认接入 Claude Code、Codex、OpenCode、iFlow CLI。
 
 ## 亮点
 
-- 统一聚合多个 provider 的会话记录，按项目目录分组浏览
+- 统一聚合多个 provider 的本地原始会话记录，按项目目录分组浏览
+- 对工具自身 UI 默认不展示但本地真实存在的记录进行标记区分，例如 OpenCode 子会话、归档、`opencode run` / 标题生成临时会话
 - Markdown 消息渲染、代码高亮、tool call 折叠，适合长对话回看
 - 支持 provider 过滤、Codex model provider 过滤、按更新时间 / 创建时间 / provider 排序
 - 搜索基于本地索引，支持长消息 chunk search，降低超长会话中段内容漏检概率
 - 支持手动改标题、调用本地 CLI 生成标题、批量选择、批量删除、项目间移动会话
-- AI 标题生成支持 `iflow / codex / claude` 优先级设置，并为每个 CLI 复用固定会话
+- AI 标题生成支持 `codex / claude / opencode` 优先级设置，并为每个 CLI 复用固定会话
 - 导出支持 `完整导出` 和 `Partial Export` 两种模式，超长对话可优先走 partial
 - Provider 路径支持自动发现、环境变量覆盖、配置文件覆盖，并可直接在 UI 中查看与修改
 - API 默认只允许本机 Host / Origin 访问，减少误暴露风险
@@ -21,7 +22,16 @@
 | Claude Code | 完整支持 | `~/.claude/projects` |
 | Codex | 完整支持 | `~/.codex/sessions` |
 | Codex state db | 完整支持 | `~/.codex/state_5.sqlite` |
+| OpenCode | 基础支持 | `~/.local/share/opencode/opencode.db` |
 | iFlow CLI | 完整支持 | `~/.iflow/projects` |
+
+OpenCode 当前支持从 SQLite 读取列表、详情、搜索索引、导出、删除会话、metadata 级移动会话和标题写回；暂不支持消息级编辑 / 删除。OpenCode 使用单一 SQLite DB 存储，对话路径显示为 DB 内 session 记录，不等同于 Claude Code / Codex 的独立 JSONL 文件路径。
+
+ChatLog Viewer 的管理目标是忠于本地原始对话数据，而不是复刻各工具自己的 session picker。OpenCode 会显示 DB 中所有 `session` 记录，包括 TUI `/sessions` 默认不显示的子会话、归档会话、30 天外会话、`opencode run` / 自动化 one-shot session，以及 ChatLog Viewer AI 标题生成产生的临时 session，并通过列表 badge 标记区分。
+
+`opencode session list`、OpenCode TUI `/sessions` 和 ChatLog Viewer 的列表语义不同：前两者是 OpenCode 自身的操作视图，ChatLog Viewer 以本地 DB / 文件中的真实记录为准，用于完整盘点和管理本机对话资产。Claude Code、Codex、iFlow 也遵循同样原则：优先呈现本地实际存在的数据，对仅 metadata、仅 history、残留记录等不完整状态做显式标记，而不是静默隐藏。
+
+Claude Code 会对缺少主 transcript 的记录标记 `history 回填`、`索引空壳`、`无 transcript`；Codex 会对仅存在于 `state_5.sqlite` 的记录标记 `state db`、`无 transcript`；OpenCode 会标记 `子会话`、`已归档`、`30天外`、`run/临时`、`标题生成` 等原始状态。
 
 ## 技术栈
 
@@ -93,7 +103,7 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 
 - 支持手动改标题
 - 支持调用本地 AI CLI 自动生成标题
-- 标题生成支持 `iflow -> codex -> claude` 等可调 fallback 优先级
+- 标题生成支持 `codex -> claude -> opencode` 等可调 fallback 优先级
 - 每个标题生成 CLI 会复用固定会话，避免每次都新建新对话
 - 设置页支持查看每个 CLI 是否可用、是否已有固定会话，并可单独或全部重置
 - 支持批量选择、批量删除
@@ -152,6 +162,10 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
       "storagePath": "/data/codex/sessions",
       "stateDbPath": "/data/codex/state_5.sqlite"
     },
+    "opencode": {
+      "storagePath": "/data/opencode",
+      "stateDbPath": "/data/opencode/opencode.db"
+    },
     "iflow": {
       "storagePath": "/data/iflow/projects"
     }
@@ -166,6 +180,9 @@ CHATLOG_VIEWER_CONFIG_PATH=/path/to/config.json
 CHATLOG_VIEWER_CLAUDE_CODE_PATH=/path/to/claude/projects
 CHATLOG_VIEWER_CODEX_SESSIONS_PATH=/path/to/codex/sessions
 CHATLOG_VIEWER_CODEX_STATE_DB_PATH=/path/to/codex/state_5.sqlite
+CHATLOG_VIEWER_OPENCODE_PATH=/path/to/opencode
+CHATLOG_VIEWER_OPENCODE_DB_PATH=/path/to/opencode/opencode.db
+CHATLOG_VIEWER_OPENCODE_BIN=/path/to/opencode
 CHATLOG_VIEWER_IFLOW_PATH=/path/to/iflow/projects
 ```
 

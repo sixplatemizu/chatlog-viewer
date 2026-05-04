@@ -1,7 +1,7 @@
 import { memo, useMemo, useState } from "react";
 import { GroupedVirtuoso } from "react-virtuoso";
 import { MessageSquare, FolderOpen, ChevronDown, ChevronRight } from "lucide-react";
-import type { ConversationMeta } from "../lib/api";
+import type { ConversationBadgeTone, ConversationMeta } from "../lib/api";
 import {
   canonicalizeProjectPath,
   getDisambiguatedProjectName,
@@ -24,6 +24,18 @@ const FOLDER_COLOR: Record<string, string> = {
   "gemini-cli": "text-purple-400",
   opencode: "text-cyan-400",
 };
+
+const BADGE_TONE_CLASS: Record<ConversationBadgeTone, string> = {
+  gray: "bg-gray-50 text-gray-600 border-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-600",
+  blue: "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/30 dark:text-blue-300 dark:border-blue-700",
+  cyan: "bg-cyan-50 text-cyan-700 border-cyan-200 dark:bg-cyan-900/30 dark:text-cyan-300 dark:border-cyan-700",
+  amber: "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-700",
+  rose: "bg-rose-50 text-rose-700 border-rose-200 dark:bg-rose-900/30 dark:text-rose-300 dark:border-rose-700",
+  indigo: "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-300 dark:border-indigo-700",
+  green: "bg-green-50 text-green-600 border-green-200 dark:bg-green-900/30 dark:text-green-400 dark:border-green-700",
+};
+
+const BADGE_BASE_CLASS = "text-[9px] px-1.5 py-0 rounded-full border flex-shrink-0 leading-4";
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -223,6 +235,15 @@ const ConversationRow = memo(function ConversationRow({
               残留
             </span>
           )}
+          {conv.badges?.map((badge) => (
+            <span
+              key={`${badge.label}-${badge.title ?? ""}`}
+              title={badge.title}
+              className={`${BADGE_BASE_CLASS} ${BADGE_TONE_CLASS[badge.tone ?? "gray"]}`}
+            >
+              {badge.label}
+            </span>
+          ))}
         </div>
         <div className="flex items-center gap-2 mt-0.5">
           <span className="text-xs text-gray-400">

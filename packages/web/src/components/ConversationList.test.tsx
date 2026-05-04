@@ -166,6 +166,18 @@ describe("ConversationList", () => {
         title: "Claude history",
         contentStatus: "history-only",
       }),
+      createConversation({
+        id: "opencode:run-1",
+        provider: "opencode",
+        title: "OpenCode run",
+        badges: [{ label: "run/临时", tone: "amber", title: "opencode run" }],
+      }),
+      createConversation({
+        id: "codex:state-1",
+        provider: "codex",
+        title: "Codex state db",
+        badges: [{ label: "state db", tone: "green", title: "state only" }],
+      }),
     ];
 
     render(
@@ -184,6 +196,8 @@ describe("ConversationList", () => {
     expect(screen.getByText("残留")).toBeInTheDocument();
     expect(screen.getByText("仅 metadata")).toBeInTheDocument();
     expect(screen.getByText("仅 history")).toBeInTheDocument();
+    expect(screen.getByText("run/临时")).toHaveAttribute("title", "opencode run");
+    expect(screen.getByText("state db")).toHaveAttribute("title", "state only");
   });
 
   it("同一路径跨 provider 分组时仍会拆分为两个分组", () => {

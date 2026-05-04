@@ -1,16 +1,19 @@
+import { execFileSync } from "child_process";
 import { readFileSync, statSync } from "fs";
 import { copyFile, mkdir, readdir, rename, rm, stat, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { posix, win32 } from "path";
 
-export type ResolvedProviderName = "claude-code" | "codex" | "iflow";
-export type TitleGenerationCli = "codex" | "claude";
+export type ResolvedProviderName = "claude-code" | "codex" | "iflow" | "opencode";
+export type TitleGenerationCli = "codex" | "claude" | "opencode";
+export type TitleGenerationCliSessionMode = "fixed" | "fresh";
 type PathKind = "file" | "directory";
 type EnvLike = Record<string, string | undefined>;
 export type ProviderPathSource = "env" | "config" | "auto" | "default";
 
-const TITLE_GENERATION_CLI_ORDER: TitleGenerationCli[] = ["codex", "claude"];
+const TITLE_GENERATION_CLI_ORDER: TitleGenerationCli[] = ["codex", "claude", "opencode"];
 const TITLE_GENERATION_CLI_SET = new Set<TitleGenerationCli>(TITLE_GENERATION_CLI_ORDER);
+const TITLE_GENERATION_CLI_SESSION_MODE_SET = new Set<TitleGenerationCliSessionMode>(["fixed", "fresh"]);
 
 export interface ProviderPathConfig {
   storagePath?: string;
@@ -19,6 +22,7 @@ export interface ProviderPathConfig {
 
 export interface AiConfig {
   titleGenerationCliPriority?: TitleGenerationCli[];
+  titleGenerationCliSessionModes?: Partial<Record<TitleGenerationCli, TitleGenerationCliSessionMode>>;
 }
 
 export interface AppConfig {
@@ -64,6 +68,7 @@ interface ResolveProviderPathsOptions {
   config?: AppConfig;
   configDir?: string;
   pathExists?: (path: string, kind: PathKind) => boolean;
+  openCodeDbPath?: string | null;
 }
 
 interface UpdateProviderConfigsOptions {
@@ -135,6 +140,44 @@ export function getTitleGenerationCliPriority(
   );
 }
 
+export function normalizeTitleGenerationCliSessionModes(
+  modes?: Partial<Record<string, unknown>>
+): Record<TitleGenerationCli, TitleGenerationCliSessionMode> {
+  const normalized = Object.fromEntries(
+    TITLE_GENERATION_CLI_ORDER.map((cli) => [cli, "fixed"])
+  ) as Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
+
+  if (!modes || typeof modes !== "object") return normalized;
+
+  for (const cli of TITLE_GENERATION_CLI_ORDER) {
+    const mode = modes[cli];
+    if (TITLE_GENERATION_CLI_SESSION_MODE_SET.has(mode as TitleGenerationCliSessionMode)) {
+      normalized[cli] = mode as TitleGenerationCliSessionMode;
+    }
+  }
+
+  return normalized;
+}
+
+export function getTitleGenerationCliSessionModes(
+  env: EnvLike = process.env,
+  homeDir = homedir()
+): Record<TitleGenerationCli, TitleGenerationCliSessionMode> {
+  return normalizeTitleGenerationCliSessionModes(
+    loadAppConfig(env, homeDir).config.ai?.titleGenerationCliSessionModes
+  );
+}
+
+export function getTitleGenerationCliSessionReuse(
+  env: EnvLike = process.env,
+  homeDir = homedir()
+): Record<TitleGenerationCli, boolean> {
+  const modes = getTitleGenerationCliSessionModes(env, homeDir);
+  return Object.fromEntries(
+    TITLE_GENERATION_CLI_ORDER.map((cli) => [cli, modes[cli] === "fixed"])
+  ) as Record<TitleGenerationCli, boolean>;
+}
+
 export function resolveProviderPaths(
   providerName: ResolvedProviderName,
   options: ResolveProviderPathsOptions = {}
@@ -187,6 +230,46 @@ export function resolveProviderPaths(
       storagePath: storage.path,
       storageExists: storage.exists,
       storageSource: storage.source,
+    };
+  }
+
+  if (providerName === "opencode") {
+    const hasStorageOverride = !!env.CHATLOG_VIEWER_OPENCODE_PATH?.trim() || !!providerConfig?.storagePath?.trim();
+    const hasStateDbOverride = !!env.CHATLOG_VIEWER_OPENCODE_DB_PATH?.trim() || !!providerConfig?.stateDbPath?.trim();
+    const openCodeDbPath = options.openCodeDbPath === undefined && (!hasStorageOverride || !hasStateDbOverride)
+      ? resolveOpenCodeCliDbPath(env, homeDir)
+      : options.openCodeDbPath ?? null;
+    const storage = resolvePathWithFallback({
+      envKeys: ["CHATLOG_VIEWER_OPENCODE_PATH"],
+      configValue: providerConfig?.storagePath,
+      configDir: loadedConfig.configDir,
+      autoCandidates: buildOpenCodeStorageCandidates(homeDir, env, openCodeDbPath),
+      defaultPath: joinStyledPath(homeDir, ".local", "share", "opencode"),
+      kind: "directory",
+      env,
+      homeDir,
+      pathExists,
+    });
+
+    const stateDb = resolvePathWithFallback({
+      envKeys: ["CHATLOG_VIEWER_OPENCODE_DB_PATH"],
+      configValue: providerConfig?.stateDbPath,
+      configDir: loadedConfig.configDir,
+      autoCandidates: buildOpenCodeStateDbCandidates(homeDir, env, storage.path, openCodeDbPath),
+      defaultPath: joinStyledPath(homeDir, ".local", "share", "opencode", "opencode.db"),
+      kind: "file",
+      env,
+      homeDir,
+      pathExists,
+    });
+
+    return {
+      storagePath: storage.path,
+      storageExists: storage.exists,
+      storageSource: storage.source,
+      stateDbPath: stateDb.path,
+      stateDbExists: stateDb.exists,
+      stateDbSource: stateDb.source,
     };
   }
 
@@ -296,12 +379,21 @@ export async function updateProviderConfigs(
   }
 
   if (options.ai) {
-    nextConfig.ai = {
-      ...(nextConfig.ai ?? {}),
-      titleGenerationCliPriority: normalizeTitleGenerationCliPriority(
+    const nextAiConfig: AiConfig = { ...(nextConfig.ai ?? {}) };
+
+    if ("titleGenerationCliPriority" in options.ai) {
+      nextAiConfig.titleGenerationCliPriority = normalizeTitleGenerationCliPriority(
         options.ai.titleGenerationCliPriority
-      ),
-    };
+      );
+    }
+
+    if ("titleGenerationCliSessionModes" in options.ai) {
+      nextAiConfig.titleGenerationCliSessionModes = normalizeTitleGenerationCliSessionModes(
+        options.ai.titleGenerationCliSessionModes
+      );
+    }
+
+    nextConfig.ai = nextAiConfig;
   }
 
   const migrationResults = await migrateProviderPaths(
@@ -580,6 +672,49 @@ function buildIFlowStorageCandidates(homeDir: string, env: EnvLike): string[] {
     joinStyledPath(homeDir, ".iflow", "projects"),
     ...namedCandidates(sharedRoots, [".iflow", "iflow", "iFlow", "IFlow"], ["projects"]),
   ];
+}
+
+function buildOpenCodeStorageCandidates(homeDir: string, env: EnvLike, openCodeDbPath?: string | null): string[] {
+  const sharedRoots = getSharedConfigRoots(homeDir, env);
+  return [
+    openCodeDbPath ? dirnameStyledPath(openCodeDbPath) : undefined,
+    joinStyledPath(homeDir, ".local", "share", "opencode"),
+    joinStyledPath(homeDir, ".opencode"),
+    ...namedCandidates(sharedRoots, ["opencode", "OpenCode", ".opencode"], []),
+  ].filter((value): value is string => !!value);
+}
+
+function buildOpenCodeStateDbCandidates(
+  homeDir: string,
+  env: EnvLike,
+  storagePath: string,
+  openCodeDbPath?: string | null
+): string[] {
+  const sharedRoots = getSharedConfigRoots(homeDir, env);
+  return [
+    joinStyledPath(storagePath, "opencode.db"),
+    openCodeDbPath ?? undefined,
+    joinStyledPath(homeDir, ".local", "share", "opencode", "opencode.db"),
+    joinStyledPath(homeDir, ".opencode", "opencode.db"),
+    ...namedCandidates(sharedRoots, ["opencode", "OpenCode", ".opencode"], ["opencode.db"]),
+  ].filter((value): value is string => !!value);
+}
+
+function resolveOpenCodeCliDbPath(env: EnvLike, homeDir: string): string | null {
+  const command = env.CHATLOG_VIEWER_OPENCODE_BIN?.trim() || "opencode";
+  try {
+    const output = execFileSync(command, ["db", "path"], {
+      encoding: "utf-8",
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+      windowsHide: true,
+    }).trim();
+    const lastLine = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1);
+    return lastLine ? resolvePathValue(lastLine, homeDir, env, homeDir) : null;
+  } catch {
+    return null;
+  }
 }
 
 function getSharedConfigRoots(homeDir: string, env: EnvLike): string[] {

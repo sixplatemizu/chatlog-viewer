@@ -9,16 +9,19 @@ import {
   getProviderConfigPath,
   getProviderPaths,
   getTitleGenerationCliPriority,
+  getTitleGenerationCliSessionModes,
   normalizeTitleGenerationCliPriority,
+  normalizeTitleGenerationCliSessionModes,
   updateProviderConfigs,
   type ProviderPathMigrationSelection,
   type ProviderPathConfig,
   type ResolvedProviderName,
   type TitleGenerationCli,
+  type TitleGenerationCliSessionMode,
 } from "../utils/provider-paths.js";
 
-const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "iflow"]);
-const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["codex", "claude"]);
+const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "opencode", "iflow"]);
+const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["codex", "claude", "opencode"]);
 
 function isResolvedProviderName(name: string): name is ResolvedProviderName {
   return RESOLVED_PROVIDER_NAMES.has(name as ResolvedProviderName);
@@ -67,6 +70,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
       providers: buildProviderPathSettings(providers),
       ai: {
         titleGenerationCliPriority: getTitleGenerationCliPriority(),
+        titleGenerationCliSessionModes: getTitleGenerationCliSessionModes(),
       },
     });
   });
@@ -75,7 +79,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
     const body = await c.req.json<{
       providers?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
       migrations?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
-      ai?: { titleGenerationCliPriority?: unknown };
+      ai?: { titleGenerationCliPriority?: unknown; titleGenerationCliSessionModes?: unknown };
     }>();
 
     if (!body || typeof body !== "object" || !body.providers || typeof body.providers !== "object") {
@@ -85,6 +89,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
     const updates: Partial<Record<ResolvedProviderName, ProviderPathConfig>> = {};
     const migrations: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>> = {};
     let titleGenerationCliPriority: TitleGenerationCli[] | undefined;
+    let titleGenerationCliSessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode> | undefined;
 
     try {
       for (const [providerName, value] of Object.entries(body.providers)) {
@@ -100,7 +105,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
         }
 
         if ("stateDbPath" in value) {
-          if (providerName !== "codex" && value.stateDbPath !== null && value.stateDbPath !== undefined) {
+          if (providerName !== "codex" && providerName !== "opencode" && value.stateDbPath !== null && value.stateDbPath !== undefined) {
             return c.json({ error: `${providerName} 不支持 state db 路径配置` }, 400);
           }
           nextConfig.stateDbPath = normalizeOptionalPathInput(value.stateDbPath);
@@ -123,7 +128,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
           }
 
           if ("stateDbPath" in value) {
-            if (providerName !== "codex") {
+            if (providerName !== "codex" && providerName !== "opencode") {
               return c.json({ error: `${providerName} 不支持 state db 迁移配置` }, 400);
             }
             if (typeof value.stateDbPath !== "boolean") {
@@ -154,6 +159,19 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
               .filter(Boolean)
           );
         }
+
+        if ("titleGenerationCliSessionModes" in body.ai) {
+          if (
+            !body.ai.titleGenerationCliSessionModes
+            || typeof body.ai.titleGenerationCliSessionModes !== "object"
+            || Array.isArray(body.ai.titleGenerationCliSessionModes)
+          ) {
+            return c.json({ error: "标题生成 CLI 会话模式必须是对象" }, 400);
+          }
+          titleGenerationCliSessionModes = normalizeTitleGenerationCliSessionModes(
+            body.ai.titleGenerationCliSessionModes as Record<string, unknown>
+          );
+        }
       }
     } catch (error) {
       return c.json({ error: getErrorMessage(error) }, 400);
@@ -161,9 +179,10 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
 
     const updated = await updateProviderConfigs(updates, process.env, homedir(), {
       migrations,
-      ...(titleGenerationCliPriority ? {
+      ...((titleGenerationCliPriority || titleGenerationCliSessionModes) ? {
         ai: {
           titleGenerationCliPriority,
+          titleGenerationCliSessionModes,
         },
       } : {}),
     });
@@ -173,6 +192,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
       providers: buildProviderPathSettings(providers),
       ai: {
         titleGenerationCliPriority: getTitleGenerationCliPriority(),
+        titleGenerationCliSessionModes: getTitleGenerationCliSessionModes(),
       },
       migrationResults: updated.migrationResults,
     });

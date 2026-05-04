@@ -162,6 +162,7 @@ function getDb(): BetterSqlite3.Database {
       file_size INTEGER NOT NULL,
       file_path TEXT NOT NULL,
       model_provider TEXT,
+      meta_json TEXT,
       cache_key TEXT NOT NULL,
       indexed_at INTEGER NOT NULL,
       search_version INTEGER NOT NULL DEFAULT 1
@@ -247,6 +248,10 @@ function ensureConversationIndexSchema(database: BetterSqlite3.Database): void {
 
   if (!columns.some((column) => column.name === "search_version")) {
     database.exec("ALTER TABLE conversation_index ADD COLUMN search_version INTEGER NOT NULL DEFAULT 1");
+  }
+
+  if (!columns.some((column) => column.name === "meta_json")) {
+    database.exec("ALTER TABLE conversation_index ADD COLUMN meta_json TEXT");
   }
 
   supportsConversationFtsSearch = false;
@@ -380,6 +385,67 @@ export function hasIndexedSearchData(item: IndexedCacheItem): boolean {
   return item.searchText !== undefined || (item.searchChunks?.length ?? 0) > 0;
 }
 
+interface ConversationIndexRow {
+  id: string;
+  provider: string;
+  title: string;
+  search_text: string | null;
+  project: string;
+  project_key: string;
+  project_id: string | null;
+  created_at: number;
+  updated_at: number;
+  message_count: number;
+  file_size: number;
+  file_path: string;
+  model_provider: string | null;
+  meta_json: string | null;
+  search_version?: number;
+}
+
+function buildConversationMetaFromIndexRow(row: ConversationIndexRow): ConversationMeta {
+  const fallback: ConversationMeta = {
+    id: row.id,
+    provider: row.provider,
+    title: row.title,
+    project: row.project,
+    projectKey: row.project_key,
+    projectId: row.project_id ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    messageCount: row.message_count,
+    fileSize: row.file_size,
+    filePath: row.file_path,
+    modelProvider: row.model_provider ?? undefined,
+  };
+
+  if (!row.meta_json) return fallback;
+
+  try {
+    const parsed = JSON.parse(row.meta_json) as unknown;
+    if (!parsed || typeof parsed !== "object") return fallback;
+    const parsedMeta = parsed as Partial<ConversationMeta>;
+    const meta = { ...fallback, ...parsedMeta };
+    return {
+      ...meta,
+      id: fallback.id,
+      provider: fallback.provider,
+      title: fallback.title,
+      project: fallback.project,
+      projectKey: fallback.projectKey,
+      projectId: fallback.projectId,
+      createdAt: fallback.createdAt,
+      updatedAt: fallback.updatedAt,
+      messageCount: fallback.messageCount,
+      fileSize: fallback.fileSize,
+      filePath: fallback.filePath,
+      modelProvider: fallback.modelProvider ?? meta.modelProvider,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 function createIndexedItemSignature(item: {
   meta: ConversationMeta;
   searchText?: string;
@@ -388,19 +454,9 @@ function createIndexedItemSignature(item: {
 }): string {
   return JSON.stringify([
     item.searchVersion,
-    item.meta.provider,
-    item.meta.title,
+    item.meta,
     item.searchText ?? null,
     item.searchChunks ?? [],
-    item.meta.project,
-    item.meta.projectKey,
-    item.meta.projectId ?? null,
-    item.meta.createdAt,
-    item.meta.updatedAt,
-    item.meta.messageCount,
-    item.meta.fileSize,
-    item.meta.filePath,
-    item.meta.modelProvider ?? null,
   ]);
 }
 
@@ -643,6 +699,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
           file_size,
           file_path,
           model_provider,
+          meta_json,
           search_version
         FROM conversation_index
         WHERE cache_key = ?
@@ -663,6 +720,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
       file_size: number;
       file_path: string;
       model_provider: string | null;
+      meta_json: string | null;
       search_version: number;
     }>;
     const chunkRows = database
@@ -694,20 +752,7 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
     }
 
     const detailedItems = rows.map((row) => ({
-      meta: {
-        id: row.id,
-        provider: row.provider,
-        title: row.title,
-        project: row.project,
-        projectKey: row.project_key,
-        projectId: row.project_id ?? undefined,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
-        messageCount: row.message_count,
-        fileSize: row.file_size,
-        filePath: row.file_path,
-        modelProvider: row.model_provider ?? undefined,
-      },
+      meta: buildConversationMetaFromIndexRow(row),
       searchText: row.search_text ?? undefined,
       searchChunks: chunksByConversationId.get(row.id),
     }));
@@ -825,10 +870,11 @@ export function setIndexedListCache(
            file_size,
            file_path,
            model_provider,
+           meta_json,
            cache_key,
            indexed_at,
            search_version
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            title = excluded.title,
@@ -842,6 +888,7 @@ export function setIndexedListCache(
            file_size = excluded.file_size,
            file_path = excluded.file_path,
            model_provider = excluded.model_provider,
+           meta_json = excluded.meta_json,
            cache_key = excluded.cache_key,
            indexed_at = excluded.indexed_at,
            search_version = excluded.search_version`
@@ -880,6 +927,7 @@ export function setIndexedListCache(
            file_size,
            file_path,
            model_provider,
+           meta_json,
            search_version
          FROM conversation_index
          WHERE cache_key = ?`
@@ -897,6 +945,7 @@ export function setIndexedListCache(
         file_size: number;
         file_path: string;
         model_provider: string | null;
+        meta_json: string | null;
         search_version: number;
       }>;
       const existingChunkRows = database.prepare(
@@ -926,20 +975,7 @@ export function setIndexedListCache(
         existingRows.map((row) => [
           row.id,
           createIndexedItemSignature({
-            meta: {
-              id: row.id,
-              provider: row.provider,
-              title: row.title,
-              project: row.project,
-              projectKey: row.project_key,
-              projectId: row.project_id ?? undefined,
-              createdAt: row.created_at,
-              updatedAt: row.updated_at,
-              messageCount: row.message_count,
-              fileSize: row.file_size,
-              filePath: row.file_path,
-              modelProvider: row.model_provider ?? undefined,
-            },
+            meta: buildConversationMetaFromIndexRow(row),
             searchText: row.search_text ?? undefined,
             searchChunks: existingChunksById.get(row.id),
             searchVersion: row.search_version,
@@ -990,6 +1026,7 @@ export function setIndexedListCache(
           meta.fileSize,
           meta.filePath,
           meta.modelProvider ?? null,
+          JSON.stringify(meta),
           cacheKey,
           updatedAt,
           searchVersion
@@ -1207,7 +1244,8 @@ export function queryConversationIndex(options: {
         conversation_index.message_count,
         conversation_index.file_size,
         conversation_index.file_path,
-        conversation_index.model_provider
+        conversation_index.model_provider,
+        conversation_index.meta_json
       FROM conversation_index
       WHERE ${whereClauses.join(" AND ")}
       ORDER BY ${orderBy}
@@ -1227,22 +1265,10 @@ export function queryConversationIndex(options: {
       file_size: number;
       file_path: string;
       model_provider: string | null;
+      meta_json: string | null;
     }>;
 
-    return rows.map((row) => ({
-      id: row.id,
-      provider: row.provider,
-      title: row.title,
-      project: row.project,
-      projectKey: row.project_key,
-      projectId: row.project_id ?? undefined,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      messageCount: row.message_count,
-      fileSize: row.file_size,
-      filePath: row.file_path,
-      modelProvider: row.model_provider ?? undefined,
-    }));
+    return rows.map((row) => buildConversationMetaFromIndexRow(row));
   } catch {
     return [];
   }

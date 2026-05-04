@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { buildTitleGenerationMessages, createConversationRoutes } from "../conversations.js";
 import {
   invalidateListCache,
@@ -89,6 +89,103 @@ function createConversationMeta(partial: Partial<ConversationMeta> & Pick<Conver
     filePath: "/tmp/project/session.jsonl",
     ...partial,
   };
+}
+
+async function createFakeCodexTitleEnv() {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-route-ai-test-"));
+  const binDir = join(baseDir, "bin");
+  const configPath = join(baseDir, "config.json");
+  const sessionDir = join(baseDir, "ai-title-sessions", "codex");
+  const runnerPath = join(binDir, "fake-title-cli.mjs");
+  const unixWrapperPath = join(binDir, "codex");
+  const cmdWrapperPath = join(binDir, "codex.cmd");
+  const previousPath = process.env.PATH;
+  const previousConfigPath = process.env.CHATLOG_VIEWER_CONFIG_PATH;
+
+  await mkdir(binDir, { recursive: true });
+  await writeFile(
+    runnerPath,
+    `import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const [, , toolName, ...args] = process.argv;
+let input = "";
+
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  input += chunk;
+});
+process.stdin.on("end", () => {
+  const cwd = process.cwd();
+  const sessionFile = join(cwd, \`\${toolName}.session\`);
+  const callsFile = join(cwd, \`\${toolName}.calls.log\`);
+  const isResume = args.includes("resume") || args.includes("--resume") || args.includes("-c") || args.includes("--continue");
+
+  appendFileSync(callsFile, \`\${JSON.stringify({ args, isResume, inputLength: input.length })}\\n\`, "utf8");
+
+  if (isResume) {
+    if (!existsSync(sessionFile)) {
+      process.stderr.write("No conversation found to resume");
+      process.exit(1);
+      return;
+    }
+
+    process.stdout.write("复用路由标题");
+    process.exit(0);
+    return;
+  }
+
+  writeFileSync(sessionFile, "active", "utf8");
+  process.stdout.write("新建路由标题");
+  process.exit(0);
+});
+
+process.stdin.resume();
+`,
+    "utf-8"
+  );
+  await writeFile(
+    unixWrapperPath,
+    `#!/usr/bin/env sh
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${process.execPath}" "$SCRIPT_DIR/fake-title-cli.mjs" codex "$@"
+`,
+    "utf-8"
+  );
+  await writeFile(
+    cmdWrapperPath,
+    `@echo off\r\n"${process.execPath}" "%~dp0fake-title-cli.mjs" codex %*\r\n`,
+    "utf-8"
+  );
+  await chmod(unixWrapperPath, 0o755);
+
+  process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+  process.env.CHATLOG_VIEWER_CONFIG_PATH = configPath;
+
+  return {
+    baseDir,
+    sessionDir,
+    restoreEnv() {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+
+      if (previousConfigPath === undefined) delete process.env.CHATLOG_VIEWER_CONFIG_PATH;
+      else process.env.CHATLOG_VIEWER_CONFIG_PATH = previousConfigPath;
+    },
+  };
+}
+
+async function readFakeCodexTitleCalls(sessionDir: string) {
+  const content = await readFile(join(sessionDir, "codex.calls.log"), "utf-8");
+  return content
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as {
+      args: string[];
+      isResume: boolean;
+      inputLength: number;
+    });
 }
 
 test("provider 过滤为空时返回空列表", async () => {
@@ -186,7 +283,7 @@ test("支持原生标题持久化的 provider 会调用 updateTitle 并清理 ov
   assert.equal(data.conversations[0]?.title, "同步到原生存储");
 });
 
-test("列表接口会显示旧 overlay 标题但不回填到支持原生标题的 provider", async () => {
+test("列表接口不会用旧 overlay 覆盖支持原生标题的 provider", async () => {
   const sourceConversations = [
     createConversationMeta({
       id: "codex:legacy-title",
@@ -217,12 +314,12 @@ test("列表接口会显示旧 overlay 标题但不回填到支持原生标题�
   assert.equal(res.status, 200);
 
   const data = (await res.json()) as { total: number; conversations: ConversationMeta[] };
-  assert.equal(data.conversations[0]?.title, "旧覆盖标题");
+  assert.equal(data.conversations[0]?.title, "原始标题");
   assert.deepEqual(receivedCalls, []);
   assert.equal(await getTitle("codex:legacy-title"), "旧覆盖标题");
 });
 
-test("详情接口会显示旧 overlay 标题但不回填到支持原生标题的 provider", async () => {
+test("详情接口不会用旧 overlay 覆盖支持原生标题的 provider", async () => {
   const sourceConversations = [
     createConversationMeta({
       id: "codex:legacy-detail",
@@ -257,7 +354,7 @@ test("详情接口会显示旧 overlay 标题但不回填到支持原生标题�
   assert.equal(res.status, 200);
 
   const data = await res.json() as Conversation;
-  assert.equal(data.title, "详情覆盖标题");
+  assert.equal(data.title, "原始标题");
   assert.deepEqual(receivedCalls, []);
   assert.equal(await getTitle("codex:legacy-detail"), "详情覆盖标题");
 });
@@ -434,6 +531,119 @@ test("iFlow AI 标题生成接口会被禁用", async () => {
   assert.deepEqual(await res.json(), {
     error: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
   });
+});
+
+test("AI 标题生成路由会复用固定 CLI 会话", async () => {
+  const env = await createFakeCodexTitleEnv();
+  const sourceConversations = [
+    createConversationMeta({
+      id: "codex:route-ai-title",
+      provider: "codex",
+      title: "原始标题",
+    }),
+  ];
+  const savedTitles: string[] = [];
+
+  try {
+    const app = createConversationRoutes([
+      createProvider({
+        name: "codex",
+        displayName: "Codex",
+        conversations: sourceConversations,
+        read: async (id) => ({
+          ...sourceConversations.find((item) => item.id === id)!,
+          messages: [{
+            role: "user",
+            content: "请分析标题生成路由是否复用固定会话",
+          }],
+        }),
+        updateTitle: async (_id, title) => {
+          savedTitles.push(title);
+        },
+      }),
+    ]);
+
+    const first = await app.request("http://localhost/conversations/codex%3Aroute-ai-title/generate-title", {
+      method: "POST",
+    });
+    assert.equal(first.status, 200);
+    assert.equal((await first.json() as { title: string }).title, "新建路由标题");
+
+    const second = await app.request("http://localhost/conversations/codex%3Aroute-ai-title/generate-title", {
+      method: "POST",
+    });
+    assert.equal(second.status, 200);
+    assert.equal((await second.json() as { title: string }).title, "复用路由标题");
+
+    const calls = await readFakeCodexTitleCalls(env.sessionDir);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]?.isResume, false);
+    assert.equal(calls[1]?.isResume, true);
+    assert.deepEqual(savedTitles, ["新建路由标题", "复用路由标题"]);
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("AI 标题生成路由在不固定模式下每次新建 CLI 会话", async () => {
+  const env = await createFakeCodexTitleEnv();
+  const sourceConversations = [
+    createConversationMeta({
+      id: "codex:route-ai-title-fresh",
+      provider: "codex",
+      title: "原始标题",
+    }),
+  ];
+
+  try {
+    await writeFile(
+      join(env.baseDir, "config.json"),
+      JSON.stringify({
+        ai: {
+          titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliSessionModes: {
+            codex: "fresh",
+            claude: "fixed",
+            opencode: "fixed",
+          },
+        },
+      }),
+      "utf-8"
+    );
+
+    const app = createConversationRoutes([
+      createProvider({
+        name: "codex",
+        displayName: "Codex",
+        conversations: sourceConversations,
+        read: async (id) => ({
+          ...sourceConversations.find((item) => item.id === id)!,
+          messages: [{
+            role: "user",
+            content: "请分析标题生成路由的不固定模式",
+          }],
+        }),
+        updateTitle: async () => {},
+      }),
+    ]);
+
+    for (let index = 0; index < 2; index += 1) {
+      const response = await app.request("http://localhost/conversations/codex%3Aroute-ai-title-fresh/generate-title", {
+        method: "POST",
+      });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json() as { title: string }).title, "新建路由标题");
+    }
+
+    const calls = await readFakeCodexTitleCalls(env.sessionDir);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]?.isResume, false);
+    assert.equal(calls[1]?.isResume, false);
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
 });
 
 test("批量 AI 标题生成会跳过 iFlow 并返回禁用错误", async () => {

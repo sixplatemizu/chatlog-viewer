@@ -33,7 +33,12 @@ function createSettings(overrides?: Partial<ProviderPathSettings>): ProviderPath
   return {
     configPath: "/tmp/chatlog-viewer/config.json",
     ai: {
-      titleGenerationCliPriority: ["codex", "claude"],
+      titleGenerationCliPriority: ["codex", "claude", "opencode"],
+      titleGenerationCliSessionModes: {
+        codex: "fixed",
+        claude: "fixed",
+        opencode: "fixed",
+      },
     },
     providers: [
       {
@@ -59,6 +64,7 @@ describe("ProviderPathsDialog", () => {
     mockFetchAvailableClis.mockResolvedValue([
       { name: "codex", discoverable: true, healthy: true, hasSession: false },
       { name: "claude", discoverable: false, healthy: false, hasSession: false },
+      { name: "opencode", discoverable: true, healthy: true, hasSession: false },
     ]);
   });
 
@@ -81,12 +87,20 @@ describe("ProviderPathsDialog", () => {
           },
         },
         ai: {
-          titleGenerationCliPriority: ["codex", "claude"],
+          titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliSessionModes: {
+            codex: "fixed",
+            claude: "fixed",
+            opencode: "fixed",
+          },
         },
       });
 
       return {
         ...settings,
+        ai: {
+          ...settings.ai,
+        },
         providers: [
           {
             ...settings.providers[0],
@@ -178,8 +192,8 @@ describe("ProviderPathsDialog", () => {
       />
     );
 
-    await screen.findByText("命令已发现");
-    expect(screen.getByText("健康可用")).toBeInTheDocument();
+    expect(await screen.findAllByText("命令已发现")).toHaveLength(2);
+    expect(screen.getAllByText("健康可用")).toHaveLength(2);
     expect(screen.getByText("命令未发现")).toBeInTheDocument();
   });
 
@@ -188,11 +202,12 @@ describe("ProviderPathsDialog", () => {
 
     mockFetchProviderPathSettings.mockResolvedValue(settings);
     mockUpdateProviderPathSettings.mockImplementation(async (payload) => {
-      expect(payload.ai?.titleGenerationCliPriority).toEqual(["claude", "codex"]);
+      expect(payload.ai?.titleGenerationCliPriority).toEqual(["claude", "codex", "opencode"]);
       return {
         ...settings,
         ai: {
-          titleGenerationCliPriority: ["claude", "codex"],
+          titleGenerationCliPriority: ["claude", "codex", "opencode"],
+          titleGenerationCliSessionModes: settings.ai.titleGenerationCliSessionModes,
         },
       };
     });
@@ -206,7 +221,48 @@ describe("ProviderPathsDialog", () => {
     );
 
     await screen.findByText("AI 标题生成优先级");
+    expect(screen.getByText("OpenCode")).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText("下移 Codex"));
+    fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
+
+    await waitFor(() => {
+      expect(mockUpdateProviderPathSettings).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("允许切换 AI 标题生成固定模式并保存到 API", async () => {
+    const settings = createSettings();
+
+    mockFetchProviderPathSettings.mockResolvedValue(settings);
+    mockUpdateProviderPathSettings.mockImplementation(async (payload) => {
+      expect(payload.ai?.titleGenerationCliSessionModes).toEqual({
+        codex: "fresh",
+        claude: "fixed",
+        opencode: "fixed",
+      });
+      return {
+        ...settings,
+        ai: {
+          titleGenerationCliPriority: settings.ai.titleGenerationCliPriority,
+          titleGenerationCliSessionModes: {
+            codex: "fresh",
+            claude: "fixed",
+            opencode: "fixed",
+          },
+        },
+      };
+    });
+
+    render(
+      <ProviderPathsDialog
+        open
+        onClose={() => {}}
+        onNotify={() => {}}
+      />
+    );
+
+    await screen.findByText("AI 标题生成优先级");
+    fireEvent.click(screen.getByLabelText("切换为不固定模式 Codex"));
     fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
 
     await waitFor(() => {
@@ -223,10 +279,12 @@ describe("ProviderPathsDialog", () => {
       .mockResolvedValueOnce([
         { name: "codex", discoverable: true, healthy: true, hasSession: true },
         { name: "claude", discoverable: false, healthy: false, hasSession: false },
+        { name: "opencode", discoverable: true, healthy: true, hasSession: false },
       ])
       .mockResolvedValueOnce([
         { name: "codex", discoverable: true, healthy: true, hasSession: false },
         { name: "claude", discoverable: false, healthy: false, hasSession: false },
+        { name: "opencode", discoverable: true, healthy: true, hasSession: false },
       ]);
 
     render(

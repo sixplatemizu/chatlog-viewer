@@ -11,6 +11,7 @@ import {
   type ProviderPathInfo,
   type ProviderPathSettings,
   type TitleGenerationCli,
+  type TitleGenerationCliSessionMode,
 } from "../lib/api";
 import type { ToastPayload } from "./ToastViewport";
 
@@ -48,6 +49,13 @@ const SOURCE_STYLES = {
 const TITLE_GENERATION_CLI_LABELS: Record<TitleGenerationCli, string> = {
   codex: "Codex",
   claude: "Claude Code",
+  opencode: "OpenCode",
+};
+
+const DEFAULT_TITLE_GENERATION_SESSION_MODES: Record<TitleGenerationCli, TitleGenerationCliSessionMode> = {
+  codex: "fixed",
+  claude: "fixed",
+  opencode: "fixed",
 };
 
 function buildCliStateMap(clis: AvailableCliInfo[]): Partial<Record<TitleGenerationCli, AvailableCliInfo>> {
@@ -249,18 +257,22 @@ function ProviderCard({
 
 function TitleGenerationPriorityCard({
   priority,
+  sessionModes,
   cliStates,
   saving,
   resettingCli,
   onMove,
+  onToggleSessionMode,
   onResetCli,
   onResetAll,
 }: {
   priority: TitleGenerationCli[];
+  sessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
   cliStates: Partial<Record<TitleGenerationCli, AvailableCliInfo>>;
   saving: boolean;
   resettingCli: TitleGenerationCli | "all" | null;
   onMove: (index: number, direction: -1 | 1) => void;
+  onToggleSessionMode: (cli: TitleGenerationCli) => void;
   onResetCli: (cli: TitleGenerationCli) => void;
   onResetAll: () => void;
 }) {
@@ -274,7 +286,7 @@ function TitleGenerationPriorityCard({
           <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">AI 标题生成优先级</div>
             <div className="text-[11px] text-gray-500 dark:text-gray-400">
-              生成标题时会按以下顺序依次尝试，成功后立即停止 fallback。每个 CLI 也会复用固定会话，可在这里手动重置。
+              生成标题时会按以下顺序依次尝试；固定模式会复用最近一次标题生成会话，不固定模式每次新建但仍记录最近会话。
             </div>
           </div>
         </div>
@@ -295,6 +307,8 @@ function TitleGenerationPriorityCard({
           const discoverable = cliState?.discoverable ?? false;
           const healthy = cliState?.healthy ?? false;
           const hasSession = cliState?.hasSession ?? false;
+          const sessionMode = sessionModes[cli] ?? "fixed";
+          const fixedMode = sessionMode === "fixed";
 
           return (
             <div
@@ -331,15 +345,33 @@ function TitleGenerationPriorityCard({
                   </span>
                   <span
                     className={`rounded-full border px-2 py-0.5 text-[10px] ${
-                      hasSession
+                      fixedMode
                         ? "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-700 dark:bg-blue-900/30 dark:text-blue-300"
                         : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
                     }`}
                   >
-                    {hasSession ? "已有固定会话" : "无固定会话"}
+                    {fixedMode ? "固定模式" : "不固定模式"}
+                  </span>
+                  <span
+                    className={`rounded-full border px-2 py-0.5 text-[10px] ${
+                      hasSession
+                        ? "border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300"
+                        : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
+                    }`}
+                  >
+                    {hasSession ? "有最近会话" : "无最近会话"}
                   </span>
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={() => onToggleSessionMode(cli)}
+                disabled={saving || resettingCli !== null}
+                className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                aria-label={`${fixedMode ? "切换为不固定模式" : "切换为固定模式"} ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+              >
+                {fixedMode ? "改为不固定" : "改为固定"}
+              </button>
               <button
                 type="button"
                 onClick={() => onResetCli(cli)}
@@ -383,6 +415,9 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
   const [drafts, setDrafts] = useState<Record<string, ProviderDraft>>({});
   const [migrationDrafts, setMigrationDrafts] = useState<Record<string, ProviderMigrationDraft>>({});
   const [titleGenerationCliPriority, setTitleGenerationCliPriority] = useState<TitleGenerationCli[]>([]);
+  const [titleGenerationCliSessionModes, setTitleGenerationCliSessionModes] = useState<Record<TitleGenerationCli, TitleGenerationCliSessionMode>>(
+    DEFAULT_TITLE_GENERATION_SESSION_MODES
+  );
   const [cliStates, setCliStates] = useState<Partial<Record<TitleGenerationCli, AvailableCliInfo>>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -405,6 +440,10 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
       setDrafts(buildDrafts(nextSettings));
       setMigrationDrafts({});
       setTitleGenerationCliPriority(nextSettings.ai.titleGenerationCliPriority);
+      setTitleGenerationCliSessionModes({
+        ...DEFAULT_TITLE_GENERATION_SESSION_MODES,
+        ...nextSettings.ai.titleGenerationCliSessionModes,
+      });
 
       if (clisResult.status === "fulfilled") {
         setCliStates(buildCliStateMap(clisResult.value));
@@ -473,6 +512,13 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
       [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
       return next;
     });
+  }, []);
+
+  const handleToggleTitleGenerationSessionMode = useCallback((cli: TitleGenerationCli) => {
+    setTitleGenerationCliSessionModes((prev) => ({
+      ...prev,
+      [cli]: (prev[cli] ?? "fixed") === "fixed" ? "fresh" : "fixed",
+    }));
   }, []);
 
   const refreshCliStates = useCallback(async () => {
@@ -567,6 +613,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
         migrations,
         ai: {
           titleGenerationCliPriority,
+          titleGenerationCliSessionModes: titleGenerationCliSessionModes,
         },
       });
 
@@ -574,6 +621,10 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
       setDrafts(buildDrafts(nextSettings));
       setMigrationDrafts({});
       setTitleGenerationCliPriority(nextSettings.ai.titleGenerationCliPriority);
+      setTitleGenerationCliSessionModes({
+        ...DEFAULT_TITLE_GENERATION_SESSION_MODES,
+        ...nextSettings.ai.titleGenerationCliSessionModes,
+      });
       await onSaved?.();
 
       const migrationMessages = nextSettings.migrationResults?.map((item) => item.message) ?? [];
@@ -593,7 +644,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
     } finally {
       setSaving(false);
     }
-  }, [drafts, migrationDrafts, onNotify, onSaved, settings, titleGenerationCliPriority]);
+  }, [drafts, migrationDrafts, onNotify, onSaved, settings, titleGenerationCliPriority, titleGenerationCliSessionModes]);
 
   if (!open) return null;
 
@@ -634,10 +685,12 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
             <div className="space-y-4">
               <TitleGenerationPriorityCard
                 priority={titleGenerationCliPriority}
+                sessionModes={titleGenerationCliSessionModes}
                 cliStates={cliStates}
                 saving={saving}
                 resettingCli={resettingCli}
                 onMove={handleMoveTitleGenerationCli}
+                onToggleSessionMode={handleToggleTitleGenerationSessionMode}
                 onResetCli={(cli) => void handleResetCli(cli)}
                 onResetAll={() => void handleResetAllClis()}
               />

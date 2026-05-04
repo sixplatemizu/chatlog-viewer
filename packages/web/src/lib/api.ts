@@ -91,6 +91,7 @@ export interface ProviderPathSettings {
   providers: ProviderPathInfo[];
   ai: {
     titleGenerationCliPriority: TitleGenerationCli[];
+    titleGenerationCliSessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
   };
   migrationResults?: ProviderPathMigrationResult[];
 }
@@ -104,9 +105,17 @@ export interface ProviderPathMigrationResult {
   message: string;
 }
 
-export type TitleGenerationCli = "codex" | "claude";
+export type TitleGenerationCli = "codex" | "claude" | "opencode";
+export type TitleGenerationCliSessionMode = "fixed" | "fresh";
 export type TitleSyncMode = "native" | "overlay";
 export type ConversationContentStatus = "full" | "history-only" | "metadata-only";
+export type ConversationBadgeTone = "gray" | "blue" | "cyan" | "amber" | "rose" | "indigo" | "green";
+
+export interface ConversationBadge {
+  label: string;
+  tone?: ConversationBadgeTone;
+  title?: string;
+}
 
 export interface ConversationCapabilities {
   canUpdateTitle: boolean;
@@ -134,6 +143,7 @@ export interface ConversationMeta {
   contentStatus?: ConversationContentStatus;
   titleGenerationHint?: string;
   cleanupCandidate?: boolean;
+  badges?: ConversationBadge[];
 }
 
 export interface Message {
@@ -173,7 +183,10 @@ export async function fetchProviderPathSettings(signal?: AbortSignal): Promise<P
 export async function updateProviderPathSettings(payload: {
   providers: Record<string, { storagePath?: string | null; stateDbPath?: string | null }>;
   migrations?: Record<string, { storagePath?: boolean; stateDbPath?: boolean }>;
-  ai?: { titleGenerationCliPriority: TitleGenerationCli[] };
+  ai?: {
+    titleGenerationCliPriority: TitleGenerationCli[];
+    titleGenerationCliSessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
+  };
 }): Promise<ProviderPathSettings> {
   return requestJson<ProviderPathSettings>(`${BASE}/settings/provider-paths`, {
     method: "PUT",

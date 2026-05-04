@@ -8,7 +8,9 @@ import {
   getAppConfig,
   getProviderConfigPath,
   getTitleGenerationCliPriority,
+  getTitleGenerationCliSessionModes,
   normalizeTitleGenerationCliPriority,
+  normalizeTitleGenerationCliSessionModes,
   resolveProviderPaths,
   updateProviderConfigs,
 } from "../../utils/provider-paths.js";
@@ -96,6 +98,63 @@ test("Codex state db 会优先跟随已解析的 sessions 上级目录", () => {
   assert.equal(resolved.stateDbSource, "auto");
 });
 
+test("OpenCode 会解析数据目录并优先使用同目录 opencode.db", () => {
+  const resolved = resolveProviderPaths("opencode", {
+    homeDir: "/home/tester",
+    config: {
+      providers: {
+        opencode: {
+          storagePath: "/data/opencode",
+        },
+      },
+    },
+    pathExists: (path, kind) => {
+      if (kind === "directory") return path === "/data/opencode";
+      if (kind === "file") return path === "/data/opencode/opencode.db";
+      return false;
+    },
+  });
+
+  assert.equal(resolved.storagePath, "/data/opencode");
+  assert.equal(resolved.storageSource, "config");
+  assert.equal(resolved.stateDbPath, "/data/opencode/opencode.db");
+  assert.equal(resolved.stateDbSource, "auto");
+  assert.equal(resolved.stateDbExists, true);
+});
+
+test("OpenCode state db 支持环境变量覆盖", () => {
+  const resolved = resolveProviderPaths("opencode", {
+    homeDir: "/home/tester",
+    env: {
+      CHATLOG_VIEWER_OPENCODE_DB_PATH: "/custom/opencode.db",
+    },
+    openCodeDbPath: null,
+    pathExists: (path, kind) => kind === "file" && path === "/custom/opencode.db",
+  });
+
+  assert.equal(resolved.stateDbPath, "/custom/opencode.db");
+  assert.equal(resolved.stateDbSource, "env");
+  assert.equal(resolved.stateDbExists, true);
+});
+
+test("OpenCode 会使用 CLI 返回的 DB 路径作为自动发现候选", () => {
+  const resolved = resolveProviderPaths("opencode", {
+    homeDir: "/home/tester",
+    openCodeDbPath: "/custom/share/opencode/opencode.db",
+    pathExists: (path, kind) => {
+      if (kind === "directory") return path === "/custom/share/opencode";
+      if (kind === "file") return path === "/custom/share/opencode/opencode.db";
+      return false;
+    },
+  });
+
+  assert.equal(resolved.storagePath, "/custom/share/opencode");
+  assert.equal(resolved.storageSource, "auto");
+  assert.equal(resolved.stateDbPath, "/custom/share/opencode/opencode.db");
+  assert.equal(resolved.stateDbSource, "auto");
+  assert.equal(resolved.stateDbExists, true);
+});
+
 test("未命中任何候选时回退到默认路径", () => {
   const resolved = resolveProviderPaths("claude-code", {
     homeDir: "/home/tester",
@@ -121,8 +180,24 @@ test("配置文件路径支持环境变量覆盖", () => {
 
 test("标题生成 CLI 优先级会归一化并补齐缺失项", () => {
   assert.deepEqual(
-    normalizeTitleGenerationCliPriority(["codex", "iflow", "codex"]),
-    ["codex", "claude"]
+    normalizeTitleGenerationCliPriority(["codex", "iflow", "opencode", "codex"]),
+    ["codex", "opencode", "claude"]
+  );
+});
+
+test("标题生成 CLI 会话模式会归一化并补齐默认固定模式", () => {
+  assert.deepEqual(
+    normalizeTitleGenerationCliSessionModes({
+      codex: "fresh",
+      claude: "bad",
+      opencode: "fixed",
+      iflow: "fresh",
+    }),
+    {
+      codex: "fresh",
+      claude: "fixed",
+      opencode: "fixed",
+    }
   );
 });
 
@@ -147,7 +222,12 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
       baseDir,
       {
         ai: {
-          titleGenerationCliPriority: ["codex", "claude"],
+          titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliSessionModes: {
+            codex: "fresh",
+            claude: "fixed",
+            opencode: "fixed",
+          },
         },
       }
     );
@@ -156,13 +236,21 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
       await readFile(join(baseDir, "config.json"), "utf-8")
     ) as {
       providers?: Record<string, { storagePath?: string; stateDbPath?: string }>;
-      ai?: { titleGenerationCliPriority?: string[] };
+      ai?: {
+        titleGenerationCliPriority?: string[];
+        titleGenerationCliSessionModes?: Record<string, string>;
+      };
     };
 
     assert.equal(saved.providers?.codex?.storagePath, "/data/codex/sessions");
     assert.equal(saved.providers?.codex?.stateDbPath, "/data/codex/state_5.sqlite");
     assert.equal(saved.providers?.["claude-code"]?.storagePath, "/data/claude/projects");
-    assert.deepEqual(saved.ai?.titleGenerationCliPriority, ["codex", "claude"]);
+    assert.deepEqual(saved.ai?.titleGenerationCliPriority, ["codex", "claude", "opencode"]);
+    assert.deepEqual(saved.ai?.titleGenerationCliSessionModes, {
+      codex: "fresh",
+      claude: "fixed",
+      opencode: "fixed",
+    });
 
     await updateProviderConfigs(
       {
@@ -178,7 +266,12 @@ test("更新 provider 配置会写入文件并支持清空回退", async () => {
     const loaded = getAppConfig(env, baseDir);
     assert.equal(loaded.config.providers?.codex, undefined);
     assert.equal(loaded.config.providers?.["claude-code"]?.storagePath, "/data/claude/projects");
-    assert.deepEqual(getTitleGenerationCliPriority(env, baseDir), ["codex", "claude"]);
+    assert.deepEqual(getTitleGenerationCliPriority(env, baseDir), ["codex", "claude", "opencode"]);
+    assert.deepEqual(getTitleGenerationCliSessionModes(env, baseDir), {
+      codex: "fresh",
+      claude: "fixed",
+      opencode: "fixed",
+    });
   } finally {
     await rm(baseDir, { recursive: true, force: true });
   }

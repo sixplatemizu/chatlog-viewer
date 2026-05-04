@@ -7,6 +7,7 @@ import { createExportRoutes } from "./routes/export.js";
 import { ClaudeCodeProvider } from "./providers/claude-code.js";
 import { CodexProvider } from "./providers/codex.js";
 import { IFlowProvider } from "./providers/iflow.js";
+import { OpenCodeProvider } from "./providers/opencode.js";
 import type { ConversationProvider } from "./providers/types.js";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -46,6 +47,7 @@ export function createDefaultProviders(): ConversationProvider[] {
   return [
     new ClaudeCodeProvider(),
     new CodexProvider(),
+    new OpenCodeProvider(),
     new IFlowProvider(),
   ];
 }

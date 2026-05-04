@@ -8,8 +8,9 @@ import type BetterSqlite3 from "better-sqlite3";
 import { ClaudeCodeProvider } from "./claude-code.js";
 import { clearCodexMessageIdentityCacheForTests, CodexProvider } from "./codex.js";
 import { IFlowProvider } from "./iflow.js";
+import { OpenCodeProvider } from "./opencode.js";
 import { clearProviderPathCache } from "../utils/provider-paths.js";
-import { getIndexedCacheSnapshot, getIndexedListCacheKey, setCacheStoreDirForTests } from "../utils/cache.js";
+import { getIndexedCacheSnapshot, getIndexedListCacheKey, queryConversationIndex, setCacheStoreDirForTests } from "../utils/cache.js";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
@@ -173,6 +174,8 @@ test("Claude Code 的 hint-only 空壳会标记为 metadata-only 且可清理", 
     assert.equal(conversations[0]?.id, `claude-code:${sessionId}`);
     assert.equal(conversations[0]?.contentStatus, "metadata-only");
     assert.equal(conversations[0]?.cleanupCandidate, true);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "索引空壳"), true);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "无 transcript"), true);
     assert.equal(conversations[0]?.messageCount, 0);
   } finally {
     await fixture.cleanup(() => {
@@ -226,9 +229,12 @@ test("Claude Code 的 history-only 会话不会被标记为残留记录", async 
     assert.equal(conversations.length, 1);
     assert.equal(conversations[0]?.contentStatus, "history-only");
     assert.equal(conversations[0]?.cleanupCandidate, false);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "history 回填"), true);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "无 transcript"), true);
 
     const detail = await provider.read(`claude-code:${sessionId}`);
     assert.equal(detail.contentStatus, "history-only");
+    assert.equal(detail.badges?.some((badge) => badge.label === "history 回填"), true);
     assert.equal(detail.messages[0]?.role, "system");
     assert.equal(detail.messages[1]?.role, "user");
   } finally {
@@ -301,6 +307,476 @@ test("iFlow 在 eagerSearchIndex 模式下会同步构建搜索索引", async ()
         delete process.env.CHATLOG_VIEWER_IFLOW_PATH;
       } else {
         process.env.CHATLOG_VIEWER_IFLOW_PATH = previousStoragePath;
+      }
+    });
+  }
+});
+
+function createOpenCodeSchema(db: BetterSqlite3.Database): void {
+  db.exec(`
+    CREATE TABLE project (
+      id TEXT PRIMARY KEY,
+      worktree TEXT,
+      name TEXT,
+      time_created INTEGER,
+      time_updated INTEGER
+    );
+
+    CREATE TABLE session (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      parent_id TEXT,
+      slug TEXT,
+      directory TEXT,
+      title TEXT,
+      version TEXT,
+      permission TEXT,
+      time_created INTEGER,
+      time_updated INTEGER,
+      time_archived INTEGER,
+      path TEXT
+    );
+
+    CREATE TABLE message (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      time_created INTEGER,
+      time_updated INTEGER,
+      data TEXT
+    );
+
+    CREATE TABLE part (
+      id TEXT PRIMARY KEY,
+      message_id TEXT,
+      session_id TEXT,
+      time_created INTEGER,
+      time_updated INTEGER,
+      data TEXT
+    );
+
+    CREATE TABLE session_entry (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      type TEXT,
+      time_created INTEGER,
+      time_updated INTEGER,
+      data TEXT
+    );
+
+    CREATE TABLE session_share (
+      session_id TEXT,
+      id TEXT,
+      secret TEXT,
+      url TEXT,
+      time_created INTEGER,
+      time_updated INTEGER
+    );
+
+    CREATE TABLE todo (
+      session_id TEXT,
+      content TEXT,
+      status TEXT,
+      priority TEXT,
+      position INTEGER,
+      time_created INTEGER,
+      time_updated INTEGER
+    );
+
+    CREATE TABLE event (
+      id TEXT PRIMARY KEY,
+      aggregate_id TEXT,
+      seq INTEGER,
+      type TEXT,
+      data TEXT
+    );
+
+    CREATE TABLE event_sequence (
+      aggregate_id TEXT PRIMARY KEY,
+      seq INTEGER
+    );
+  `);
+}
+
+test("OpenCode 会从 SQLite 构建列表、详情和搜索索引", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-indexing-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+  const sessionId = "ses_opencode_indexing";
+  const userMessageId = "msg_opencode_user";
+  const assistantMessageId = "msg_opencode_assistant";
+  const childSessionId = "ses_opencode_child";
+  const needle = "opencode-index-needle";
+  const now = Date.now();
+  const oldSessionId = "ses_opencode_old";
+  const runSessionId = "ses_opencode_run";
+  const archivedSessionId = "ses_opencode_archived";
+  const titleGenerationSessionId = "ses_opencode_title_generation";
+  let provider: OpenCodeProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      createOpenCodeSchema(db);
+      db.prepare(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?)"
+      ).run("proj-demo", "/", "chatlog-viewer", 1774500000000, 1774500000000);
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sessionId,
+        "proj-demo",
+        null,
+        "demo-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 原生标题",
+        "1.14.30",
+        now - 10_000,
+        now,
+        null,
+        null
+      );
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        childSessionId,
+        "proj-demo",
+        sessionId,
+        "child-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 子会话标题",
+        "1.14.30",
+        now - 9_000,
+        now - 8_000,
+        null,
+        null
+      );
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path, permission
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        oldSessionId,
+        "proj-demo",
+        null,
+        "old-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 旧会话",
+        "1.14.30",
+        now - 31 * 24 * 60 * 60 * 1000,
+        now - 31 * 24 * 60 * 60 * 1000,
+        null,
+        null,
+        null
+      );
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path, permission
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        runSessionId,
+        "proj-demo",
+        null,
+        "deny-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "New session - 2026-05-03T15:42:07.067Z",
+        "1.14.30",
+        now - 7_000,
+        now - 6_000,
+        null,
+        null,
+        JSON.stringify([
+          { permission: "question", pattern: "*", action: "deny" },
+          { permission: "plan_enter", pattern: "*", action: "deny" },
+          { permission: "plan_exit", pattern: "*", action: "deny" },
+        ])
+      );
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        archivedSessionId,
+        "proj-demo",
+        null,
+        "archived-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 已归档会话",
+        "1.14.30",
+        now - 5_500,
+        now - 5_000,
+        now - 1_000,
+        null
+      );
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        titleGenerationSessionId,
+        "proj-demo",
+        null,
+        "title-generation-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "ChatLog Viewer AI Title - 2026-05-03T15:42:07.067Z",
+        "1.14.30",
+        now - 4_500,
+        now - 4_000,
+        null,
+        null
+      );
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run(userMessageId, sessionId, 1774500001000, 1774500001000, JSON.stringify({ role: "user", time: 1774500001000 }));
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run(assistantMessageId, sessionId, 1774500002000, 1774500003000, JSON.stringify({ role: "assistant" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_user_text", userMessageId, sessionId, 1774500001000, 1774500001000, JSON.stringify({ type: "text", text: `请搜索 ${needle}` }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_assistant_text", assistantMessageId, sessionId, 1774500002000, 1774500002000, JSON.stringify({ type: "text", text: `${needle} 已写入 OpenCode 搜索索引` }));
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run("msg_child", childSessionId, 1774500006000, 1774500006000, JSON.stringify({ role: "user" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_child", "msg_child", childSessionId, 1774500006000, 1774500006000, JSON.stringify({ type: "text", text: "子会话详情仍可读取" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(
+          "prt_tool",
+          assistantMessageId,
+          sessionId,
+          1774500002500,
+          1774500002500,
+          JSON.stringify({
+            type: "tool",
+            tool: "read",
+            state: {
+              input: { filePath: "src/app.ts" },
+              output: "工具输出",
+              status: "completed",
+            },
+          })
+        );
+    } finally {
+      db.close();
+    }
+
+    provider = new OpenCodeProvider();
+    const conversations = await provider.list({ eagerSearchIndex: true });
+    const conversationById = new Map(conversations.map((item) => [item.id, item]));
+    assert.deepEqual(new Set(conversations.map((item) => item.id)), new Set([
+      `opencode:${sessionId}`,
+      `opencode:${childSessionId}`,
+      `opencode:${oldSessionId}`,
+      `opencode:${runSessionId}`,
+      `opencode:${archivedSessionId}`,
+      `opencode:${titleGenerationSessionId}`,
+    ]));
+    assert.equal(conversations[0]?.id, `opencode:${sessionId}`);
+    assert.equal(conversationById.get(`opencode:${sessionId}`)?.title, "OpenCode 原生标题");
+    assert.equal(conversationById.get(`opencode:${sessionId}`)?.messageCount, 2);
+    assert.equal(conversationById.get(`opencode:${sessionId}`)?.project, "C:/Users/tester/Desktop/code_area/chatlog-viewer");
+    assert.ok((conversationById.get(`opencode:${sessionId}`)?.fileSize ?? 0) > 0);
+    assert.equal(conversationById.get(`opencode:${childSessionId}`)?.badges?.some((badge) => badge.label === "子会话"), true);
+    assert.equal(conversationById.get(`opencode:${oldSessionId}`)?.badges?.some((badge) => badge.label === "30天外"), true);
+    assert.equal(conversationById.get(`opencode:${runSessionId}`)?.badges?.some((badge) => badge.label === "run/临时"), true);
+    assert.equal(conversationById.get(`opencode:${archivedSessionId}`)?.badges?.some((badge) => badge.label === "已归档"), true);
+    assert.equal(conversationById.get(`opencode:${titleGenerationSessionId}`)?.badges?.some((badge) => badge.label === "标题生成"), true);
+
+    const cacheKey = getIndexedListCacheKey("opencode", provider.getStoragePath());
+    const snapshot = getIndexedCacheSnapshot(cacheKey);
+    assert.equal(snapshot?.some((item) => item.meta.id === `opencode:${sessionId}`), true);
+    assert.equal(snapshot?.some((item) => item.meta.id === `opencode:${childSessionId}`), true);
+    assert.ok(snapshot?.find((item) => item.meta.id === `opencode:${sessionId}`)?.searchText?.includes(needle));
+    assert.ok(snapshot?.find((item) => item.meta.id === `opencode:${sessionId}`)?.searchChunks?.some((chunk) => chunk.includes(needle)));
+    const indexedChildMatches = queryConversationIndex({ cacheKeys: [cacheKey], search: "子会" });
+    assert.equal(indexedChildMatches[0]?.id, `opencode:${childSessionId}`);
+    assert.equal(indexedChildMatches[0]?.badges?.some((badge) => badge.label === "子会话"), true);
+
+    const childDetail = await provider.read(`opencode:${childSessionId}`);
+    assert.equal(childDetail.title, "OpenCode 子会话标题");
+    assert.equal(childDetail.badges?.some((badge) => badge.label === "子会话"), true);
+    const runDetail = await provider.read(`opencode:${runSessionId}`);
+    assert.equal(runDetail.title, "New session - 2026-05-03T15:42:07.067Z");
+    assert.equal(runDetail.badges?.some((badge) => badge.label === "run/临时"), true);
+    assert.equal(childDetail.messages[0]?.content, "子会话详情仍可读取");
+
+    const detail = await provider.read(`opencode:${sessionId}`);
+    assert.equal(detail.messages.length, 3);
+    assert.equal(detail.messages[0]?.role, "user");
+    assert.equal(detail.messages[0]?.content, `请搜索 ${needle}`);
+    assert.equal(detail.messages[2]?.role, "tool");
+    assert.equal(detail.messages[2]?.toolName, "read");
+    assert.match(detail.messages[2]?.toolInput ?? "", /src\/app\.ts/);
+  } finally {
+    provider?.closeDb();
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      }
+
+      if (previousDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
+      }
+    });
+  }
+});
+
+test("OpenCode 支持 metadata 级移动会话", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-move-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+  const sessionId = "ses_opencode_move";
+  let provider: OpenCodeProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      createOpenCodeSchema(db);
+      db.prepare(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?)"
+      ).run("proj-demo", "/", null, 1774500000000, 1774500000000);
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(sessionId, "proj-demo", null, "demo", "C:/Users/tester/Desktop/code_area/original-project", "待移动标题", "1.14.30", 1774500000000, 1774500000000, null, "Users/tester/Desktop/code_area/original-project");
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run("msg_move", sessionId, 1774500001000, 1774500001000, JSON.stringify({ role: "user" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_move", "msg_move", sessionId, 1774500001000, 1774500001000, JSON.stringify({ type: "text", text: "移动测试" }));
+    } finally {
+      db.close();
+    }
+
+    provider = new OpenCodeProvider();
+    await provider.move(`opencode:${sessionId}`, "C:/Users/tester/Desktop/code_area/target-project");
+
+    const moved = await provider.read(`opencode:${sessionId}`);
+    assert.equal(moved.project, "C:/Users/tester/Desktop/code_area/target-project");
+    assert.equal(moved.projectKey, "c:/users/tester/desktop/code_area/target-project");
+
+    const verifyDb = new Database(dbPath, { readonly: true });
+    try {
+      const row = verifyDb.prepare("SELECT directory, path FROM session WHERE id = ?").get(sessionId) as { directory: string; path: string };
+      assert.equal(row.directory, "C:/Users/tester/Desktop/code_area/target-project");
+      assert.equal(row.path, "Users/tester/Desktop/code_area/target-project");
+    } finally {
+      verifyDb.close();
+    }
+  } finally {
+    provider?.closeDb();
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      }
+
+      if (previousDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
+      }
+    });
+  }
+});
+
+test("OpenCode 支持写回标题并级联删除会话", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-delete-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+  const sessionId = "ses_opencode_delete";
+  let provider: OpenCodeProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      createOpenCodeSchema(db);
+      db.prepare(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?)"
+      ).run("proj-demo", "C:/Users/tester/Desktop/code_area/chatlog-viewer", null, 1774500000000, 1774500000000);
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(sessionId, "proj-demo", null, "demo", "C:/Users/tester/Desktop/code_area/chatlog-viewer", "旧标题", "1.14.30", 1774500000000, 1774500000000, null, null);
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run("msg_delete", sessionId, 1774500001000, 1774500001000, JSON.stringify({ role: "user" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_delete", "msg_delete", sessionId, 1774500001000, 1774500001000, JSON.stringify({ type: "text", text: "删除测试" }));
+      db.prepare("INSERT INTO session_entry (id, session_id, type, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("entry_delete", sessionId, "test", 1774500001000, 1774500001000, "{}");
+      db.prepare("INSERT INTO session_share (session_id, id, secret, url, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(sessionId, "share_delete", "secret", "https://example.test", 1774500001000, 1774500001000);
+      db.prepare("INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(sessionId, "todo", "pending", "low", 0, 1774500001000, 1774500001000);
+      db.prepare("INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)")
+        .run("event_delete", sessionId, 1, "test", "{}");
+      db.prepare("INSERT INTO event_sequence (aggregate_id, seq) VALUES (?, ?)")
+        .run(sessionId, 1);
+    } finally {
+      db.close();
+    }
+
+    provider = new OpenCodeProvider();
+    await provider.updateTitle(`opencode:${sessionId}`, "新标题");
+    const updated = await provider.read(`opencode:${sessionId}`);
+    assert.equal(updated.title, "新标题");
+
+    await provider.delete(`opencode:${sessionId}`);
+
+    const verifyDb = new Database(dbPath, { readonly: true });
+    try {
+      for (const tableName of ["session", "message", "part", "session_entry", "session_share", "todo"]) {
+        const row = verifyDb.prepare(`SELECT count(*) AS count FROM ${tableName} WHERE ${tableName === "session" ? "id" : "session_id"} = ?`).get(sessionId) as { count: number };
+        assert.equal(row.count, 0, `${tableName} 应已清理`);
+      }
+      const eventRow = verifyDb.prepare("SELECT count(*) AS count FROM event WHERE aggregate_id = ?").get(sessionId) as { count: number };
+      const sequenceRow = verifyDb.prepare("SELECT count(*) AS count FROM event_sequence WHERE aggregate_id = ?").get(sessionId) as { count: number };
+      assert.equal(eventRow.count, 0);
+      assert.equal(sequenceRow.count, 0);
+    } finally {
+      verifyDb.close();
+    }
+  } finally {
+    provider?.closeDb();
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      }
+
+      if (previousDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
       }
     });
   }
@@ -695,10 +1171,13 @@ test("Codex 会回填仅存在于 state db 的对话并提供 metadata-only 详�
     assert.equal(conversations[0]?.transcriptMissing, true);
     assert.equal(conversations[0]?.contentStatus, "metadata-only");
     assert.equal(conversations[0]?.cleanupCandidate, undefined);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "state db"), true);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "无 transcript"), true);
 
     const detail = await provider.read(`codex:${sessionId}`);
     assert.equal(detail.transcriptMissing, true);
     assert.equal(detail.contentStatus, "metadata-only");
+    assert.equal(detail.badges?.some((badge) => badge.label === "state db"), true);
     assert.equal(detail.messages.length, 1);
     assert.match(detail.messages[0]?.content ?? "", /未找到 transcript 文件/);
     assert.match(detail.titleGenerationHint ?? "", /State DB 标题/);
@@ -706,6 +1185,7 @@ test("Codex 会回填仅存在于 state db 的对话并提供 metadata-only 详�
 
     const snapshot = getIndexedCacheSnapshot(getIndexedListCacheKey("codex", provider.getStoragePath()));
     assert.equal(snapshot?.[0]?.meta.id, `codex:${sessionId}`);
+    assert.equal(snapshot?.[0]?.meta.badges?.some((badge) => badge.label === "state db"), true);
     assert.ok(snapshot?.[0]?.searchText?.includes("State DB 标题"));
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
@@ -783,6 +1263,129 @@ test("Codex 删除仅存在于 state db 的对话后不会再次回填", async (
 
     const afterDelete = await provider.list({ eagerSearchIndex: true });
     assert.equal(afterDelete.some((item) => item.id === `codex:${sessionId}`), false);
+  } finally {
+    (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
+    await fixture.cleanup(() => {
+      if (previousSessionsPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH = previousSessionsPath;
+      }
+
+      if (previousStateDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH = previousStateDbPath;
+      }
+    });
+  }
+});
+
+test("Codex 手动标题写入 state db 后会刷新 transcript 列表标题", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-codex-native-title-refresh-");
+  const storagePath = join(fixture.baseDir, "sessions");
+  const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
+  const previousSessionsPath = process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH;
+  const previousStateDbPath = process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH;
+  const sessionId = "codex-native-title-refresh-session";
+  let provider: CodexProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH = stateDbPath;
+    clearProviderPathCache();
+
+    await mkdir(join(storagePath, "project-a"), { recursive: true });
+    await writeFile(
+      join(storagePath, "project-a", `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          timestamp: "2026-03-01T00:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: sessionId,
+            cwd: "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-03-01T00:00:01.000Z",
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "hi",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-03-01T00:00:02.000Z",
+          type: "response_item",
+          payload: {
+            role: "user",
+            content: [{ type: "input_text", text: "请分析肝母细胞瘤机制相关研究进展" }],
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf-8"
+    );
+
+    const db = new Database(stateDbPath);
+    try {
+      db.exec(`
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY,
+          rollout_path TEXT,
+          created_at INTEGER,
+          updated_at INTEGER,
+          source TEXT,
+          model_provider TEXT,
+          cwd TEXT,
+          title TEXT,
+          first_user_message TEXT
+        )
+      `);
+      db.prepare(
+        `INSERT INTO threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, first_user_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sessionId,
+        join(storagePath, "project-a", `${sessionId}.jsonl`),
+        1774500000,
+        1774500300,
+        "cli",
+        "octopus",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "hi",
+        "hi"
+      );
+    } finally {
+      db.close();
+    }
+
+    provider = new CodexProvider();
+    const before = await provider.list({ eagerSearchIndex: true });
+    assert.equal(before[0]?.title, "请分析肝母细胞瘤机制相关研究进展");
+    assert.equal(before[0]?.badges?.some((badge) => badge.label === "标题回退"), true);
+
+    await provider.updateTitle(`codex:${sessionId}`, "手动持久化标题");
+
+    const after = await provider.list({ eagerSearchIndex: true });
+    assert.equal(after[0]?.title, "手动持久化标题");
+    assert.equal(after[0]?.badges?.some((badge) => badge.label === "标题回退") ?? false, false);
+
+    const detail = await provider.read(`codex:${sessionId}`);
+    assert.equal(detail.title, "手动持久化标题");
+
+    const verifyDb = new Database(stateDbPath, { readonly: true });
+    try {
+      const row = verifyDb.prepare("SELECT title, first_user_message FROM threads WHERE id = ?").get(sessionId) as {
+        title: string;
+        first_user_message: string;
+      } | undefined;
+      assert.equal(row?.title, "手动持久化标题");
+      assert.equal(row?.first_user_message, "手动持久化标题");
+    } finally {
+      verifyDb.close();
+    }
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
     await fixture.cleanup(() => {

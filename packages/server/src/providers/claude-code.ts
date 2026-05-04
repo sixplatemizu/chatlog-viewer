@@ -38,6 +38,7 @@ import type {
   ConversationMeta,
   Conversation,
   Message,
+  ConversationBadge,
   ConversationReadOptions,
   ConversationListOptions,
 } from "./types.js";
@@ -301,6 +302,34 @@ function isClaudeCleanupCandidate(source: ClaudeCodeSessionSource): boolean {
 
   const historyMessageCount = source.historySession?.messages.length ?? 0;
   return historyMessageCount === 0;
+}
+
+function buildClaudeHintBadges(source: ClaudeCodeSessionSource, historyMessageCount: number): ConversationBadge[] {
+  const badges: ConversationBadge[] = [];
+
+  if (historyMessageCount > 0) {
+    badges.push({
+      label: "history 回填",
+      tone: "indigo",
+      title: "Claude Code 未保留主 transcript，当前记录由 history.jsonl 中的用户输入回填",
+    });
+  } else {
+    badges.push({
+      label: "索引空壳",
+      tone: "amber",
+      title: "Claude Code 仅保留 sessions-index / session 目录元数据，未找到主 transcript 或 history 内容",
+    });
+  }
+
+  if (!source.transcriptPath) {
+    badges.push({
+      label: "无 transcript",
+      tone: "gray",
+      title: "本地未找到 Claude Code 主 transcript，详情无法展示完整消息",
+    });
+  }
+
+  return badges;
 }
 
 function pickHistorySession(
@@ -1073,6 +1102,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
       filePath: source.key,
       contentStatus: historyMessageCount > 0 ? "history-only" : "metadata-only",
       cleanupCandidate: isClaudeCleanupCandidate(source),
+      badges: buildClaudeHintBadges(source, historyMessageCount),
     };
 
     setCache(source.key, source.updatedAtHint, meta);

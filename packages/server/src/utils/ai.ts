@@ -3,11 +3,12 @@ import { access, mkdir, rm, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { promisify } from "util";
 import type { Message } from "../providers/types.js";
+import type { TitleGenerationCli } from "./provider-paths.js";
 import { getProviderConfigPath } from "./provider-paths.js";
 
 const execAsync = promisify(exec);
 
-type CliToolName = "codex" | "claude";
+type CliToolName = TitleGenerationCli;
 type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh";
 
 interface CliTool {
@@ -35,6 +36,14 @@ const CLI_TOOLS: CliTool[] = [
     resumeArgs: ["-c", "-p", ""],
     healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
+  },
+  {
+    name: "opencode",
+    command: "opencode",
+    freshArgs: ["run", "--title", "ChatLog Viewer AI Title"],
+    resumeArgs: ["run", "--continue", "--title", "ChatLog Viewer AI Title"],
+    healthcheckArgs: ["--version"],
+    timeoutMs: 45_000,
   },
 ];
 
@@ -266,7 +275,7 @@ async function runCliTool(
 
 export async function generateTitle(
   messages: Message[],
-  options?: { priority?: string[]; reuseSession?: boolean }
+  options?: { priority?: string[]; reuseSession?: boolean | Partial<Record<CliToolName, boolean>> }
 ): Promise<{
   title: string;
   usedCli: string;
@@ -276,7 +285,7 @@ export async function generateTitle(
     options?.priority
   );
   if (tools.length === 0) {
-    throw new Error("没有可用的 AI CLI 工具（需要 claude 或 codex）");
+    throw new Error("没有可用的 AI CLI 工具（需要 claude、codex 或 opencode）");
   }
 
   const context = buildContext(messages);
@@ -285,8 +294,11 @@ export async function generateTitle(
 
   for (const tool of tools) {
     try {
+      const reuseSession = typeof options?.reuseSession === "object"
+        ? options.reuseSession[tool.name] ?? false
+        : options?.reuseSession;
       const result = await runCliTool(tool, fullPrompt, {
-        reuseSession: options?.reuseSession,
+        reuseSession,
       });
       console.log(`[AI] 调用 ${tool.name} (${result.mode})`);
       const title = extractCleanOutput(result.stdout);

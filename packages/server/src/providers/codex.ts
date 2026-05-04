@@ -52,12 +52,14 @@ import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
+  ConversationBadge,
   ConversationReadOptions,
   ConversationListOptions,
 } from "./types.js";
 import {
   CodexSqliteClient,
   formatCodexStoredPath,
+  type CodexThreadMetadata,
   type CodexThreadRow,
 } from "./codex-sqlite-client.js";
 
@@ -84,6 +86,9 @@ interface CodexMessageIdentityCacheEntry {
 }
 
 const CODEX_STATE_ONLY_PREFIX = "codex-state://";
+const CODEX_LIST_SOURCE_VERSION = "codex-list-v3-native-title-cache";
+const CODEX_TITLE_FALLBACK_BADGE_LABEL = "标题回退";
+const CODEX_WEAK_TITLE_SET = new Set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽"]);
 const codexMessageIdentityCache = new Map<string, CodexMessageIdentityCacheEntry>();
 
 export function clearCodexMessageIdentityCacheForTests(): void {
@@ -112,9 +117,126 @@ function normalizeCodexDisplayText(value?: string | null): string | undefined {
   return normalized ? normalized : undefined;
 }
 
+function isWeakCodexTitle(value?: string | null): boolean {
+  const normalized = normalizeCodexDisplayText(value)
+    ?.toLowerCase()
+    .replace(/[!！.。?？,，~～]+$/g, "");
+  return !!normalized && CODEX_WEAK_TITLE_SET.has(normalized);
+}
+
+function pickCodexConversationTitle(options: {
+  nativeTitle?: string;
+  firstUserMessage?: string;
+  fallbackTitle?: string;
+}): { title: string; usedFallback: boolean } {
+  const nativeTitle = normalizeCodexDisplayText(options.nativeTitle);
+  const firstUserMessage = normalizeCodexDisplayText(options.firstUserMessage);
+  const fallbackTitle = normalizeCodexDisplayText(options.fallbackTitle);
+  const canUseFallback = !!fallbackTitle && !isWeakCodexTitle(fallbackTitle);
+  const nativeTitleIsWeak = !!nativeTitle && isWeakCodexTitle(nativeTitle);
+  const nativeLooksOriginal = !firstUserMessage || firstUserMessage === nativeTitle || isWeakCodexTitle(firstUserMessage);
+
+  if (nativeTitle && (!nativeTitleIsWeak || !nativeLooksOriginal || !canUseFallback)) {
+    return { title: nativeTitle, usedFallback: false };
+  }
+
+  if (canUseFallback) {
+    return { title: fallbackTitle, usedFallback: !!nativeTitle };
+  }
+
+  return { title: nativeTitle || fallbackTitle || "未知对话", usedFallback: false };
+}
+
+function buildCodexTitleFallbackBadges(): ConversationBadge[] {
+  return [{
+    label: CODEX_TITLE_FALLBACK_BADGE_LABEL,
+    tone: "amber",
+    title: "Codex 原生 title 是问候语，ChatLog Viewer 改用 transcript 中后续有效用户问题作为展示标题",
+  }];
+}
+
+function hasCodexTitleFallbackBadge(meta?: ConversationMeta): boolean {
+  return meta?.badges?.some((badge) => badge.label === CODEX_TITLE_FALLBACK_BADGE_LABEL) ?? false;
+}
+
+function isCodexNativeOriginalWeakTitle(metadata: CodexThreadMetadata): boolean {
+  const nativeTitle = normalizeCodexDisplayText(metadata.title);
+  const firstUserMessage = normalizeCodexDisplayText(metadata.firstUserMessage);
+  return !!nativeTitle
+    && isWeakCodexTitle(nativeTitle)
+    && (!firstUserMessage || firstUserMessage === nativeTitle || isWeakCodexTitle(firstUserMessage));
+}
+
+function isReusableCodexMetaHint(
+  metaHint: ConversationMeta | undefined,
+  fileStat: { mtimeMs: number; size: number },
+  threadMetadata: CodexThreadMetadata
+): metaHint is ConversationMeta {
+  if (!metaHint) return false;
+  if (metaHint.updatedAt !== fileStat.mtimeMs || metaHint.fileSize !== fileStat.size) return false;
+  if (metaHint.modelProvider !== threadMetadata.modelProvider) return false;
+
+  const nativeTitle = normalizeCodexDisplayText(threadMetadata.title);
+  if (!nativeTitle) {
+    return !hasCodexTitleFallbackBadge(metaHint);
+  }
+
+  if (isCodexNativeOriginalWeakTitle(threadMetadata)) {
+    return hasCodexTitleFallbackBadge(metaHint);
+  }
+
+  return metaHint.title === nativeTitle;
+}
+
+function getCodexUserTitleCandidate(entry?: CodexEntry): string {
+  if (!entry) return "";
+  if (
+    entry.type === "event_msg"
+    && entry.payload?.type === "user_message"
+    && typeof entry.payload.message === "string"
+  ) {
+    return entry.payload.message.trim().slice(0, 100);
+  }
+
+  if (entry.type === "response_item" && entry.payload?.role === "user" && Array.isArray(entry.payload.content)) {
+    const content = extractContent(entry.payload.content).trim();
+    if (!content || content.includes("<environment_context>")) return "";
+    return content.slice(0, 100);
+  }
+
+  return "";
+}
+
+async function findCodexFallbackTitle(filePath: string): Promise<string> {
+  let fallbackTitle = "";
+  await visitJsonl<CodexEntry>(filePath, (entry) => {
+    if (fallbackTitle) return;
+    const candidateTitle = getCodexUserTitleCandidate(entry);
+    if (candidateTitle && !isWeakCodexTitle(candidateTitle)) {
+      fallbackTitle = candidateTitle;
+    }
+  });
+  return fallbackTitle;
+}
+
 function buildCodexStateOnlyFilePath(sessionId: string, rolloutPath?: string): string {
   const normalizedRolloutPath = rolloutPath ? normalizePath(rolloutPath) : "";
   return normalizedRolloutPath || `${CODEX_STATE_ONLY_PREFIX}${sessionId}`;
+}
+
+function buildCodexStateOnlyBadges(): ConversationBadge[] {
+  return [
+    {
+      label: "state db",
+      tone: "green",
+      title: "Codex state_5.sqlite 中存在 thread metadata，但未找到对应 transcript 文件",
+    },
+    {
+      label: "无 transcript",
+      tone: "gray",
+      title: "本地未找到 Codex transcript，详情无法展示完整消息",
+    },
+  ];
 }
 
 function buildCodexTitleGenerationHint(thread: CodexThreadRow): string | undefined {
@@ -438,6 +560,13 @@ export class CodexProvider implements ConversationProvider {
     return this.getStateDbPath().replace(/\\/g, "/");
   }
 
+  private createListSourceSignature(fileStates: Array<{ path: string; mtimeMs: number; size: number }>): string {
+    return createIndexedListSourceSignature([
+      { path: CODEX_LIST_SOURCE_VERSION, mtimeMs: 0, size: 0 },
+      ...fileStates,
+    ]);
+  }
+
   private async getListSourceFiles() {
     const pattern = join(this.getStoragePath(), "**", "*.jsonl").replace(/\\/g, "/");
     const fileStates = await collectGlobFileStates(pattern);
@@ -483,6 +612,7 @@ export class CodexProvider implements ConversationProvider {
       transcriptMissing: true,
       contentStatus: "metadata-only",
       titleGenerationHint: buildCodexTitleGenerationHint(thread),
+      badges: buildCodexStateOnlyBadges(),
     };
   }
 
@@ -496,6 +626,12 @@ export class CodexProvider implements ConversationProvider {
       throw new Error("标题不能为空");
     }
     this.sqliteClient.writeDisplayTitle(sessionId, normalizedTitle, options);
+  }
+
+  private getSessionIdFromMetaOrPath(meta: ConversationMeta | undefined, filePath: string): string {
+    return meta?.id.startsWith("codex:")
+      ? meta.id.replace("codex:", "")
+      : filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
   }
 
   getStoragePath(): string {
@@ -521,7 +657,7 @@ export class CodexProvider implements ConversationProvider {
   async getListSourceSignature(): Promise<string | null> {
     try {
       const fileStates = await this.getListSourceFiles();
-      return createIndexedListSourceSignature(fileStates);
+      return this.createListSourceSignature(fileStates);
     } catch {
       return null;
     }
@@ -555,7 +691,7 @@ export class CodexProvider implements ConversationProvider {
     const basePath = this.getStoragePath();
     const cacheKey = getListCacheKey(this.name, basePath);
     const fileStates = await this.getListSourceFiles();
-    const sourceSignature = createIndexedListSourceSignature(fileStates);
+    const sourceSignature = this.createListSourceSignature(fileStates);
     const cachedList = getIndexedListCache(cacheKey, undefined, {
       requireSearchReady: options.eagerSearchIndex,
       sourceSignature,
@@ -574,17 +710,17 @@ export class CodexProvider implements ConversationProvider {
 
     for (const fileState of transcriptFileStates) {
       const filePath = fileState.path;
-      const sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
-      transcriptSessionIds.add(sessionId);
       const previousMeta = previousByFilePath.get(filePath);
+      const sessionId = this.getSessionIdFromMetaOrPath(previousMeta?.meta, filePath);
+      transcriptSessionIds.add(sessionId);
       if (!previousMeta) {
         filesToRefresh.push(filePath);
         continue;
       }
 
+      const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
       if (
-        fileState.mtimeMs === previousMeta.meta.updatedAt
-        && fileState.size === previousMeta.meta.fileSize
+        isReusableCodexMetaHint(previousMeta.meta, fileState, threadMetadata)
         && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
       ) {
         setCache(filePath, fileState.mtimeMs, previousMeta.meta);
@@ -610,24 +746,24 @@ export class CodexProvider implements ConversationProvider {
       const filePath = buildCodexStateOnlyFilePath(thread.id, thread.rolloutPath);
       const previousItem = previousByFilePath.get(filePath);
       const previousMeta = previousItem?.meta;
-      const rowUpdatedAt = thread.updatedAt;
-      const rowCreatedAt = thread.createdAt;
+      const meta = this.buildStateOnlyMeta(thread);
+      if (!meta || seenIds.has(meta.id)) {
+        continue;
+      }
+
       const previousStillFresh = previousMeta
-        && previousMeta.updatedAt === rowUpdatedAt
-        && previousMeta.createdAt === rowCreatedAt
-        && previousMeta.modelProvider === thread.modelProvider
-        && previousMeta.projectKey === canonicalizeProjectPath(thread.cwd)
+        && previousMeta.updatedAt === meta.updatedAt
+        && previousMeta.createdAt === meta.createdAt
+        && previousMeta.modelProvider === meta.modelProvider
+        && previousMeta.projectKey === meta.projectKey
+        && previousMeta.title === meta.title
+        && previousMeta.titleGenerationHint === meta.titleGenerationHint
         && previousMeta.transcriptMissing === true
         && (!options.eagerSearchIndex || hasIndexedSearchData(previousItem));
 
       if (previousStillFresh && previousItem) {
         results.push(previousItem);
         seenIds.add(previousItem.meta.id);
-        continue;
-      }
-
-      const meta = this.buildStateOnlyMeta(thread);
-      if (!meta || seenIds.has(meta.id)) {
         continue;
       }
 
@@ -661,8 +797,10 @@ export class CodexProvider implements ConversationProvider {
   ): Promise<IndexedCacheItem | null> {
     const fileStat = await stat(filePath);
     const metaHint = options.metaHint;
+    const sessionId = this.getSessionIdFromMetaOrPath(metaHint, filePath);
+    const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
 
-    if (metaHint && metaHint.updatedAt === fileStat.mtimeMs && metaHint.fileSize === fileStat.size) {
+    if (isReusableCodexMetaHint(metaHint, fileStat, threadMetadata)) {
       setCache(filePath, fileStat.mtimeMs, metaHint);
       if (!options.includeSearchIndex) {
         return { meta: metaHint };
@@ -693,6 +831,7 @@ export class CodexProvider implements ConversationProvider {
     let sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     let cwd = "";
     let defaultTitle = "";
+    let fallbackTitle = "";
     let userMessageCount = 0;
     let messageCount = 0;
     let firstTimestamp: number | undefined;
@@ -718,8 +857,12 @@ export class CodexProvider implements ConversationProvider {
         && typeof entry.payload.message === "string"
       ) {
         userMessageCount += 1;
+        const candidateTitle = getCodexUserTitleCandidate(entry);
         if (!defaultTitle) {
-          defaultTitle = entry.payload.message.slice(0, 100);
+          defaultTitle = candidateTitle;
+        }
+        if (!fallbackTitle && candidateTitle && !isWeakCodexTitle(candidateTitle)) {
+          fallbackTitle = candidateTitle;
         }
         return;
       }
@@ -734,6 +877,15 @@ export class CodexProvider implements ConversationProvider {
       }
 
       messageCount += 1;
+      if (role === "user") {
+        const candidateTitle = getCodexUserTitleCandidate(entry);
+        if (!defaultTitle) {
+          defaultTitle = candidateTitle;
+        }
+        if (!fallbackTitle && candidateTitle && !isWeakCodexTitle(candidateTitle)) {
+          fallbackTitle = candidateTitle;
+        }
+      }
       if (searchBuilder) {
         appendSearchIndexEntry(searchBuilder, entry);
       }
@@ -745,12 +897,19 @@ export class CodexProvider implements ConversationProvider {
 
     const normalizedCwd = canonicalizeProjectPath(cwd);
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
-    const normalizedThreadTitle = threadMetadata.title?.replace(/<[^>]+>/g, "").trim();
+    if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
+      fallbackTitle = await findCodexFallbackTitle(filePath);
+    }
+    const titleChoice = pickCodexConversationTitle({
+      nativeTitle: threadMetadata.title,
+      firstUserMessage: threadMetadata.firstUserMessage,
+      fallbackTitle: fallbackTitle || defaultTitle,
+    });
 
     const meta: ConversationMeta = {
       id: `codex:${sessionId}`,
       provider: this.name,
-      title: normalizedThreadTitle || defaultTitle.replace(/<[^>]+>/g, "").trim() || "未知对话",
+      title: titleChoice.title,
       project: normalizedCwd,
       projectKey: normalizedCwd,
       projectId: normalizedCwd,
@@ -761,6 +920,7 @@ export class CodexProvider implements ConversationProvider {
       filePath,
       modelProvider: threadMetadata.modelProvider,
       contentStatus: "full",
+      badges: titleChoice.usedFallback ? buildCodexTitleFallbackBadges() : undefined,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
@@ -786,7 +946,13 @@ export class CodexProvider implements ConversationProvider {
   private async extractMeta(filePath: string): Promise<ConversationMeta | null> {
     const fileStat = await stat(filePath);
     const cached = getCached(filePath, fileStat.mtimeMs);
-    if (cached) return cached;
+    if (cached) {
+      const sessionId = this.getSessionIdFromMetaOrPath(cached, filePath);
+      const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+      if (isReusableCodexMetaHint(cached, fileStat, threadMetadata)) {
+        return cached;
+      }
+    }
 
     // 只读前 20 行获取 session_meta 和首条用户消息
     const headEntries = await parseJsonlHead<CodexEntry>(filePath, 20);
@@ -800,7 +966,10 @@ export class CodexProvider implements ConversationProvider {
       (e) => e.type === "event_msg" && e.payload?.type === "user_message" && e.payload.message
     );
 
-    const defaultTitle = userMessages[0]?.payload?.message?.slice(0, 100) || "未知对话";
+    const defaultTitle = getCodexUserTitleCandidate(userMessages[0]) || "未知对话";
+    let fallbackTitle = userMessages
+      .map((entry) => getCodexUserTitleCandidate(entry))
+      .find((title) => !!title && !isWeakCodexTitle(title));
 
     // 快速行计数
     const messageCount = await countLines(
@@ -821,12 +990,19 @@ export class CodexProvider implements ConversationProvider {
     const normalizedCwd = canonicalizeProjectPath(cwd);
 
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
-    const normalizedThreadTitle = threadMetadata.title?.replace(/<[^>]+>/g, "").trim();
+    if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
+      fallbackTitle = await findCodexFallbackTitle(filePath);
+    }
+    const titleChoice = pickCodexConversationTitle({
+      nativeTitle: threadMetadata.title,
+      firstUserMessage: threadMetadata.firstUserMessage,
+      fallbackTitle: fallbackTitle || defaultTitle,
+    });
 
     const meta: ConversationMeta = {
       id: `codex:${sessionId}`,
       provider: this.name,
-      title: normalizedThreadTitle || defaultTitle.replace(/<[^>]+>/g, "").trim() || "未知对话",
+      title: titleChoice.title,
       project: normalizedCwd,
       projectKey: normalizedCwd,
       projectId: normalizedCwd,
@@ -837,6 +1013,7 @@ export class CodexProvider implements ConversationProvider {
       filePath,
       modelProvider: threadMetadata.modelProvider,
       contentStatus: "full",
+      badges: titleChoice.usedFallback ? buildCodexTitleFallbackBadges() : undefined,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
