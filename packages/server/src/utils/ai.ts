@@ -18,6 +18,7 @@ interface CliTool {
   resumeArgs?: string[];
   healthcheckArgs: string[];
   timeoutMs?: number;
+  promptMode?: "stdin" | "args";
 }
 
 const CLI_TOOLS: CliTool[] = [
@@ -40,15 +41,16 @@ const CLI_TOOLS: CliTool[] = [
   {
     name: "opencode",
     command: "opencode",
-    freshArgs: ["run", "--title", "ChatLog Viewer AI Title"],
-    resumeArgs: ["run", "--continue", "--title", "ChatLog Viewer AI Title"],
+    freshArgs: ["run", "--format", "json", "--", "__PROMPT__"],
     healthcheckArgs: ["--version"],
     timeoutMs: 45_000,
+    promptMode: "args",
   },
 ];
 
 const TITLE_SESSION_DIRNAME = "ai-title-sessions";
 const SESSION_MARKER_FILENAME = ".session.json";
+const INVALID_GENERATED_TITLE_OUTPUTS = new Set(["default", "build", "plan", "general"]);
 const RESUME_MISS_PATTERNS = [
   /no .*?(conversation|session|chat|thread).*?(found|available|to resume|to continue)/i,
   /(nothing|no previous|no prior).*(resume|continue|conversation|session)/i,
@@ -139,14 +141,98 @@ function buildContext(messages: Message[], maxChars = 2000): string {
   return lines.join("\n");
 }
 
-function extractCleanOutput(stdout: string): string {
+function stripTitleQuotes(text: string): string {
+  return text
+    .replace(/^["'「『《]/, "")
+    .replace(/["'」』》][。.!！]?$/, "")
+    .trim();
+}
+
+function isInvalidGeneratedTitle(text: string): boolean {
+  const normalized = text
+    .replace(/^>\s*/, "")
+    .replace(/[。.!！?？]+$/, "")
+    .trim()
+    .toLowerCase();
+  if (!normalized) return true;
+  if (INVALID_GENERATED_TITLE_OUTPUTS.has(normalized)) return true;
+  return /^(default|build|plan|general)\s*[·•]\s*[\w./:-]+/i.test(normalized);
+}
+
+function cleanTitleCandidate(text: string): string {
+  const title = stripTitleQuotes(text);
+  return isInvalidGeneratedTitle(title) ? "" : title;
+}
+
+function extractJsonLineTextOutput(stdout: string): string | null {
+  const textParts: string[] = [];
+  let hasTextEvent = false;
+
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+
+    try {
+      const event = JSON.parse(trimmed) as {
+        type?: string;
+        part?: {
+          type?: string;
+          text?: string;
+        };
+      };
+      if (event.type === "text" && event.part?.type === "text" && typeof event.part.text === "string") {
+        hasTextEvent = true;
+        textParts.push(event.part.text);
+      }
+    } catch {
+      // 非 JSON 行按普通文本兜底处理。
+    }
+  }
+
+  const text = textParts.join("\n").trim();
+  return hasTextEvent ? cleanTitleCandidate(text) : null;
+}
+
+function isCliStatusLine(line: string): boolean {
+  const normalized = line.replace(/^>\s*/, "").trim();
+  if (!normalized) return true;
+  if (/^(default|build|plan|general)$/i.test(normalized)) return true;
+  return /^[\w-]+\s*[·•]\s*[\w./:-]+/i.test(normalized);
+}
+
+export function extractCleanOutput(stdout: string): string {
+  const jsonLineText = extractJsonLineTextOutput(stdout);
+  if (jsonLineText !== null) return jsonLineText;
+
   const ansiEscape = String.fromCharCode(27);
-  let clean = stdout.replace(/<Execution Info>[\s\S]*/m, "").trim();
-  clean = clean.replace(new RegExp(`${ansiEscape}\\[[0-9;]*m`, "g"), "");
-  clean = clean.replace(/^标题[:：]\s*/m, "");
-  clean = clean.replace(/^["'「]|["'」]$/g, "");
-  const firstLine = clean.split("\n")[0]?.trim() || clean;
-  return firstLine;
+  const clean = stdout
+    .replace(/<Execution Info>[\s\S]*/m, "")
+    .replace(/<environment_details>[\s\S]*<\/environment_details>/m, "")
+    .replace(new RegExp(`${ansiEscape}\\[[0-9;]*m`, "g"), "")
+    .replace(/^#{1,3}\s*/m, "")
+    .replace(/[*_]{1,2}([^*_\n]+)[*_]{1,2}/g, "$1")
+    .trim();
+
+  // 按优先级尝试提取：
+  // 1. "标题：xxx" / "建议标题为：xxx" 等明确标记
+  const titleLabelMatch = clean.match(/(?:标题|建议标题|推荐标题)(?:为|是)?[：:]\s*(.+?)(?:\n|$)/m);
+  if (titleLabelMatch) {
+    return cleanTitleCandidate(titleLabelMatch[1]);
+  }
+
+  // 2. 引号/书名号包裹的短文本（2-50 字），取最后一个作为标题
+  const quotedMatches = clean.match(/["'「『《]([^"'」』》\n]{2,50})["'」』》]/g);
+  if (quotedMatches) {
+    return cleanTitleCandidate(quotedMatches[quotedMatches.length - 1]!);
+  }
+
+  // 3. 首个非 CLI 状态行，去掉常见前缀语
+  const firstLine = clean
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => !isCliStatusLine(line)) ?? "";
+  const stripped = firstLine.replace(/^(?:好的|根据对话内容|我认为|建议|标题可以).{0,10}(?:是|为)[：:]\s*/i, "");
+  return cleanTitleCandidate(stripped);
 }
 
 const INSTRUCTION = "请为以下AI对话生成一个简短的中文标题（10-20个字），准确概括对话主题，只输出标题本身，不要加引号或其他格式：\n\n";
@@ -197,12 +283,17 @@ function isResumeMissError(error: unknown): boolean {
 }
 
 async function executeCli(tool: CliTool, args: string[], prompt: string, workDir: string): Promise<string> {
+  const promptViaArgs = tool.promptMode === "args";
+  const resolvedArgs = promptViaArgs
+    ? args.map((arg) => arg === "__PROMPT__" ? prompt.replace(/\n/g, "  ").replace(/[&|<>^%]/g, " ") : arg)
+    : args;
+
   return await new Promise<string>((resolve, reject) => {
-    const child = spawn(tool.command, args, {
+    const child = spawn(tool.command, resolvedArgs, {
       cwd: workDir,
       env: { ...process.env },
       shell: process.platform === "win32",
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: promptViaArgs ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
 
@@ -213,12 +304,12 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
       reject(new Error(`${tool.name} 执行超时`));
     }, tool.timeoutMs ?? 30_000);
 
-    child.stdout.setEncoding("utf-8");
-    child.stderr.setEncoding("utf-8");
-    child.stdout.on("data", (chunk) => {
+    child.stdout!.setEncoding("utf-8");
+    child.stderr!.setEncoding("utf-8");
+    child.stdout!.on("data", (chunk) => {
       stdout += chunk;
     });
-    child.stderr.on("data", (chunk) => {
+    child.stderr!.on("data", (chunk) => {
       stderr += chunk;
     });
     child.once("error", (error) => {
@@ -231,13 +322,15 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
         reject(new Error(stderr.trim() || `${tool.name} 执行失败 (${code ?? "unknown"})`));
         return;
       }
-      resolve(stdout);
+      resolve(stdout || stderr);
     });
 
-    child.stdin.on("error", () => {
-      // 某些 CLI 可能会提前结束 stdin，这里不额外中断主流程。
-    });
-    child.stdin.end(prompt, "utf-8");
+    if (!promptViaArgs) {
+      child.stdin!.on("error", () => {
+        // 某些 CLI 可能会提前结束 stdin，这里不额外中断主流程。
+      });
+      child.stdin!.end(prompt, "utf-8");
+    }
   });
 }
 
@@ -301,8 +394,9 @@ export async function generateTitle(
         reuseSession,
       });
       console.log(`[AI] 调用 ${tool.name} (${result.mode})`);
+      console.log(`[AI] ${tool.name} 原始输出(${result.stdout.length} 字):`, JSON.stringify(result.stdout.slice(0, 300)));
       const title = extractCleanOutput(result.stdout);
-      console.log(`[AI] ${tool.name} 输出: "${title}"`);
+      console.log(`[AI] ${tool.name} 提取标题: "${title}"`);
       if (title && title.length > 0 && title.length < 100) {
         return { title, usedCli: tool.name };
       }

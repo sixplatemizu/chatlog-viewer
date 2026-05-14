@@ -62,6 +62,7 @@ import {
   type CodexThreadMetadata,
   type CodexThreadRow,
 } from "./codex-sqlite-client.js";
+import { normalizePath, canonicalizeProjectPath, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
 
 interface CodexEntry {
   timestamp: string;
@@ -100,16 +101,6 @@ function extractContent(content: Array<{ type: string; text?: string }>): string
     .filter((c) => (c.type === "input_text" || c.type === "output_text") && c.text)
     .map((c) => c.text!)
     .join("\n");
-}
-
-function normalizePath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
-}
-
-function canonicalizeProjectPath(value: string): string {
-  const normalized = normalizePath(value);
-  if (!normalized) return "";
-  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
 }
 
 function normalizeCodexDisplayText(value?: string | null): string | undefined {
@@ -513,26 +504,6 @@ function appendSearchIndexEntry(
     content,
     timestamp: new Date(entry.timestamp).getTime(),
   });
-}
-
-function getListCacheKey(providerName: string, storagePath: string): string {
-  return `${providerName}::${storagePath}::indexed`;
-}
-
-function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
-  const limit = options?.limit;
-  const before = options?.before ?? 0;
-
-  if (!limit || limit <= 0) {
-    return { items, hasMore: false };
-  }
-
-  const end = Math.max(0, items.length - before);
-  const start = Math.max(0, end - limit);
-  return {
-    items: items.slice(start, end),
-    hasMore: start > 0,
-  };
 }
 
 export class CodexProvider implements ConversationProvider {

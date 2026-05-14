@@ -676,9 +676,14 @@ test("OpenCode 支持 metadata 级移动会话", async () => {
 
     const verifyDb = new Database(dbPath, { readonly: true });
     try {
-      const row = verifyDb.prepare("SELECT directory, path FROM session WHERE id = ?").get(sessionId) as { directory: string; path: string };
-      assert.equal(row.directory, "C:/Users/tester/Desktop/code_area/target-project");
+      const row = verifyDb.prepare("SELECT directory, path, time_updated FROM session WHERE id = ?").get(sessionId) as {
+        directory: string;
+        path: string;
+        time_updated: number;
+      };
+      assert.equal(row.directory, "C:\\Users\\tester\\Desktop\\code_area\\target-project");
       assert.equal(row.path, "Users/tester/Desktop/code_area/target-project");
+      assert.ok(row.time_updated >= 10_000_000_000);
     } finally {
       verifyDb.close();
     }
@@ -748,6 +753,18 @@ test("OpenCode 支持写回标题并级联删除会话", async () => {
     await provider.updateTitle(`opencode:${sessionId}`, "新标题");
     const updated = await provider.read(`opencode:${sessionId}`);
     assert.equal(updated.title, "新标题");
+
+    const titleDb = new Database(dbPath, { readonly: true });
+    try {
+      const row = titleDb.prepare("SELECT title, time_updated FROM session WHERE id = ?").get(sessionId) as {
+        title: string;
+        time_updated: number;
+      };
+      assert.equal(row.title, "新标题");
+      assert.ok(row.time_updated >= 10_000_000_000);
+    } finally {
+      titleDb.close();
+    }
 
     await provider.delete(`opencode:${sessionId}`);
 

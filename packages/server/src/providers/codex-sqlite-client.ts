@@ -1,5 +1,6 @@
 import { createRequire } from "module";
 import type BetterSqlite3 from "better-sqlite3";
+import { normalizePath } from "./shared/provider-utils.js";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
@@ -25,10 +26,6 @@ export interface CodexThreadMetadata {
 export interface ThreadLocationUpdates {
   cwd?: string;
   rolloutPath?: string | null;
-}
-
-function normalizePath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
 }
 
 function normalizeCodexTimestamp(value: number | null | undefined, fallback: number): number {

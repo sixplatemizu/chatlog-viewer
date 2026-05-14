@@ -1,6 +1,6 @@
 import { createRequire } from "module";
 import { basename } from "path";
-import { stat } from "fs/promises";
+import { realpath, stat } from "fs/promises";
 import type BetterSqlite3 from "better-sqlite3";
 import {
   getIndexedListCache,
@@ -316,6 +316,19 @@ function buildOpenCodePathValue(directory: string): string | null {
     .replace(/^[A-Za-z]:\//, "")
     .replace(/^\/+/, "");
   return normalized || null;
+}
+
+async function resolveOpenCodeDirectoryValue(directory: string): Promise<string> {
+  const trimmed = directory.trim();
+  try {
+    return await realpath(trimmed);
+  } catch {
+    const normalized = normalizePath(trimmed);
+    if (/^[A-Za-z]:\//.test(normalized)) {
+      return `${normalized[0]?.toUpperCase()}:${normalized.slice(2).replace(/\//g, "\\")}`;
+    }
+    return trimmed;
+  }
 }
 
 function sliceWindow<T>(items: T[], options?: ConversationReadOptions): { items: T[]; hasMore: boolean } {
@@ -669,10 +682,11 @@ export class OpenCodeProvider implements ConversationProvider {
 
   async move(id: string, targetProjectKey: string): Promise<void> {
     const sessionId = id.replace("opencode:", "");
-    const targetDirectory = normalizePath(targetProjectKey);
-    if (!targetDirectory) {
+    const targetDirectoryInput = normalizePath(targetProjectKey);
+    if (!targetDirectoryInput) {
       throw new Error("目标文件夹不能为空");
     }
+    const targetDirectory = await resolveOpenCodeDirectoryValue(targetDirectoryInput);
 
     const meta = this.findSessionRow(sessionId);
     if (!meta) {

@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { Message } from "../../providers/types.js";
-import { generateTitle, getAvailableClis, resetSession } from "../ai.js";
+import { extractCleanOutput, generateTitle, getAvailableClis, resetSession } from "../ai.js";
 
 const SAMPLE_MESSAGES: Message[] = [
   {
@@ -118,6 +118,40 @@ async function readCallLog(sessionDir: string) {
 function findCli(clis: Awaited<ReturnType<typeof getAvailableClis>>, name: string) {
   return clis.find((item) => item.name === name);
 }
+
+test("标题提取会跳过 OpenCode default 状态行", () => {
+  assert.equal(
+    extractCleanOutput("\u001b[0m\n> default · deepseek-v4-flash\n\u001b[0m\n真实标题\n"),
+    "真实标题"
+  );
+});
+
+test("标题提取会优先读取 OpenCode JSON text 事件", () => {
+  assert.equal(
+    extractCleanOutput([
+      JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "JSON 标题" } }),
+      JSON.stringify({ type: "step_finish", part: { type: "step-finish" } }),
+    ].join("\n")),
+    "JSON 标题"
+  );
+});
+
+test("标题提取会拒绝 OpenCode JSON default 占位输出", () => {
+  assert.equal(
+    extractCleanOutput([
+      JSON.stringify({ type: "step_start", part: { type: "step-start" } }),
+      JSON.stringify({ type: "text", part: { type: "text", text: "default" } }),
+      JSON.stringify({ type: "step_finish", part: { type: "step-finish" } }),
+    ].join("\n")),
+    ""
+  );
+});
+
+test("标题提取会拒绝 CLI 状态占位输出", () => {
+  assert.equal(extractCleanOutput("default"), "");
+  assert.equal(extractCleanOutput("> default · deepseek-v4-flash"), "");
+});
 
 test("首次生成标题会创建固定会话并写入 session 状态", async () => {
   const env = await createFakeCodexEnv();

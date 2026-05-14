@@ -60,9 +60,50 @@ interface IndexedListCacheWriteOptions {
 }
 
 // 基于文件 mtime 的元数据缓存
-const memoryCache = new Map<string, CacheEntry>();
-const memoryListCache = new Map<string, ListCacheEntry>();
-const memoryIndexedListCache = new Map<string, IndexedListCacheEntry>();
+class LRUMap<K, V> {
+  private map = new Map<K, V>();
+  private maxSize: number;
+
+  constructor(maxSize: number) {
+    this.maxSize = maxSize;
+  }
+
+  get(key: K): V | undefined {
+    if (!this.map.has(key)) return undefined;
+    const value = this.map.get(key)!;
+    this.map.delete(key);
+    this.map.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.maxSize) {
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.map.delete(oldestKey);
+      }
+    }
+    this.map.set(key, value);
+  }
+
+  delete(key: K): void {
+    this.map.delete(key);
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+
+  has(key: K): boolean {
+    return this.map.has(key);
+  }
+}
+
+const memoryCache = new LRUMap<string, CacheEntry>(10_000);
+const memoryListCache = new LRUMap<string, ListCacheEntry>(200);
+const memoryIndexedListCache = new LRUMap<string, IndexedListCacheEntry>(500);
 let db: BetterSqlite3.Database | null = null;
 let dbPath: string | null = null;
 let lastPruneAt = 0;

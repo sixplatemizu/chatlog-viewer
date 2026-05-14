@@ -115,11 +115,6 @@ function buildDistributedIndices(length: number): number[] {
     const index = Math.floor(((slot + 1) * (length - 1)) / (middleSlots + 1));
     push(index);
   }
-
-  for (let index = 0; index < length; index++) {
-    push(index);
-  }
-
   return indices;
 }
 
