@@ -283,15 +283,31 @@ function isResumeMissError(error: unknown): boolean {
 
 async function executeCli(tool: CliTool, args: string[], prompt: string, workDir: string): Promise<string> {
   const promptViaArgs = tool.promptMode === "args";
+  const isWindowsShell = process.platform === "win32";
   const resolvedArgs = promptViaArgs
-    ? args.map((arg) => arg === "__PROMPT__" ? prompt.replace(/\n/g, "  ").replace(/[&|<>^%]/g, " ") : arg)
+    ? args.map((arg) => {
+        if (arg !== "__PROMPT__") return arg;
+        const sanitized = prompt.replace(/\n/g, "  ").replace(/[&|<>^%]/g, " ");
+        if (!isWindowsShell) {
+          // Linux/macOS 下 spawn 用 execve，args 已是独立元素，不需要外层引号
+          return sanitized;
+        }
+        // Windows 下 shell: true 经过 cmd.exe，含空格的 arg 需要双引号包裹；内部 " 用 "" 转义
+        return `"${sanitized.replace(/"/g, '""')}"`;
+      })
     : args;
+
+  // 调试日志：脱敏 prompt，仅打印长度 + 摘要前 80 字符
+  const promptPreview = prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt;
+  console.log(`[AI] 执行 ${tool.name} (prompt ${prompt.length} chars, mode=${promptViaArgs ? "args" : "stdin"})`);
+  console.debug(`[AI] ${tool.name} prompt preview: ${promptPreview.replace(/\n/g, " ")}`);
+  console.debug(`[AI] ${tool.name} cmd: ${tool.command} ${promptViaArgs ? args.join(" ") : resolvedArgs.join(" ")}`);
 
   return await new Promise<string>((resolve, reject) => {
     const child = spawn(tool.command, resolvedArgs, {
       cwd: workDir,
       env: { ...process.env },
-      shell: process.platform === "win32",
+      shell: isWindowsShell,
       stdio: promptViaArgs ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -313,10 +329,15 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
     });
     child.once("error", (error) => {
       clearTimeout(timeout);
+      console.error(`[AI] ${tool.name} spawn 错误:`, error.message);
       reject(error);
     });
     child.once("close", (code) => {
       clearTimeout(timeout);
+      console.log(`[AI] ${tool.name} 退出 code=${code} stdout=${stdout.length}B stderr=${stderr.length}B`);
+      if (stderr.trim()) {
+        console.error(`[AI] ${tool.name} stderr: ${stderr.slice(0, 500)}`);
+      }
       if (code !== 0) {
         reject(new Error(stderr.trim() || `${tool.name} 执行失败 (${code ?? "unknown"})`));
         return;
@@ -445,18 +466,4 @@ export async function getAvailableClis(): Promise<Array<{
       hasSession: await hasPersistedSession(tool.name),
     };
   }));
-}
-
-export async function getAiDebugLog(): Promise<string> {
-  try {
-    const { readFile } = await import("fs/promises");
-    const content = await readFile(AI_LOG_FILE, "utf-8");
-    return content;
-  } catch {
-    return "";
-  }
-}
-
-export async function clearAiDebugLog(): Promise<void> {
-  await rm(AI_LOG_FILE, { force: true });
 }

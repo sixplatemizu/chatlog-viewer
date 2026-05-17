@@ -1,10 +1,15 @@
-import { appendFile, mkdir, readdir, rm, readFile, rename } from "fs/promises";
-import { dirname, join, basename } from "path";
+import { appendFile, mkdir, readdir, rm, readFile, stat, writeFile } from "fs/promises";
+import { dirname, join } from "path";
 import { getProviderConfigPath } from "./provider-paths.js";
 
 const LOG_DIR = join(dirname(getProviderConfigPath()), "logs");
+// 单文件超过此行数后整体保留尾部 MAX_LOG_LINES 行，避免无限增长。
 const MAX_LOG_LINES = 10000;
+// 保留最新 N 个日志文件（按文件名字典序，ISO 日期天然有序）。
 const MAX_LOG_FILES = 7;
+// 文件 size 估算行数的最小步长（每 1MB 检查一次截尾），避免每次写入都 stat。
+const TRUNCATE_CHECK_MIN_BYTES = 1 << 20;
+const ROTATE_INTERVAL_MS = 60_000;
 
 let originalConsoleLog: typeof console.log;
 let originalConsoleError: typeof console.error;
@@ -50,18 +55,16 @@ function formatLogLine(level: LogLevel, args: unknown[]): string {
 
 async function flushLogQueue() {
   if (isWriting || logQueue.length === 0) return;
-  
+
   isWriting = true;
   const lines = [...logQueue];
   logQueue = [];
-  
+
   try {
     await mkdir(LOG_DIR, { recursive: true });
     const logFile = getLogFile("INFO");
     await appendFile(logFile, lines.join("\n") + "\n", "utf-8");
-    
-    // 定期清理旧日志
-    await rotateLogFiles();
+    await maybeRotate(logFile);
   } catch {
     // 日志写入失败不影响主流程
   } finally {
@@ -74,15 +77,16 @@ async function flushLogQueue() {
 
 async function flushDebugQueue() {
   if (isWritingDebug || debugQueue.length === 0) return;
-  
+
   isWritingDebug = true;
   const lines = [...debugQueue];
   debugQueue = [];
-  
+
   try {
     await mkdir(LOG_DIR, { recursive: true });
     const logFile = getLogFile("DEBUG");
     await appendFile(logFile, lines.join("\n") + "\n", "utf-8");
+    await maybeRotate(logFile);
   } catch {
     // 日志写入失败不影响主流程
   } finally {
@@ -93,17 +97,37 @@ async function flushDebugQueue() {
   }
 }
 
-async function rotateLogFiles() {
+let lastRotateAt = 0;
+
+// rotate 节流：单次 flush 不会触发额外 IO。
+// - 按文件数：超过 MAX_LOG_FILES 后删旧的
+// - 按行数：单文件超过 MAX_LOG_LINES 时截尾保留最近行
+async function maybeRotate(currentFile: string): Promise<void> {
+  const now = Date.now();
+  if (now - lastRotateAt < ROTATE_INTERVAL_MS) return;
+  lastRotateAt = now;
+
+  // 1. 文件数 rotate
   try {
     const files = await readdir(LOG_DIR);
-    const logFiles = files.filter(f => f.endsWith(".log")).sort();
-    
+    const logFiles = files.filter((f) => f.endsWith(".log")).sort();
     if (logFiles.length > MAX_LOG_FILES) {
       const toDelete = logFiles.slice(0, logFiles.length - MAX_LOG_FILES);
-      for (const file of toDelete) {
-        await rm(join(LOG_DIR, file), { force: true });
-      }
+      await Promise.all(toDelete.map((file) => rm(join(LOG_DIR, file), { force: true })));
     }
+  } catch {
+    // 忽略
+  }
+
+  // 2. 行数 rotate：仅对超过阈值的单文件抽样
+  try {
+    const fileStat = await stat(currentFile);
+    if (fileStat.size < TRUNCATE_CHECK_MIN_BYTES) return;
+    const content = await readFile(currentFile, "utf-8");
+    const lines = content.split("\n");
+    if (lines.length <= MAX_LOG_LINES) return;
+    const truncated = lines.slice(-MAX_LOG_LINES).join("\n");
+    await writeFile(currentFile, truncated, "utf-8");
   } catch {
     // 忽略
   }
@@ -112,20 +136,17 @@ async function rotateLogFiles() {
 function createLogInterceptor(level: LogLevel, original: (...args: unknown[]) => void) {
   return (...args: unknown[]) => {
     original(...args);
+    if (LOG_LEVELS[level] < LOG_LEVELS[currentLogLevel]) return;
+
     const line = formatLogLine(level, args);
-    
-    if (LOG_LEVELS[level] >= LOG_LEVELS[currentLogLevel]) {
-      logQueue.push(line);
-      if (!isWriting) {
-        void flushLogQueue();
-      }
-    }
-    
+
     if (level === "DEBUG") {
+      // DEBUG 仅写 debug-*.log，避免污染主日志
       debugQueue.push(line);
-      if (!isWritingDebug) {
-        void flushDebugQueue();
-      }
+      if (!isWritingDebug) void flushDebugQueue();
+    } else {
+      logQueue.push(line);
+      if (!isWriting) void flushLogQueue();
     }
   };
 }

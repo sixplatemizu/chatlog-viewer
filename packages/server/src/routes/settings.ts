@@ -9,7 +9,6 @@ import {
   getAppConfig,
   getProviderConfigPath,
   getProviderPaths,
-  getTitleGenerationCliPriority,
   getRawTitleGenerationCliPriority,
   getTitleGenerationCliSessionModes,
   getTitleGenerationCliDisabled,
