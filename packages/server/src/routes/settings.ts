@@ -3,13 +3,16 @@ import { homedir } from "os";
 import type { ConversationProvider } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
 import { getAvailableClis, resetSession } from "../utils/ai.js";
+import { getServerLog, getDebugLog, clearServerLog, clearDebugLog, clearAllLogs } from "../utils/file-logger.js";
 import { getErrorMessage } from "../utils/errors.js";
 import {
   getAppConfig,
   getProviderConfigPath,
   getProviderPaths,
   getTitleGenerationCliPriority,
+  getRawTitleGenerationCliPriority,
   getTitleGenerationCliSessionModes,
+  getTitleGenerationCliDisabled,
   normalizeTitleGenerationCliPriority,
   normalizeTitleGenerationCliSessionModes,
   updateProviderConfigs,
@@ -69,8 +72,9 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
       configPath: getProviderConfigPath(),
       providers: buildProviderPathSettings(providers),
       ai: {
-        titleGenerationCliPriority: getTitleGenerationCliPriority(),
+        titleGenerationCliPriority: getRawTitleGenerationCliPriority(),
         titleGenerationCliSessionModes: getTitleGenerationCliSessionModes(),
+        titleGenerationCliDisabled: getTitleGenerationCliDisabled(),
       },
     });
   });
@@ -79,7 +83,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
     const body = await c.req.json<{
       providers?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
       migrations?: Record<string, { storagePath?: unknown; stateDbPath?: unknown }>;
-      ai?: { titleGenerationCliPriority?: unknown; titleGenerationCliSessionModes?: unknown };
+      ai?: { titleGenerationCliPriority?: unknown; titleGenerationCliSessionModes?: unknown; titleGenerationCliDisabled?: unknown };
     }>();
 
     if (!body || typeof body !== "object" || !body.providers || typeof body.providers !== "object") {
@@ -90,6 +94,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
     const migrations: Partial<Record<ResolvedProviderName, ProviderPathMigrationSelection>> = {};
     let titleGenerationCliPriority: TitleGenerationCli[] | undefined;
     let titleGenerationCliSessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode> | undefined;
+    let titleGenerationCliDisabled: TitleGenerationCli[] | undefined;
 
     try {
       for (const [providerName, value] of Object.entries(body.providers)) {
@@ -172,6 +177,14 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
             body.ai.titleGenerationCliSessionModes as Record<string, unknown>
           );
         }
+
+        if ("titleGenerationCliDisabled" in body.ai) {
+          if (!Array.isArray(body.ai.titleGenerationCliDisabled)) {
+            return c.json({ error: "标题生成 CLI 禁用列表必须是数组" }, 400);
+          }
+          titleGenerationCliDisabled = body.ai.titleGenerationCliDisabled
+            .filter((item): item is TitleGenerationCli => isTitleGenerationCli(item));
+        }
       }
     } catch (error) {
       return c.json({ error: getErrorMessage(error) }, 400);
@@ -179,10 +192,11 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
 
     const updated = await updateProviderConfigs(updates, process.env, homedir(), {
       migrations,
-      ...((titleGenerationCliPriority || titleGenerationCliSessionModes) ? {
+      ...((titleGenerationCliPriority || titleGenerationCliSessionModes || titleGenerationCliDisabled) ? {
         ai: {
           titleGenerationCliPriority,
           titleGenerationCliSessionModes,
+          titleGenerationCliDisabled,
         },
       } : {}),
     });
@@ -191,8 +205,9 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
       configPath: getProviderConfigPath(),
       providers: buildProviderPathSettings(providers),
       ai: {
-        titleGenerationCliPriority: getTitleGenerationCliPriority(),
+        titleGenerationCliPriority: getRawTitleGenerationCliPriority(),
         titleGenerationCliSessionModes: getTitleGenerationCliSessionModes(),
+        titleGenerationCliDisabled: getTitleGenerationCliDisabled(),
       },
       migrationResults: updated.migrationResults,
     });
@@ -215,6 +230,24 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
     }
 
     await resetSession(name);
+    return c.json({ success: true });
+  });
+
+  app.get("/ai/debug-log", async (c) => {
+    const type = c.req.query("type") ?? "server";
+    const log = type === "debug" ? await getDebugLog() : await getServerLog();
+    return c.json({ log, type });
+  });
+
+  app.delete("/ai/debug-log", async (c) => {
+    const type = c.req.query("type") ?? "server";
+    if (type === "debug") {
+      await clearDebugLog();
+    } else if (type === "all") {
+      await clearAllLogs();
+    } else {
+      await clearServerLog();
+    }
     return c.json({ success: true });
   });
 

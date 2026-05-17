@@ -1,12 +1,9 @@
-import { exec, spawn } from "child_process";
+import { spawn } from "child_process";
 import { access, mkdir, rm, writeFile } from "fs/promises";
 import { dirname, join } from "path";
-import { promisify } from "util";
 import type { Message } from "../providers/types.js";
 import type { TitleGenerationCli } from "./provider-paths.js";
 import { getProviderConfigPath } from "./provider-paths.js";
-
-const execAsync = promisify(exec);
 
 type CliToolName = TitleGenerationCli;
 type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh";
@@ -60,16 +57,14 @@ const RESUME_MISS_PATTERNS = [
   /can't (resume|continue)/i,
 ];
 
-function getLocateCommand(command: string): string {
-  return process.platform === "win32" ? `where ${command}` : `which ${command}`;
-}
-
 async function detectAvailableCli(): Promise<CliTool[]> {
   const available: CliTool[] = [];
   for (const tool of CLI_TOOLS) {
     try {
-      await execAsync(getLocateCommand(tool.command), { timeout: 5000 });
-      available.push(tool);
+      const isAvailable = await checkCliHealth(tool);
+      if (isAvailable) {
+        available.push(tool);
+      }
     } catch {
       // 不可用
     }
@@ -114,8 +109,12 @@ async function checkCliHealth(tool: CliTool): Promise<boolean> {
 function orderToolsByPriority(tools: CliTool[], priority?: readonly string[]): CliTool[] {
   if (!priority || priority.length === 0) return tools;
 
+  const prioritySet = new Set(priority);
+  const filtered = tools.filter((tool) => prioritySet.has(tool.name));
+  if (filtered.length === 0) return tools;
+
   const rank = new Map(priority.map((name, index) => [name, index]));
-  return [...tools].sort((a, b) => {
+  return [...filtered].sort((a, b) => {
     const aRank = rank.get(a.name) ?? Number.MAX_SAFE_INTEGER;
     const bRank = rank.get(b.name) ?? Number.MAX_SAFE_INTEGER;
     return aRank - bRank;
@@ -398,12 +397,14 @@ export async function generateTitle(
       const title = extractCleanOutput(result.stdout);
       console.log(`[AI] ${tool.name} 提取标题: "${title}"`);
       if (title && title.length > 0 && title.length < 100) {
+        console.log(`[AI] 成功使用 ${tool.name} 生成标题: "${title}"`);
         return { title, usedCli: tool.name };
       }
+      console.log(`[AI] ${tool.name} 失败: 输出为空或格式无效`);
       failures.push(`${tool.name}: 输出为空或格式无效`);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      console.error(`${tool.name} 生成标题失败:`, message);
+      console.error(`[AI] ${tool.name} 生成标题失败:`, message);
       failures.push(`${tool.name}: ${message}`);
     }
   }
@@ -444,4 +445,18 @@ export async function getAvailableClis(): Promise<Array<{
       hasSession: await hasPersistedSession(tool.name),
     };
   }));
+}
+
+export async function getAiDebugLog(): Promise<string> {
+  try {
+    const { readFile } = await import("fs/promises");
+    const content = await readFile(AI_LOG_FILE, "utf-8");
+    return content;
+  } catch {
+    return "";
+  }
+}
+
+export async function clearAiDebugLog(): Promise<void> {
+  await rm(AI_LOG_FILE, { force: true });
 }

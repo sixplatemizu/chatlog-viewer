@@ -23,6 +23,7 @@ export interface ProviderPathConfig {
 export interface AiConfig {
   titleGenerationCliPriority?: TitleGenerationCli[];
   titleGenerationCliSessionModes?: Partial<Record<TitleGenerationCli, TitleGenerationCliSessionMode>>;
+  titleGenerationCliDisabled?: TitleGenerationCli[];
 }
 
 export interface AppConfig {
@@ -110,20 +111,24 @@ export function getAppConfig(env: EnvLike = process.env, homeDir = homedir()): L
 }
 
 export function normalizeTitleGenerationCliPriority(
-  priority?: readonly string[]
+  priority?: readonly string[],
+  disabled?: readonly string[]
 ): TitleGenerationCli[] {
+  const disabledSet = new Set(disabled ?? []);
   const normalized: TitleGenerationCli[] = [];
   const seen = new Set<TitleGenerationCli>();
 
   for (const item of priority ?? []) {
     if (!TITLE_GENERATION_CLI_SET.has(item as TitleGenerationCli)) continue;
     const cli = item as TitleGenerationCli;
+    if (disabledSet.has(cli)) continue;
     if (seen.has(cli)) continue;
     seen.add(cli);
     normalized.push(cli);
   }
 
   for (const cli of TITLE_GENERATION_CLI_ORDER) {
+    if (disabledSet.has(cli)) continue;
     if (seen.has(cli)) continue;
     normalized.push(cli);
   }
@@ -135,9 +140,29 @@ export function getTitleGenerationCliPriority(
   env: EnvLike = process.env,
   homeDir = homedir()
 ): TitleGenerationCli[] {
+  const loaded = loadAppConfig(env, homeDir).config.ai;
   return normalizeTitleGenerationCliPriority(
-    loadAppConfig(env, homeDir).config.ai?.titleGenerationCliPriority
+    loaded?.titleGenerationCliPriority,
+    loaded?.titleGenerationCliDisabled
   );
+}
+
+export function getRawTitleGenerationCliPriority(
+  env: EnvLike = process.env,
+  homeDir = homedir()
+): TitleGenerationCli[] {
+  const priority = loadAppConfig(env, homeDir).config.ai?.titleGenerationCliPriority;
+  if (!Array.isArray(priority)) return [...TITLE_GENERATION_CLI_ORDER];
+  return priority.filter((item): item is TitleGenerationCli => TITLE_GENERATION_CLI_SET.has(item as TitleGenerationCli));
+}
+
+export function getTitleGenerationCliDisabled(
+  env: EnvLike = process.env,
+  homeDir = homedir()
+): TitleGenerationCli[] {
+  const disabled = loadAppConfig(env, homeDir).config.ai?.titleGenerationCliDisabled;
+  if (!Array.isArray(disabled)) return [];
+  return disabled.filter((item): item is TitleGenerationCli => TITLE_GENERATION_CLI_SET.has(item as TitleGenerationCli));
 }
 
 export function normalizeTitleGenerationCliSessionModes(
@@ -391,6 +416,17 @@ export async function updateProviderConfigs(
       nextAiConfig.titleGenerationCliSessionModes = normalizeTitleGenerationCliSessionModes(
         options.ai.titleGenerationCliSessionModes
       );
+    }
+
+    if ("titleGenerationCliDisabled" in options.ai) {
+      const disabled = options.ai.titleGenerationCliDisabled;
+      if (Array.isArray(disabled)) {
+        nextAiConfig.titleGenerationCliDisabled = disabled.filter(
+          (item): item is TitleGenerationCli => TITLE_GENERATION_CLI_SET.has(item as TitleGenerationCli)
+        );
+      } else {
+        delete nextAiConfig.titleGenerationCliDisabled;
+      }
     }
 
     nextConfig.ai = nextAiConfig;

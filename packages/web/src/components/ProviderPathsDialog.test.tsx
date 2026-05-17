@@ -39,6 +39,7 @@ function createSettings(overrides?: Partial<ProviderPathSettings>): ProviderPath
         claude: "fixed",
         opencode: "fixed",
       },
+      titleGenerationCliDisabled: [],
     },
     providers: [
       {
@@ -93,6 +94,7 @@ describe("ProviderPathsDialog", () => {
             claude: "fixed",
             opencode: "fixed",
           },
+          titleGenerationCliDisabled: [],
         },
       });
 
@@ -208,6 +210,7 @@ describe("ProviderPathsDialog", () => {
         ai: {
           titleGenerationCliPriority: ["claude", "codex", "opencode"],
           titleGenerationCliSessionModes: settings.ai.titleGenerationCliSessionModes,
+          titleGenerationCliDisabled: [],
         },
       };
     });
@@ -249,6 +252,7 @@ describe("ProviderPathsDialog", () => {
             claude: "fixed",
             opencode: "fixed",
           },
+          titleGenerationCliDisabled: [],
         },
       };
     });

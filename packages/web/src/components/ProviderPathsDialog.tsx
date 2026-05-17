@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowDown, ArrowUp, Loader2, RefreshCw, Save, Settings2, Sparkles, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Loader2, RefreshCw, Save, Settings2, Sparkles, X, FileText } from "lucide-react";
 import {
   fetchAvailableClis,
   fetchProviderPathSettings,
+  fetchAiDebugLog,
+  clearAiDebugLog,
   getErrorMessage,
   resetAiCliSession,
   resetAllAiCliSessions,
@@ -265,6 +267,8 @@ function TitleGenerationPriorityCard({
   onToggleSessionMode,
   onResetCli,
   onResetAll,
+  disabled,
+  onToggleDisabled,
 }: {
   priority: TitleGenerationCli[];
   sessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
@@ -275,6 +279,8 @@ function TitleGenerationPriorityCard({
   onToggleSessionMode: (cli: TitleGenerationCli) => void;
   onResetCli: (cli: TitleGenerationCli) => void;
   onResetAll: () => void;
+  disabled: TitleGenerationCli[];
+  onToggleDisabled: (cli: TitleGenerationCli) => void;
 }) {
   const hasAnySession = priority.some((cli) => cliStates[cli]?.hasSession);
 
@@ -309,18 +315,28 @@ function TitleGenerationPriorityCard({
           const hasSession = cliState?.hasSession ?? false;
           const sessionMode = sessionModes[cli] ?? "fixed";
           const fixedMode = sessionMode === "fixed";
+          const isDisabled = disabled.includes(cli);
 
           return (
             <div
               key={cli}
-              className="flex items-center gap-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 dark:border-gray-700 dark:bg-gray-900/60"
+              className={`flex items-center gap-3 rounded-lg border px-3 py-2 ${
+                isDisabled
+                  ? "border-gray-200 bg-gray-100 opacity-60 dark:border-gray-700 dark:bg-gray-800/40"
+                  : "border-gray-200 bg-gray-50 dark:border-gray-700 dark:bg-gray-900/60"
+              }`}
             >
-              <div className="flex h-6 w-6 items-center justify-center rounded-full bg-purple-100 text-xs font-semibold text-purple-700 dark:bg-purple-900/40 dark:text-purple-300">
+              <div className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+                isDisabled
+                  ? "bg-gray-200 text-gray-500 dark:bg-gray-700 dark:text-gray-400"
+                  : "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300"
+              }`}>
                 {index + 1}
               </div>
               <div className="min-w-0 flex-1">
                 <div className="text-sm text-gray-800 dark:text-gray-100">
                   {TITLE_GENERATION_CLI_LABELS[cli]}
+                  {isDisabled && <span className="ml-2 text-xs text-gray-400 dark:text-gray-500">（已禁用）</span>}
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
                   <span
@@ -365,43 +381,60 @@ function TitleGenerationPriorityCard({
               </div>
               <button
                 type="button"
-                onClick={() => onToggleSessionMode(cli)}
-                disabled={saving || resettingCli !== null}
-                className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-                aria-label={`${fixedMode ? "切换为不固定模式" : "切换为固定模式"} ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                onClick={() => onToggleDisabled(cli)}
+                disabled={saving}
+                className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                  isDisabled
+                    ? "border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700 dark:bg-rose-900/30 dark:text-rose-300 dark:hover:bg-rose-900/50"
+                    : "border-gray-200 text-gray-600 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                }`}
+                aria-label={`${isDisabled ? "启用" : "禁用"} ${TITLE_GENERATION_CLI_LABELS[cli]}`}
               >
-                {fixedMode ? "改为不固定" : "改为固定"}
+                {isDisabled ? "启用" : "禁用"}
               </button>
-              <button
-                type="button"
-                onClick={() => onResetCli(cli)}
-                disabled={saving || resettingCli !== null || !hasSession}
-                className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-                aria-label={`重置 ${TITLE_GENERATION_CLI_LABELS[cli]} 标题会话`}
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${resettingCli === cli ? "animate-spin" : ""}`} />
-                重置会话
-              </button>
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  onClick={() => onMove(index, -1)}
-                  disabled={saving || resettingCli !== null || index === 0}
-                  className="rounded-md border border-gray-200 p-1 text-gray-500 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-                  aria-label={`上移 ${TITLE_GENERATION_CLI_LABELS[cli]}`}
-                >
-                  <ArrowUp className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onMove(index, 1)}
-                  disabled={saving || resettingCli !== null || index === priority.length - 1}
-                  className="rounded-md border border-gray-200 p-1 text-gray-500 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-                  aria-label={`下移 ${TITLE_GENERATION_CLI_LABELS[cli]}`}
-                >
-                  <ArrowDown className="h-3.5 w-3.5" />
-                </button>
-              </div>
+              {!isDisabled && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => onToggleSessionMode(cli)}
+                    disabled={saving || resettingCli !== null}
+                    className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                    aria-label={`${fixedMode ? "切换为不固定模式" : "切换为固定模式"} ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                  >
+                    {fixedMode ? "改为不固定" : "改为固定"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onResetCli(cli)}
+                    disabled={saving || resettingCli !== null || !hasSession}
+                    className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                    aria-label={`重置 ${TITLE_GENERATION_CLI_LABELS[cli]} 标题会话`}
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${resettingCli === cli ? "animate-spin" : ""}`} />
+                    重置会话
+                  </button>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => onMove(index, -1)}
+                      disabled={saving || resettingCli !== null || index === 0}
+                      className="rounded-md border border-gray-200 p-1 text-gray-500 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                      aria-label={`上移 ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                    >
+                      <ArrowUp className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onMove(index, 1)}
+                      disabled={saving || resettingCli !== null || index === priority.length - 1}
+                      className="rounded-md border border-gray-200 p-1 text-gray-500 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+                      aria-label={`下移 ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                    >
+                      <ArrowDown className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           );
         })}
@@ -418,10 +451,13 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
   const [titleGenerationCliSessionModes, setTitleGenerationCliSessionModes] = useState<Record<TitleGenerationCli, TitleGenerationCliSessionMode>>(
     DEFAULT_TITLE_GENERATION_SESSION_MODES
   );
+  const [titleGenerationCliDisabled, setTitleGenerationCliDisabled] = useState<TitleGenerationCli[]>([]);
   const [cliStates, setCliStates] = useState<Partial<Record<TitleGenerationCli, AvailableCliInfo>>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [resettingCli, setResettingCli] = useState<TitleGenerationCli | "all" | null>(null);
+  const [debugLog, setDebugLog] = useState<string | null>(null);
+  const [debugLogType, setDebugLogType] = useState<"server" | "debug">("server");
 
   const loadSettings = useCallback(async () => {
     setLoading(true);
@@ -444,6 +480,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
         ...DEFAULT_TITLE_GENERATION_SESSION_MODES,
         ...nextSettings.ai.titleGenerationCliSessionModes,
       });
+      setTitleGenerationCliDisabled(nextSettings.ai.titleGenerationCliDisabled ?? []);
 
       if (clisResult.status === "fulfilled") {
         setCliStates(buildCliStateMap(clisResult.value));
@@ -521,6 +558,15 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
     }));
   }, []);
 
+  const handleToggleTitleGenerationDisabled = useCallback((cli: TitleGenerationCli) => {
+    setTitleGenerationCliDisabled((prev) => {
+      if (prev.includes(cli)) {
+        return prev.filter((c) => c !== cli);
+      }
+      return [...prev, cli];
+    });
+  }, []);
+
   const refreshCliStates = useCallback(async () => {
     const nextClis = await fetchAvailableClis();
     setCliStates(buildCliStateMap(nextClis));
@@ -568,6 +614,38 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
     }
   }, [onNotify, refreshCliStates]);
 
+  const handleViewDebugLog = useCallback(async (type: "server" | "debug" = "server") => {
+    try {
+      const log = await fetchAiDebugLog(type);
+      setDebugLogType(type);
+      setDebugLog(log || "暂无日志。");
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "读取日志失败",
+        description: getErrorMessage(error, "读取日志失败"),
+      });
+    }
+  }, [onNotify]);
+
+  const handleClearDebugLog = useCallback(async () => {
+    try {
+      await clearAiDebugLog(debugLogType);
+      setDebugLog(null);
+      onNotify({
+        variant: "success",
+        title: "日志已清除",
+        description: "下次操作时会重新记录。",
+      });
+    } catch (error) {
+      onNotify({
+        variant: "error",
+        title: "清除日志失败",
+        description: getErrorMessage(error, "清除日志失败"),
+      });
+    }
+  }, [onNotify, debugLogType]);
+
   const handleSave = useCallback(async () => {
     if (!settings) return;
 
@@ -614,6 +692,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
         ai: {
           titleGenerationCliPriority,
           titleGenerationCliSessionModes: titleGenerationCliSessionModes,
+          titleGenerationCliDisabled,
         },
       });
 
@@ -625,6 +704,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
         ...DEFAULT_TITLE_GENERATION_SESSION_MODES,
         ...nextSettings.ai.titleGenerationCliSessionModes,
       });
+      setTitleGenerationCliDisabled(nextSettings.ai.titleGenerationCliDisabled ?? []);
       await onSaved?.();
 
       const migrationMessages = nextSettings.migrationResults?.map((item) => item.message) ?? [];
@@ -644,7 +724,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
     } finally {
       setSaving(false);
     }
-  }, [drafts, migrationDrafts, onNotify, onSaved, settings, titleGenerationCliPriority, titleGenerationCliSessionModes]);
+  }, [drafts, migrationDrafts, onNotify, onSaved, settings, titleGenerationCliPriority, titleGenerationCliSessionModes, titleGenerationCliDisabled]);
 
   if (!open) return null;
 
@@ -693,6 +773,8 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
                 onToggleSessionMode={handleToggleTitleGenerationSessionMode}
                 onResetCli={(cli) => void handleResetCli(cli)}
                 onResetAll={() => void handleResetAllClis()}
+                disabled={titleGenerationCliDisabled}
+                onToggleDisabled={handleToggleTitleGenerationDisabled}
               />
               {settings.providers.map((provider) => (
                 <ProviderCard
@@ -714,15 +796,25 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
         </div>
 
         <div className="flex items-center justify-between border-t border-gray-200 px-5 py-4 dark:border-gray-700">
-          <button
-            type="button"
-            onClick={() => void loadSettings()}
-            disabled={loading || saving || resettingCli !== null}
-            className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-600 transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-          >
-            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-            重新读取
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void loadSettings()}
+              disabled={loading || saving || resettingCli !== null}
+              className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-600 transition hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+            >
+              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+              重新读取
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleViewDebugLog()}
+              className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-600 transition hover:bg-gray-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+            >
+              <FileText className="h-4 w-4" />
+              调试日志
+            </button>
+          </div>
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -744,6 +836,63 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
           </div>
         </div>
       </div>
+
+      {debugLog !== null && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/50 p-4">
+          <div className="flex h-[min(32rem,calc(100vh-4rem))] w-[min(48rem,calc(100vw-4rem))] flex-col overflow-hidden rounded-2xl bg-white shadow-2xl dark:bg-gray-800">
+            <div className="flex items-center justify-between border-b border-gray-200 px-5 py-3 dark:border-gray-700">
+              <div className="flex items-center gap-3">
+                <FileText className="h-4 w-4 text-blue-500" />
+                <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">服务器日志</div>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => void handleViewDebugLog("server")}
+                    className={`rounded px-2 py-0.5 text-xs transition ${
+                      debugLogType === "server"
+                        ? "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
+                        : "text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+                    }`}
+                  >
+                    运行日志
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleViewDebugLog("debug")}
+                    className={`rounded px-2 py-0.5 text-xs transition ${
+                      debugLogType === "debug"
+                        ? "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
+                        : "text-gray-500 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+                    }`}
+                  >
+                    调试日志
+                  </button>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleClearDebugLog()}
+                  className="rounded-lg px-2 py-1 text-xs text-gray-500 transition hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-700"
+                >
+                  清除当前日志
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDebugLog(null)}
+                  className="rounded-lg p-1 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300"
+                  aria-label="关闭日志"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <pre className="flex-1 overflow-auto p-4 text-xs text-gray-700 dark:text-gray-300 whitespace-pre-wrap font-mono">
+              {debugLog}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

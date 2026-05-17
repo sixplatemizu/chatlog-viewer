@@ -1,6 +1,10 @@
 import { serve } from "@hono/node-server";
 import { createApp, DEFAULT_SERVER_HOSTNAME } from "./app.js";
 import { compactCacheDb } from "./utils/cache.js";
+import { initFileLogger } from "./utils/file-logger.js";
+
+// 初始化文件日志系统
+initFileLogger();
 
 const app = createApp();
 const parsedPort = Number.parseInt(process.env.PORT || "3456", 10);

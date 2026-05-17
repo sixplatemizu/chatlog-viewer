@@ -92,6 +92,7 @@ export interface ProviderPathSettings {
   ai: {
     titleGenerationCliPriority: TitleGenerationCli[];
     titleGenerationCliSessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
+    titleGenerationCliDisabled: TitleGenerationCli[];
   };
   migrationResults?: ProviderPathMigrationResult[];
 }
@@ -186,6 +187,7 @@ export async function updateProviderPathSettings(payload: {
   ai?: {
     titleGenerationCliPriority: TitleGenerationCli[];
     titleGenerationCliSessionModes: Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
+    titleGenerationCliDisabled: TitleGenerationCli[];
   };
 }): Promise<ProviderPathSettings> {
   return requestJson<ProviderPathSettings>(`${BASE}/settings/provider-paths`, {
@@ -393,6 +395,15 @@ export async function generateAiTitles(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ids }),
   });
+}
+
+export async function fetchAiDebugLog(type: "server" | "debug" = "server"): Promise<string> {
+  const data = await requestJson<{ log: string }>(`${BASE}/ai/debug-log?type=${type}`);
+  return data.log;
+}
+
+export async function clearAiDebugLog(type: "server" | "debug" | "all" = "server"): Promise<void> {
+  await requestJson<{ success: boolean }>(`${BASE}/ai/debug-log?type=${type}`, { method: "DELETE" });
 }
 
 export interface AvailableCliInfo {

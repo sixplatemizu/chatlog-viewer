@@ -1310,7 +1310,8 @@ export function queryConversationIndex(options: {
     }>;
 
     return rows.map((row) => buildConversationMetaFromIndexRow(row));
-  } catch {
+  } catch (error) {
+    console.error(`[cache] queryConversationIndex error:`, error);
     return [];
   }
 }
