@@ -317,12 +317,18 @@ export function Sidebar({
 
         {activeProviders.has("codex") && filterablePillNames.length > 0 && (
           <div className="mt-2 pt-2 border-t border-gray-100 dark:border-gray-600">
-            <div className="text-[10px] text-gray-400 dark:text-gray-500 mb-1.5">Codex Provider</div>
+            <div
+              className="text-[10px] text-gray-400 dark:text-gray-500 mb-1.5"
+              title="点击 pill 仅筛选该 provider 的对话。若要把某条对话改到其他 provider，请在详情页头部的绿色下拉切换。"
+            >
+              Codex Provider 筛选
+            </div>
             <div className="flex flex-wrap gap-1">
               {filterablePillNames.map((name) => (
                 <button
                   key={name}
                   onClick={() => onToggleModelProvider(name)}
+                  title={`点击切换"显示 ${name} 对话"筛选（不会修改任何对话）`}
                   className={`
                     text-[10px] px-2 py-0.5 rounded-full border transition-all
                     ${
