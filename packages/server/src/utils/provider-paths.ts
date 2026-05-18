@@ -169,7 +169,7 @@ export function normalizeTitleGenerationCliSessionModes(
   modes?: Partial<Record<string, unknown>>
 ): Record<TitleGenerationCli, TitleGenerationCliSessionMode> {
   const normalized = Object.fromEntries(
-    TITLE_GENERATION_CLI_ORDER.map((cli) => [cli, "fixed"])
+    TITLE_GENERATION_CLI_ORDER.map((cli) => [cli, "fresh"])
   ) as Record<TitleGenerationCli, TitleGenerationCliSessionMode>;
 
   if (!modes || typeof modes !== "object") return normalized;

@@ -545,6 +545,21 @@ test("AI 标题生成路由会复用固定 CLI 会话", async () => {
   const savedTitles: string[] = [];
 
   try {
+    await writeFile(
+      join(env.baseDir, "config.json"),
+      JSON.stringify({
+        ai: {
+          titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliSessionModes: {
+            codex: "fixed",
+            claude: "fresh",
+            opencode: "fresh",
+          },
+        },
+      }),
+      "utf-8"
+    );
+
     const app = createConversationRoutes([
       createProvider({
         name: "codex",

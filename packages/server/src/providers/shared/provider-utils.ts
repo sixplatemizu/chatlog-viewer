@@ -1,6 +1,6 @@
 import { join } from "path";
 import type { ConversationMeta, ConversationReadOptions } from "../types.js";
-import { setCache } from "../../utils/cache.js";
+import { getCached, setCache } from "../../utils/cache.js";
 
 export function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "").trim();
@@ -105,13 +105,23 @@ export function applyProjectDisplayPathHints(
     const projectKey = item.meta.projectKey || item.meta.project || "";
     const preferredProject = bestProjectByKey.get(projectKey);
     const preferredProjectId = canonicalizeProjectPath(preferredProject || "") || projectKey;
+
+    // 只在 cache 当前 mtime 与 item 一致时才回写，避免与并发刷新的 fresh
+    // cache 竞争把更早的 meta 覆盖回去。getCached 返回 null 表示文件已变更
+    // 或缓存被清空，跳过本次显示路径修正即可，下一轮 list 会再次尝试。
+    const persistMeta = (nextMeta: ConversationMeta): void => {
+      const stillFresh = getCached(item.meta.filePath, item.meta.updatedAt);
+      if (!stillFresh) return;
+      setCache(item.meta.filePath, item.meta.updatedAt, nextMeta);
+    };
+
     if (!preferredProject) {
       if (item.meta.projectId === preferredProjectId) return item;
       const updatedMeta = {
         ...item.meta,
         projectId: preferredProjectId,
       };
-      setCache(item.meta.filePath, item.meta.updatedAt, updatedMeta);
+      persistMeta(updatedMeta);
       return {
         ...item,
         meta: updatedMeta,
@@ -129,7 +139,7 @@ export function applyProjectDisplayPathHints(
       project: preferredScore > currentScore ? preferredProject : item.meta.project,
       projectId: preferredProjectId,
     };
-    setCache(item.meta.filePath, item.meta.updatedAt, updatedMeta);
+    persistMeta(updatedMeta);
     return {
       ...item,
       meta: updatedMeta,

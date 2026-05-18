@@ -113,6 +113,7 @@ export function ConversationViewer({
   const inputRef = useRef<HTMLInputElement>(null);
   const restoreIndexRef = useRef<number | null>(null);
   const lastConversationIdRef = useRef<string | null>(null);
+  const genStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
   const [generating, setGenerating] = useState(false);
@@ -120,6 +121,25 @@ export function ConversationViewer({
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
+
+  const scheduleGenStatusReset = (delayMs: number) => {
+    if (genStatusTimerRef.current !== null) {
+      clearTimeout(genStatusTimerRef.current);
+    }
+    genStatusTimerRef.current = setTimeout(() => {
+      genStatusTimerRef.current = null;
+      setGenStatus("");
+    }, delayMs);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (genStatusTimerRef.current !== null) {
+        clearTimeout(genStatusTimerRef.current);
+        genStatusTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const totalMessages = conversation?.messageCount ?? conversation?.messages.length ?? 0;
   const loadedMessages = conversation?.messages ?? EMPTY_MESSAGES;
@@ -242,14 +262,14 @@ export function ConversationViewer({
         );
         await onTitleChanged(conversation.id, result.title);
         await onRefreshConversation?.(conversation.id);
-        setTimeout(() => setGenStatus(""), 3000);
+        scheduleGenStatusReset(3000);
       } else {
         setGenStatus(`失败: ${result.error}`);
-        setTimeout(() => setGenStatus(""), 5000);
+        scheduleGenStatusReset(5000);
       }
     } catch (error) {
       setGenStatus(`失败: ${getErrorMessage(error, "生成失败")}`);
-      setTimeout(() => setGenStatus(""), 3000);
+      scheduleGenStatusReset(3000);
     }
     setGenerating(false);
   };

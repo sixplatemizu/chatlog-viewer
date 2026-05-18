@@ -185,7 +185,7 @@ test("标题生成 CLI 优先级会归一化并补齐缺失项", () => {
   );
 });
 
-test("标题生成 CLI 会话模式会归一化并补齐默认固定模式", () => {
+test("标题生成 CLI 会话模式会归一化无效值并补齐默认 fresh", () => {
   assert.deepEqual(
     normalizeTitleGenerationCliSessionModes({
       codex: "fresh",
@@ -195,7 +195,7 @@ test("标题生成 CLI 会话模式会归一化并补齐默认固定模式", () 
     }),
     {
       codex: "fresh",
-      claude: "fixed",
+      claude: "fresh",
       opencode: "fixed",
     }
   );

@@ -98,38 +98,51 @@ async function flushDebugQueue() {
 }
 
 let lastRotateAt = 0;
+let rotateInFlight: Promise<void> | null = null;
 
-// rotate 节流：单次 flush 不会触发额外 IO。
-// - 按文件数：超过 MAX_LOG_FILES 后删旧的
-// - 按行数：单文件超过 MAX_LOG_LINES 时截尾保留最近行
+// rotate 节流 + 互斥：
+// - 通过 in-flight Promise 防止两次并发 truncate 竞争同一文件
+// - 时间窗口节流避免每条日志都 stat/readdir
 async function maybeRotate(currentFile: string): Promise<void> {
+  if (rotateInFlight) {
+    await rotateInFlight;
+    return;
+  }
   const now = Date.now();
   if (now - lastRotateAt < ROTATE_INTERVAL_MS) return;
   lastRotateAt = now;
 
-  // 1. 文件数 rotate
-  try {
-    const files = await readdir(LOG_DIR);
-    const logFiles = files.filter((f) => f.endsWith(".log")).sort();
-    if (logFiles.length > MAX_LOG_FILES) {
-      const toDelete = logFiles.slice(0, logFiles.length - MAX_LOG_FILES);
-      await Promise.all(toDelete.map((file) => rm(join(LOG_DIR, file), { force: true })));
+  rotateInFlight = (async () => {
+    // 1. 文件数 rotate
+    try {
+      const files = await readdir(LOG_DIR);
+      const logFiles = files.filter((f) => f.endsWith(".log")).sort();
+      if (logFiles.length > MAX_LOG_FILES) {
+        const toDelete = logFiles.slice(0, logFiles.length - MAX_LOG_FILES);
+        await Promise.all(toDelete.map((file) => rm(join(LOG_DIR, file), { force: true })));
+      }
+    } catch {
+      // 忽略
     }
-  } catch {
-    // 忽略
-  }
 
-  // 2. 行数 rotate：仅对超过阈值的单文件抽样
+    // 2. 行数 rotate：仅对超过阈值的单文件抽样
+    try {
+      const fileStat = await stat(currentFile);
+      if (fileStat.size < TRUNCATE_CHECK_MIN_BYTES) return;
+      const content = await readFile(currentFile, "utf-8");
+      const lines = content.split("\n");
+      if (lines.length <= MAX_LOG_LINES) return;
+      const truncated = lines.slice(-MAX_LOG_LINES).join("\n");
+      await writeFile(currentFile, truncated, "utf-8");
+    } catch {
+      // 忽略
+    }
+  })();
+
   try {
-    const fileStat = await stat(currentFile);
-    if (fileStat.size < TRUNCATE_CHECK_MIN_BYTES) return;
-    const content = await readFile(currentFile, "utf-8");
-    const lines = content.split("\n");
-    if (lines.length <= MAX_LOG_LINES) return;
-    const truncated = lines.slice(-MAX_LOG_LINES).join("\n");
-    await writeFile(currentFile, truncated, "utf-8");
-  } catch {
-    // 忽略
+    await rotateInFlight;
+  } finally {
+    rotateInFlight = null;
   }
 }
 
