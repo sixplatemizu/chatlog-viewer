@@ -16,6 +16,12 @@ const META_CACHE_MAX_AGE_MS = 90 * 24 * 60 * 60_000;
 const LIST_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const MESSAGE_IDENTITY_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const KEEP_META_ROWS = 50_000;
+// meta_cache 中 ConversationMeta 字段语义/抽取逻辑变更时升级此版本号。
+// 启动时检测到旧版本会清空 meta_cache + indexed_list_cache + conversation_index
+// 等派生 cache，强制下一轮 list 重新从 jsonl/state-db 解析，避免被旧 bug 时期
+// 写入的污染 meta 卡住（典型例子：applyProjectDisplayPathHints 曾把同一
+// projectKey 下所有 session 的 project 同化为最深路径）。
+const META_CACHE_VERSION = 2;
 
 interface CacheEntry {
   mtimeMs: number;
@@ -249,7 +255,43 @@ function getDb(): BetterSqlite3.Database {
     ON conversation_search_chunk (conversation_id);
   `);
 
+  migrateMetaCacheVersion(db);
+
   return db;
+}
+
+// 检测 meta_cache schema 版本。低版本说明可能存在历史 bug 写入的污染条目，
+// 清空所有派生 cache 表（meta_cache / list_cache / indexed_list_cache /
+// conversation_index / conversation_search_chunk），让下一次 list 重建。
+// codex_message_identity 不清，它独立于 ConversationMeta。
+function migrateMetaCacheVersion(database: BetterSqlite3.Database): void {
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS cache_schema_meta (
+        key TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      )
+    `);
+    const row = database
+      .prepare("SELECT value FROM cache_schema_meta WHERE key = ?")
+      .get("meta_cache_version") as { value: number } | undefined;
+    const storedVersion = row?.value ?? 0;
+    if (storedVersion === META_CACHE_VERSION) return;
+
+    database.exec(`
+      DELETE FROM meta_cache;
+      DELETE FROM list_cache;
+      DELETE FROM indexed_list_cache;
+      DELETE FROM conversation_index;
+      DELETE FROM conversation_search_chunk;
+    `);
+    database
+      .prepare("INSERT OR REPLACE INTO cache_schema_meta (key, value) VALUES (?, ?)")
+      .run("meta_cache_version", META_CACHE_VERSION);
+    console.log(`[cache] meta_cache 版本迁移 ${storedVersion} → ${META_CACHE_VERSION}，已清空派生缓存`);
+  } catch {
+    // 迁移失败不影响主流程，下一轮 list 自然会重新解析（最坏情况是命中旧值）
+  }
 }
 
 function ensureIndexedListCacheSchema(database: BetterSqlite3.Database): void {
