@@ -130,14 +130,26 @@ export function applyProjectDisplayPathHints(
 
     const currentScore = getProjectSpecificity(item.meta.project, projectKey);
     const preferredScore = getProjectSpecificity(preferredProject, projectKey);
-    if (preferredScore <= currentScore && item.meta.projectId === preferredProjectId) {
+    // 关键约束：仅当当前 item 没有自己的有效 project（specificity === 0，
+    // 例如只拿到 encoded projectKey 没解析出 cwd）时才用群组内最优值填充。
+    // 否则保留 item 自己的 cwd —— 同一 Claude Code 项目目录下的不同 session
+    // 完全可能在不同子目录启动（e.g. `~` 和 `~/sub`），不应被其他 session
+    // 的更深路径覆盖。projectId 同样保留自己的而不是用 preferredProjectId，
+    // 否则前端按 projectId 分组时会把不同 cwd 的 session 合并到一起。
+    const shouldUseFallback = currentScore === 0 && preferredScore > 0;
+    const finalProject = shouldUseFallback ? preferredProject : item.meta.project;
+    const finalProjectId = shouldUseFallback
+      ? preferredProjectId
+      : canonicalizeProjectPath(item.meta.project) || preferredProjectId;
+
+    if (item.meta.project === finalProject && item.meta.projectId === finalProjectId) {
       return item;
     }
 
     const updatedMeta = {
       ...item.meta,
-      project: preferredScore > currentScore ? preferredProject : item.meta.project,
-      projectId: preferredProjectId,
+      project: finalProject,
+      projectId: finalProjectId,
     };
     persistMeta(updatedMeta);
     return {
