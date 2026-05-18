@@ -544,6 +544,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       const result = await generateTitle(buildTitleGenerationMessages(conversation), {
         priority: getTitleGenerationCliPriority(),
         reuseSession: getTitleGenerationCliSessionReuse(),
+        projectDir: conversation.project,
       });
       await persistConversationTitle(provider, id, result.title);
       return c.json({ success: true, title: result.title, usedCli: result.usedCli });
@@ -588,6 +589,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         const result = await generateTitle(buildTitleGenerationMessages(conversation), {
           priority: getTitleGenerationCliPriority(),
           reuseSession: getTitleGenerationCliSessionReuse(),
+          projectDir: conversation.project,
         });
         await persistConversationTitle(provider, id, result.title);
         results.push({

@@ -102,6 +102,65 @@ exec "${process.execPath}" "$SCRIPT_DIR/fake-title-cli.mjs" codex "$@"
   };
 }
 
+async function createFakeOpenCodeEnv(options: { emptyOutput?: boolean } = {}) {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-ai-opencode-test-"));
+  const binDir = join(baseDir, "bin");
+  const configPath = join(baseDir, "config.json");
+  const sessionDir = join(baseDir, "ai-title-sessions", "opencode");
+  const runnerPath = join(binDir, "fake-opencode-cli.mjs");
+  const unixWrapperPath = join(binDir, "opencode");
+  const cmdWrapperPath = join(binDir, "opencode.cmd");
+  const previousPath = process.env.PATH;
+  const previousConfigPath = process.env.CHATLOG_VIEWER_CONFIG_PATH;
+
+  await mkdir(binDir, { recursive: true });
+  await writeFile(
+    runnerPath,
+    `import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  process.stdout.write("opencode 1.15.0");
+  process.exit(0);
+}
+
+appendFileSync(join(process.cwd(), "opencode.calls.log"), JSON.stringify({ args, cwd: process.cwd() }) + "\\n", "utf8");
+${options.emptyOutput ? "process.exit(0);" : "process.stdout.write(JSON.stringify({ type: \"text\", part: { type: \"text\", text: \"OpenCode 标题\" } }) + \"\\n\");\nprocess.exit(0);"}
+`,
+    "utf-8"
+  );
+  await writeFile(
+    unixWrapperPath,
+    `#!/usr/bin/env sh
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${process.execPath}" "$SCRIPT_DIR/fake-opencode-cli.mjs" "$@"
+`,
+    "utf-8"
+  );
+  await writeFile(
+    cmdWrapperPath,
+    `@echo off\r\n"${process.execPath}" "%~dp0fake-opencode-cli.mjs" %*\r\n`,
+    "utf-8"
+  );
+  await chmod(unixWrapperPath, 0o755);
+
+  process.env.PATH = `${binDir}${delimiter}${previousPath ?? ""}`;
+  process.env.CHATLOG_VIEWER_CONFIG_PATH = configPath;
+
+  return {
+    baseDir,
+    sessionDir,
+    restoreEnv() {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+
+      if (previousConfigPath === undefined) delete process.env.CHATLOG_VIEWER_CONFIG_PATH;
+      else process.env.CHATLOG_VIEWER_CONFIG_PATH = previousConfigPath;
+    },
+  };
+}
+
 async function readCallLog(sessionDir: string) {
   const content = await readFile(join(sessionDir, "codex.calls.log"), "utf-8");
   return content
@@ -112,6 +171,18 @@ async function readCallLog(sessionDir: string) {
       args: string[];
       isResume: boolean;
       inputLength: number;
+    });
+}
+
+async function readOpenCodeCallLog(sessionDir: string) {
+  const content = await readFile(join(sessionDir, "opencode.calls.log"), "utf-8");
+  return content
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as {
+      args: string[];
+      cwd: string;
     });
 }
 
@@ -151,6 +222,47 @@ test("标题提取会拒绝 OpenCode JSON default 占位输出", () => {
 test("标题提取会拒绝 CLI 状态占位输出", () => {
   assert.equal(extractCleanOutput("default"), "");
   assert.equal(extractCleanOutput("> default · deepseek-v4-flash"), "");
+});
+
+test("OpenCode 生成标题时会显式传入项目目录", async () => {
+  const env = await createFakeOpenCodeEnv();
+  const projectDir = "D:/DownloadFiles/code_area";
+
+  try {
+    const result = await generateTitle(SAMPLE_MESSAGES, {
+      priority: ["opencode"],
+      projectDir,
+    });
+
+    assert.equal(result.title, "OpenCode 标题");
+    assert.equal(result.usedCli, "opencode");
+
+    const calls = await readOpenCodeCallLog(env.sessionDir);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0]?.args.slice(0, 4), ["run", "--dir", projectDir, "--format"]);
+    assert.ok(calls[0]?.args.includes("--"));
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode 空输出会返回可诊断错误", async () => {
+  const env = await createFakeOpenCodeEnv({ emptyOutput: true });
+  const projectDir = "D:/DownloadFiles/code_area";
+
+  try {
+    await assert.rejects(
+      generateTitle(SAMPLE_MESSAGES, {
+        priority: ["opencode"],
+        projectDir,
+      }),
+      /opencode 未产生输出.*dir=D:\/DownloadFiles\/code_area/
+    );
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
 });
 
 test("首次生成标题会创建固定会话并写入 session 状态", async () => {

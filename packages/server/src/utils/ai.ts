@@ -6,7 +6,7 @@ import type { TitleGenerationCli } from "./provider-paths.js";
 import { getProviderConfigPath } from "./provider-paths.js";
 
 type CliToolName = TitleGenerationCli;
-type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh";
+type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh" | "fresh-fallback-dir" | "resume-fallback-dir";
 
 interface CliTool {
   name: CliToolName;
@@ -16,6 +16,7 @@ interface CliTool {
   healthcheckArgs: string[];
   timeoutMs?: number;
   promptMode?: "stdin" | "args";
+  projectDirArg?: string;
 }
 
 const CLI_TOOLS: CliTool[] = [
@@ -42,12 +43,13 @@ const CLI_TOOLS: CliTool[] = [
     healthcheckArgs: ["--version"],
     timeoutMs: 45_000,
     promptMode: "args",
+    projectDirArg: "--dir",
   },
 ];
 
 const TITLE_SESSION_DIRNAME = "ai-title-sessions";
 const SESSION_MARKER_FILENAME = ".session.json";
-const INVALID_GENERATED_TITLE_OUTPUTS = new Set(["default", "build", "plan", "general"]);
+const INVALID_GENERATED_TITLE_OUTPUTS = new Set(["default", "build", "plan", "general", "step-start", "step_start"]);
 const RESUME_MISS_PATTERNS = [
   /no .*?(conversation|session|chat|thread).*?(found|available|to resume|to continue)/i,
   /(nothing|no previous|no prior).*(resume|continue|conversation|session)/i,
@@ -203,6 +205,22 @@ export function extractCleanOutput(stdout: string): string {
   const jsonLineText = extractJsonLineTextOutput(stdout);
   if (jsonLineText !== null) return jsonLineText;
 
+  // 当输出以"流式 JSON 事件"为主时（多数行以 { 开头），视为 CLI 走了 JSON
+  // 输出模式但未产生 text 事件（典型场景：opencode --format json 只回了
+  // step_start/step_finish）。此时退回到 regex 抽取没意义，直接返回空。
+  // 阈值用半数以上避免误伤偶尔包含一两行 JSON 示例的 claude/codex 输出。
+  const trimmedLines = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (trimmedLines.length > 0) {
+    const jsonLineCount = trimmedLines.filter((line) => line.startsWith("{")).length;
+    if (jsonLineCount * 2 >= trimmedLines.length) {
+      return "";
+    }
+  }
+
   const ansiEscape = String.fromCharCode(27);
   const clean = stdout
     .replace(/<Execution Info>[\s\S]*/m, "")
@@ -281,11 +299,37 @@ function isResumeMissError(error: unknown): boolean {
   return RESUME_MISS_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-async function executeCli(tool: CliTool, args: string[], prompt: string, workDir: string): Promise<string> {
+// 规范化 Windows 长路径前缀 `\\?\` 以及大小写、斜杠方向，用于路径比较。
+// 注意：路径换 `/` 后 `\\?\` 变成 `//?/`，要在 normalize 之后再剥离。
+function normalizeProjectDirForCompare(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^\/\/\?\//, "").toLowerCase();
+}
+
+function addProjectDirArg(tool: CliTool, args: string[], projectDir?: string): string[] {
+  const normalizedProjectDir = projectDir?.trim();
+  if (!tool.projectDirArg || !normalizedProjectDir || args.includes(tool.projectDirArg)) {
+    return args;
+  }
+
+  const [command, ...rest] = args;
+  if (!command) {
+    return [tool.projectDirArg, normalizedProjectDir];
+  }
+  return [command, tool.projectDirArg, normalizedProjectDir, ...rest];
+}
+
+async function executeCli(
+  tool: CliTool,
+  args: string[],
+  prompt: string,
+  workDir: string,
+  options: { projectDir?: string } = {}
+): Promise<string> {
   const promptViaArgs = tool.promptMode === "args";
   const isWindowsShell = process.platform === "win32";
+  const argsWithProjectDir = addProjectDirArg(tool, args, options.projectDir);
   const resolvedArgs = promptViaArgs
-    ? args.map((arg) => {
+    ? argsWithProjectDir.map((arg) => {
         if (arg !== "__PROMPT__") return arg;
         const sanitized = prompt.replace(/\n/g, "  ").replace(/[&|<>^%]/g, " ");
         if (!isWindowsShell) {
@@ -295,13 +339,13 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
         // Windows 下 shell: true 经过 cmd.exe，含空格的 arg 需要双引号包裹；内部 " 用 "" 转义
         return `"${sanitized.replace(/"/g, '""')}"`;
       })
-    : args;
+    : argsWithProjectDir;
 
   // 调试日志：脱敏 prompt，仅打印长度 + 摘要前 80 字符
   const promptPreview = prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt;
   console.log(`[AI] 执行 ${tool.name} (prompt ${prompt.length} chars, mode=${promptViaArgs ? "args" : "stdin"})`);
   console.debug(`[AI] ${tool.name} prompt preview: ${promptPreview.replace(/\n/g, " ")}`);
-  console.debug(`[AI] ${tool.name} cmd: ${tool.command} ${promptViaArgs ? args.join(" ") : resolvedArgs.join(" ")}`);
+  console.debug(`[AI] ${tool.name} cmd: ${tool.command} ${resolvedArgs.join(" ")}`);
 
   return await new Promise<string>((resolve, reject) => {
     const child = spawn(tool.command, resolvedArgs, {
@@ -342,7 +386,13 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
         reject(new Error(stderr.trim() || `${tool.name} 执行失败 (${code ?? "unknown"})`));
         return;
       }
-      resolve(stdout || stderr);
+      const output = stdout || stderr;
+      if (!output.trim()) {
+        const projectDirDetail = options.projectDir ? `, dir=${options.projectDir}` : "";
+        reject(new Error(`${tool.name} 未产生输出（cwd=${workDir}${projectDirDetail}）`));
+        return;
+      }
+      resolve(output);
     });
 
     if (!promptViaArgs) {
@@ -357,17 +407,47 @@ async function executeCli(tool: CliTool, args: string[], prompt: string, workDir
 async function runCliTool(
   tool: CliTool,
   prompt: string,
-  options?: { reuseSession?: boolean }
+  options?: { reuseSession?: boolean; projectDir?: string }
 ): Promise<{ stdout: string; mode: CliRunMode }> {
   const workDir = await ensureCliSessionDir(tool.name);
   const allowReuseSession = options?.reuseSession ?? false;
   const hasSession = allowReuseSession ? await hasPersistedSession(tool.name) : false;
+  const projectDir = tool.projectDirArg ? options?.projectDir?.trim() || process.cwd() : undefined;
+  const fallbackProjectDir = tool.name === "opencode" && projectDir
+    && normalizeProjectDirForCompare(projectDir) !== normalizeProjectDirForCompare(process.cwd())
+    ? process.cwd()
+    : undefined;
+
+  const runWithOptionalDirFallback = async (
+    args: string[],
+    mode: CliRunMode
+  ): Promise<{ stdout: string; mode: CliRunMode }> => {
+    const stdout = await executeCli(tool, args, prompt, workDir, { projectDir });
+    if (!fallbackProjectDir || tool.name !== "opencode") {
+      return { stdout, mode };
+    }
+
+    if (extractCleanOutput(stdout).trim().length > 0) {
+      return { stdout, mode };
+    }
+
+    console.warn(`[AI] ${tool.name} 在 dir=${projectDir} 下未产生有效标题，回退到当前工作目录 ${fallbackProjectDir}`);
+    const fallbackStdout = await executeCli(tool, args, prompt, workDir, { projectDir: fallbackProjectDir });
+    if (extractCleanOutput(fallbackStdout).trim().length === 0) {
+      throw new Error(`${tool.name} 在 dir=${projectDir} 和 dir=${fallbackProjectDir} 下都未产生有效输出`);
+    }
+
+    return {
+      stdout: fallbackStdout,
+      mode: mode === "resume" ? "resume-fallback-dir" : "fresh-fallback-dir",
+    };
+  };
 
   if (hasSession && tool.resumeArgs) {
     try {
-      const stdout = await executeCli(tool, tool.resumeArgs, prompt, workDir);
+      const result = await runWithOptionalDirFallback(tool.resumeArgs, "resume");
       await writeSessionMarker(tool.name);
-      return { stdout, mode: "resume" };
+      return result;
     } catch (error) {
       if (!isResumeMissError(error)) {
         throw error;
@@ -375,20 +455,24 @@ async function runCliTool(
 
       console.warn(`[AI] ${tool.name} 未找到可复用会话，回退为新建会话`);
       await clearSessionMarker(tool.name);
-      const stdout = await executeCli(tool, tool.freshArgs, prompt, workDir);
+      const result = await runWithOptionalDirFallback(tool.freshArgs, "resume-fallback-fresh");
       await writeSessionMarker(tool.name);
-      return { stdout, mode: "resume-fallback-fresh" };
+      return result;
     }
   }
 
-  const stdout = await executeCli(tool, tool.freshArgs, prompt, workDir);
+  const result = await runWithOptionalDirFallback(tool.freshArgs, "fresh");
   await writeSessionMarker(tool.name);
-  return { stdout, mode: "fresh" };
+  return result;
 }
 
 export async function generateTitle(
   messages: Message[],
-  options?: { priority?: string[]; reuseSession?: boolean | Partial<Record<CliToolName, boolean>> }
+  options?: {
+    priority?: string[];
+    reuseSession?: boolean | Partial<Record<CliToolName, boolean>>;
+    projectDir?: string;
+  }
 ): Promise<{
   title: string;
   usedCli: string;
@@ -412,6 +496,7 @@ export async function generateTitle(
         : options?.reuseSession;
       const result = await runCliTool(tool, fullPrompt, {
         reuseSession,
+        projectDir: options?.projectDir,
       });
       console.log(`[AI] 调用 ${tool.name} (${result.mode})`);
       console.log(`[AI] ${tool.name} 原始输出(${result.stdout.length} 字):`, JSON.stringify(result.stdout.slice(0, 300)));
