@@ -21,7 +21,7 @@ const KEEP_META_ROWS = 50_000;
 // 等派生 cache，强制下一轮 list 重新从 jsonl/state-db 解析，避免被旧 bug 时期
 // 写入的污染 meta 卡住（典型例子：applyProjectDisplayPathHints 曾把同一
 // projectKey 下所有 session 的 project 同化为最深路径）。
-const META_CACHE_VERSION = 2;
+const META_CACHE_VERSION = 5;
 
 interface CacheEntry {
   mtimeMs: number;

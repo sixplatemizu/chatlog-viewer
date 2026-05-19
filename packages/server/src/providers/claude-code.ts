@@ -69,6 +69,11 @@ interface ClaudeCodeEntry {
   };
   cwd?: string;
   timestamp?: string;
+  // 仅在 type==="custom-title" / "agent-name" / "summary" 等元数据条目上出现，
+  // Claude /resume 的"会话名"主要来源；UI 也应优先用这个。
+  customTitle?: string;
+  agentName?: string;
+  summary?: string;
 }
 
 interface ClaudeCodeSessionIndexEntry {
@@ -586,8 +591,17 @@ export class ClaudeCodeProvider implements ConversationProvider {
     }
 
     if (!options.includeSearchIndex) {
-      const meta = await this.extractMeta(source);
-      return meta ? { meta } : null;
+      // 即便不需要搜索索引，也走 scanTranscriptSource —— extractMeta 用
+      // parseJsonlHead(40) 拿不到出现在文件中后段的 type:"custom-title"
+      // 条目（Claude /resume 显示的会话名来自这里）。代价是首次 list 稍慢，
+      // 但有 indexed_list_cache 兜底，后续走持久层。
+      if (!source.transcriptPath) {
+        const meta = await this.extractMeta(source);
+        return meta ? { meta } : null;
+      }
+      const result = await this.scanTranscriptSource(source, false);
+      if (!result) return null;
+      return { meta: result.meta };
     }
 
     if (!source.transcriptPath) {
@@ -612,11 +626,24 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const fileStat = await stat(source.transcriptPath);
     let project = normalizePath(source.projectPathHint || source.projectKey);
     let transcriptTitle: string | undefined;
+    let inlineTitleHint: string | undefined;
     let firstTimestamp: number | undefined;
     let messageCount = 0;
     const searchBuilder = includeSearchIndex ? createConversationSearchIndexBuilder() : null;
 
     await visitJsonl<ClaudeCodeEntry>(source.transcriptPath, (entry) => {
+      // Claude /resume 显示的会话名来自 type:"custom-title" / "agent-name"
+      // 元条目。它们不是 user/assistant 消息，但需要在主循环外捕获，且取
+      // 最后一次出现的（用户可能多次重命名）。
+      if (entry.type === "custom-title" && typeof entry.customTitle === "string" && entry.customTitle.trim()) {
+        inlineTitleHint = entry.customTitle.trim();
+        return;
+      }
+      if (entry.type === "agent-name" && typeof entry.agentName === "string" && entry.agentName.trim()) {
+        if (!inlineTitleHint) inlineTitleHint = entry.agentName.trim();
+        return;
+      }
+
       if (
         entry.isMeta
         || entry.isSidechain
@@ -680,7 +707,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const meta: ConversationMeta = {
       id: `claude-code:${source.sessionId}`,
       provider: this.name,
-      title: buildConversationTitle(source.displayTitleHint, transcriptTitle, source.firstPromptHint),
+      title: buildConversationTitle(inlineTitleHint, source.displayTitleHint, transcriptTitle, source.firstPromptHint),
       project,
       projectKey: source.projectKey,
       projectId: canonicalizeProjectPath(project) || source.projectKey,
@@ -1041,6 +1068,20 @@ export class ClaudeCodeProvider implements ConversationProvider {
       ? extractTextContent(firstUserMsg.message!.content)
       : undefined;
 
+    // Claude Code 的 /resume 列表会把 type:"custom-title" / "agent-name" 元
+    // 条目里的 customTitle / agentName 当作会话显示名。这类条目可能在文件中
+    // 多次出现（每次进入 session 都重写一份），但通常都是同一值。取 head 中
+    // 最后一次出现的，与 /resume 行为保持一致。
+    const customTitleEntry = [...headEntries].reverse().find((entry) =>
+      entry.type === "custom-title" && typeof entry.customTitle === "string" && entry.customTitle.trim()
+    );
+    const agentNameEntry = [...headEntries].reverse().find((entry) =>
+      entry.type === "agent-name" && typeof entry.agentName === "string" && entry.agentName.trim()
+    );
+    const inlineTitleHint = customTitleEntry?.customTitle?.trim()
+      || agentNameEntry?.agentName?.trim()
+      || undefined;
+
     const firstTs = headMessages[0]?.timestamp
       ? new Date(headMessages[0].timestamp).getTime()
       : (source.createdAtHint ?? fileStat.birthtimeMs);
@@ -1063,7 +1104,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const meta: ConversationMeta = {
       id: `claude-code:${source.sessionId}`,
       provider: this.name,
-      title: buildConversationTitle(source.displayTitleHint, transcriptTitle, source.firstPromptHint),
+      title: buildConversationTitle(inlineTitleHint, source.displayTitleHint, transcriptTitle, source.firstPromptHint),
       project,
       projectKey: source.projectKey,
       projectId: canonicalizeProjectPath(project) || source.projectKey,
