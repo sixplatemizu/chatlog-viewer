@@ -198,6 +198,13 @@ function isCliStatusLine(line: string): boolean {
   const normalized = line.replace(/^>\s*/, "").trim();
   if (!normalized) return true;
   if (/^(default|build|plan|general)$/i.test(normalized)) return true;
+  // Windows taskkill 输出（codex v0.130+ 结束时级联杀子进程产生）
+  if (/^SUCCESS: The process with PID \d+/i.test(normalized)) return true;
+  // codex CLI 自身分节标记
+  if (/^(codex|tokens used)$/i.test(normalized)) return true;
+  if (/^tokens used\s+[\d,]+$/i.test(normalized)) return true;
+  // ISO 时间戳开头的 codex stderr 日志被合并到 stdout 时
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.*ERROR /.test(normalized)) return true;
   return /^[\w-]+\s*[·•]\s*[\w./:-]+/i.test(normalized);
 }
 
