@@ -1,4 +1,5 @@
 import { join } from "path";
+import { realpathSync } from "fs";
 import type { ConversationMeta, ConversationReadOptions } from "../types.js";
 import { getCached, setCache } from "../../utils/cache.js";
 
@@ -12,6 +13,34 @@ export function canonicalizeProjectPath(value: string): string {
   return /^[A-Za-z]:\//.test(normalized) || normalized.startsWith("~/")
     ? normalized.toLowerCase()
     : normalized;
+}
+
+// 解析符号链接：将软链接/junction 还原为真实物理路径。
+// 同名项目在 D:\ 和 C:\Users\...\Desktop 两处通过软链接共享时，
+// 不同 cwd 字符串解析到同一物理 realpath，从而被 UI 视作同一文件夹。
+const realpathCache = new Map<string, string>();
+
+export function canonicalizeProjectPathResolvingSymlinks(value: string): string {
+  const normalized = normalizePath(value);
+  if (!normalized) return "";
+
+  const cached = realpathCache.get(normalized);
+  if (cached !== undefined) return cached;
+
+  let resolved = normalized;
+  try {
+    // realpathSync 对软链接/junction 返回目标真实路径；目标不存在时抛错。
+    resolved = normalizePath(realpathSync(normalized));
+  } catch {
+    // 路径不存在或没权限：保留原归一化路径。
+  }
+
+  const canonical = /^[A-Za-z]:\//.test(resolved) || resolved.startsWith("~/")
+    ? resolved.toLowerCase()
+    : resolved;
+
+  realpathCache.set(normalized, canonical);
+  return canonical;
 }
 
 export function isWindowsHomePath(path: string): boolean {

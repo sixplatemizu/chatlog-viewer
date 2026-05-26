@@ -62,7 +62,7 @@ import {
   type CodexThreadMetadata,
   type CodexThreadRow,
 } from "./codex-sqlite-client.js";
-import { normalizePath, canonicalizeProjectPath, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
+import { normalizePath, canonicalizeProjectPath, canonicalizeProjectPathResolvingSymlinks, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
 
 interface CodexEntry {
   timestamp: string;
@@ -557,7 +557,7 @@ export class CodexProvider implements ConversationProvider {
   }
 
   private buildStateOnlyMeta(thread: CodexThreadRow): ConversationMeta | null {
-    const normalizedCwd = canonicalizeProjectPath(thread.cwd);
+    const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(thread.cwd);
     const normalizedTitle = normalizeCodexDisplayText(thread.title);
     const normalizedFirstUserMessage = normalizeCodexDisplayText(thread.firstUserMessage);
     const fallbackTitle = normalizedTitle || normalizedFirstUserMessage;
@@ -866,7 +866,7 @@ export class CodexProvider implements ConversationProvider {
       return null;
     }
 
-    const normalizedCwd = canonicalizeProjectPath(cwd);
+    const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
     if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
       fallbackTitle = await findCodexFallbackTitle(filePath);
@@ -958,7 +958,7 @@ export class CodexProvider implements ConversationProvider {
     if (messageCount === 0 && userMessages.length === 0) return null;
 
     const firstTs = new Date(headEntries[0].timestamp).getTime();
-    const normalizedCwd = canonicalizeProjectPath(cwd);
+    const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
 
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
     if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
@@ -1387,7 +1387,7 @@ export class CodexProvider implements ConversationProvider {
         const head = await parseJsonlHead<CodexEntry>(filePath, 5);
         const meta = head.find((e) => e.type === "session_meta");
         const cwd = meta?.payload?.cwd;
-        if (cwd) cwds.add(canonicalizeProjectPath(cwd));
+        if (cwd) cwds.add(canonicalizeProjectPathResolvingSymlinks(cwd));
       } catch {
         // 跳过
       }
