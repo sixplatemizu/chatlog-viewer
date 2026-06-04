@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { ClaudeCodeProvider } from "./claude-code.js";
 import { clearProviderPathCache } from "../utils/provider-paths.js";
 import { getIndexedCacheSnapshot, getIndexedListCacheKey, setCacheStoreDirForTests } from "../utils/cache.js";
+import { setNativeTitle } from "../utils/title-store.js";
 
 function createHistoryLine(input: {
   display: string;
@@ -20,18 +21,22 @@ async function createProviderFixture() {
   const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-claude-provider-"));
   const storagePath = join(baseDir, "projects");
   const storeDir = join(baseDir, ".chatlog-viewer");
+  const configPath = join(storeDir, "config.json");
   await mkdir(storagePath, { recursive: true });
 
   const previousClaudePath = process.env.CHATLOG_VIEWER_CLAUDE_CODE_PATH;
   const previousStoreDir = process.env.CHATLOG_VIEWER_STORE_DIR;
+  const previousConfigPath = process.env.CHATLOG_VIEWER_CONFIG_PATH;
   process.env.CHATLOG_VIEWER_CLAUDE_CODE_PATH = storagePath;
   process.env.CHATLOG_VIEWER_STORE_DIR = storeDir;
+  process.env.CHATLOG_VIEWER_CONFIG_PATH = configPath;
   clearProviderPathCache();
   setCacheStoreDirForTests(storeDir);
 
   return {
     baseDir,
     storagePath,
+    storeDir,
     provider: new ClaudeCodeProvider(),
     async cleanup() {
       if (previousClaudePath === undefined) {
@@ -44,6 +49,12 @@ async function createProviderFixture() {
         delete process.env.CHATLOG_VIEWER_STORE_DIR;
       } else {
         process.env.CHATLOG_VIEWER_STORE_DIR = previousStoreDir;
+      }
+
+      if (previousConfigPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_CONFIG_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_CONFIG_PATH = previousConfigPath;
       }
 
       clearProviderPathCache();
@@ -263,6 +274,146 @@ test("Claude Code 在 eagerSearchIndex 模式下会为 transcript 一次构建�
     assert.equal(snapshot?.[0]?.meta.id, `claude-code:${sessionId}`);
     assert.ok(snapshot?.[0]?.searchText?.includes(needle));
     assert.ok(snapshot?.[0]?.searchChunks?.some((chunk) => chunk.includes(needle)));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("Claude Code UI 标题会优先于原生旧标题并写回 transcript", async () => {
+  const fixture = await createProviderFixture();
+  const sessionId = "88888888-8888-4888-8888-888888888888";
+  const projectKey = "C--Users-tester-Desktop-code_area-chatlog-viewer";
+  const projectDir = join(fixture.storagePath, projectKey);
+  const transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, "sessions-index.json"), JSON.stringify({
+      version: 1,
+      entries: [
+        {
+          sessionId,
+          fullPath: transcriptPath,
+          summary: "索引旧标题",
+          customTitle: "索引旧标题",
+          firstPrompt: "原始首条问题",
+          messageCount: 1,
+          created: "2026-03-01T00:00:00.000Z",
+          modified: "2026-03-02T00:00:00.000Z",
+          projectPath: "C:\\Users\\tester\\Desktop\\code_area\\chatlog-viewer",
+          isSidechain: false,
+        },
+      ],
+    }, null, 2), "utf-8");
+    await writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "custom-title",
+          sessionId,
+          customTitle: "transcript 旧标题",
+          summary: "transcript 旧标题",
+          timestamp: "2026-03-01T00:00:00.000Z",
+          isMeta: true,
+        }),
+        JSON.stringify({
+          type: "user",
+          uuid: "claude-title-1",
+          sessionId,
+          cwd: "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+          timestamp: "2026-03-01T00:00:01.000Z",
+          message: {
+            role: "user",
+            content: "原始首条问题",
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf-8"
+    );
+
+    await setNativeTitle(`claude-code:${sessionId}`, "UI 持久标题");
+    const listed = await fixture.provider.list();
+    assert.equal(listed[0]?.title, "UI 持久标题");
+
+    const detail = await fixture.provider.read(`claude-code:${sessionId}`);
+    assert.equal(detail.title, "UI 持久标题");
+
+    await fixture.provider.updateTitle(`claude-code:${sessionId}`, "二次修改标题");
+    await setNativeTitle(`claude-code:${sessionId}`, "二次修改标题");
+
+    const updatedIndex = JSON.parse(
+      await readFile(join(projectDir, "sessions-index.json"), "utf-8")
+    ) as {
+      entries: Array<{ sessionId: string; summary?: string; customTitle?: string }>;
+    };
+    const updatedEntry = updatedIndex.entries.find((entry) => entry.sessionId === sessionId);
+    assert.equal(updatedEntry?.summary, "二次修改标题");
+    assert.equal(updatedEntry?.customTitle, "二次修改标题");
+
+    const transcriptLines = (await readFile(transcriptPath, "utf-8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { type: string; customTitle?: string; summary?: string });
+    const customTitleEntries = transcriptLines.filter((entry) => entry.type === "custom-title");
+    assert.equal(customTitleEntries.length, 1);
+    assert.equal(customTitleEntries[0]?.customTitle, "二次修改标题");
+    assert.equal(customTitleEntries[0]?.summary, "二次修改标题");
+
+    const relisted = await fixture.provider.list();
+    assert.equal(relisted[0]?.title, "二次修改标题");
+    const reread = await fixture.provider.read(`claude-code:${sessionId}`);
+    assert.equal(reread.title, "二次修改标题");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("Claude Code 会标记 ChatLog Viewer 内部 AI 标题生成会话", async () => {
+  const fixture = await createProviderFixture();
+  const sessionId = "99999999-9999-4999-8999-999999999999";
+  const projectKey = "C--Users-tester-AppData-Roaming-chatlog-viewer-ai-title-sessions-claude";
+  const projectDir = join(fixture.storagePath, projectKey);
+  const transcriptPath = join(projectDir, `${sessionId}.jsonl`);
+  const titleSessionDir = join(fixture.storeDir, "ai-title-sessions", "claude");
+
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await mkdir(titleSessionDir, { recursive: true });
+    await writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: "user",
+          uuid: "claude-title-session-1",
+          sessionId,
+          cwd: titleSessionDir,
+          timestamp: "2026-03-01T00:00:00.000Z",
+          message: {
+            role: "user",
+            content: "请为目标对话生成标题",
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "claude-title-session-2",
+          sessionId,
+          timestamp: "2026-03-01T00:00:05.000Z",
+          message: {
+            role: "assistant",
+            content: "生成的标题",
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf-8"
+    );
+
+    const conversations = await fixture.provider.list();
+    assert.equal(conversations.length, 1);
+    assert.equal(conversations[0]?.id, `claude-code:${sessionId}`);
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "标题生成"), true);
+
+    const detail = await fixture.provider.read(`claude-code:${sessionId}`);
+    assert.equal(detail.badges?.some((badge) => badge.label === "标题生成"), true);
   } finally {
     await fixture.cleanup();
   }

@@ -794,6 +794,10 @@ test("OpenCode 支持写回标题并级联删除会话", async () => {
 
     provider = new OpenCodeProvider();
     await provider.updateTitle(`opencode:${sessionId}`, "新标题");
+    const updatedList = await provider.list();
+    assert.equal(updatedList[0]?.id, `opencode:${sessionId}`);
+    assert.equal(updatedList[0]?.title, "新标题");
+
     const updated = await provider.read(`opencode:${sessionId}`);
     assert.equal(updated.title, "新标题");
 

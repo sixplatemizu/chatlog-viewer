@@ -1,4 +1,4 @@
-import { join } from "path";
+import { dirname, join } from "path";
 import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from "fs/promises";
 import {
   parseJsonlWithMeta,
@@ -10,7 +10,8 @@ import {
 } from "../utils/jsonl.js";
 import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderConfigPath, getProviderPaths } from "../utils/provider-paths.js";
+import { getNativeTitle } from "../utils/title-store.js";
 import {
   collectIndexedCacheItemsInBatches,
   createIndexedListSourceSignature,
@@ -53,6 +54,7 @@ import {
 } from "./shared/provider-utils.js";
 
 const CLAUDE_CODE_LIST_SOURCE_VERSION = "claude-code-list-v2-recover-index-prefix";
+const CLAUDE_TITLE_GENERATION_BADGE_LABEL = "标题生成";
 
 interface ClaudeCodeEntry {
   type: string;
@@ -190,6 +192,32 @@ function buildConversationTitle(...candidates: Array<string | undefined>): strin
     }
   }
   return "未知对话";
+}
+
+function normalizeClaudePathForCompare(value?: string | null): string {
+  return normalizePath(value ?? "").replace(/^\/\/\?\//, "").toLowerCase();
+}
+
+function getClaudeTitleSessionProjectPath(): string {
+  return join(dirname(getProviderConfigPath()), "ai-title-sessions", "claude");
+}
+
+function isClaudeTitleGenerationProject(value?: string | null): boolean {
+  const normalized = normalizeClaudePathForCompare(value);
+  return !!normalized && normalized === normalizeClaudePathForCompare(getClaudeTitleSessionProjectPath());
+}
+
+function buildClaudeTitleGenerationBadges(): ConversationBadge[] {
+  return [{
+    label: CLAUDE_TITLE_GENERATION_BADGE_LABEL,
+    tone: "cyan",
+    title: "ChatLog Viewer AI 标题生成产生的 Claude Code session",
+  }];
+}
+
+function mergeClaudeBadges(...groups: Array<ConversationBadge[] | undefined>): ConversationBadge[] | undefined {
+  const badges = groups.flatMap((group) => group ?? []);
+  return badges.length > 0 ? badges : undefined;
 }
 
 function toTimestamp(value?: string | number): number | undefined {
@@ -536,14 +564,24 @@ export class ClaudeCodeProvider implements ConversationProvider {
     }
   }
 
+  private getBackgroundRefreshKey(): string {
+    return `${this.getStoragePath()}::${CLAUDE_CODE_LIST_SOURCE_VERSION}`;
+  }
+
   private scheduleBackgroundIndexRefresh(): void {
-    const cacheKey = getListCacheKey(this.name, this.getStoragePath());
-    if (this.backgroundRefreshes.has(cacheKey)) {
+    const refreshKey = this.getBackgroundRefreshKey();
+    if (this.backgroundRefreshes.has(refreshKey)) {
       return;
     }
 
     const task = new Promise<void>((resolve) => {
       setTimeout(() => {
+        if (this.getBackgroundRefreshKey() !== refreshKey) {
+          this.backgroundRefreshes.delete(refreshKey);
+          resolve();
+          return;
+        }
+
         this.listInternal({
           eagerSearchIndex: true,
           allowBackground: false,
@@ -553,13 +591,68 @@ export class ClaudeCodeProvider implements ConversationProvider {
             logProviderError("conversations.index.background", this.name, error);
           })
           .finally(() => {
-            this.backgroundRefreshes.delete(cacheKey);
+            this.backgroundRefreshes.delete(refreshKey);
             resolve();
           });
       }, 250);
     });
 
-    this.backgroundRefreshes.set(cacheKey, task);
+    this.backgroundRefreshes.set(refreshKey, task);
+  }
+
+  private async getManagedTitle(sessionId: string): Promise<string | null> {
+    return normalizeTitleCandidate(await getNativeTitle(`claude-code:${sessionId}`)) ?? null;
+  }
+
+  private async upsertTranscriptCustomTitle(
+    filePath: string,
+    sessionId: string,
+    title: string
+  ): Promise<boolean> {
+    const originalContent = await readFile(filePath, "utf-8");
+    let matched = false;
+    let changed = false;
+    const now = new Date().toISOString();
+
+    const rewrittenLines = originalContent
+      .split("\n")
+      .map((line) => {
+        if (!line.trim()) return line;
+        try {
+          const entry = JSON.parse(line) as ClaudeCodeEntry;
+          if (entry.type !== "custom-title") return line;
+
+          matched = true;
+          const nextEntry: ClaudeCodeEntry = {
+            ...entry,
+            sessionId: entry.sessionId || sessionId,
+            customTitle: title,
+            summary: title,
+            timestamp: entry.timestamp || now,
+          };
+          const nextLine = JSON.stringify(nextEntry);
+          if (nextLine !== line) changed = true;
+          return nextLine;
+        } catch {
+          return line;
+        }
+      });
+
+    if (!matched) {
+      rewrittenLines.push(JSON.stringify({
+        type: "custom-title",
+        sessionId,
+        customTitle: title,
+        summary: title,
+        timestamp: now,
+        isMeta: true,
+      } satisfies ClaudeCodeEntry));
+      changed = true;
+    }
+
+    if (!changed) return false;
+    await writeFile(filePath, rewrittenLines.join("\n"), "utf-8");
+    return true;
   }
 
   private async listInternal(options: {
@@ -771,10 +864,18 @@ export class ClaudeCodeProvider implements ConversationProvider {
       };
     }
 
+    const managedTitle = await this.getManagedTitle(source.sessionId);
+    const isTitleGenerationSession = isClaudeTitleGenerationProject(project);
     const meta: ConversationMeta = {
       id: `claude-code:${source.sessionId}`,
       provider: this.name,
-      title: buildConversationTitle(inlineTitleHint, source.displayTitleHint, transcriptTitle, source.firstPromptHint),
+      title: buildConversationTitle(
+        managedTitle ?? undefined,
+        inlineTitleHint,
+        source.displayTitleHint,
+        transcriptTitle,
+        source.firstPromptHint
+      ),
       project,
       projectKey: source.projectKey,
       projectId: canonicalizeProjectPath(project) || source.projectKey,
@@ -783,6 +884,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
       messageCount,
       fileSize: fileStat.size,
       filePath: source.key,
+      badges: mergeClaudeBadges(
+        isTitleGenerationSession ? buildClaudeTitleGenerationBadges() : undefined
+      ),
     };
 
     setCache(source.key, source.updatedAtHint, meta);
@@ -1068,10 +1172,12 @@ export class ClaudeCodeProvider implements ConversationProvider {
 
     const project = normalizePath(source.projectPathHint || source.projectKey) || source.projectKey;
     const historyMessageCount = source.historySession?.messages.length ?? 0;
+    const managedTitle = await this.getManagedTitle(source.sessionId);
+    const isTitleGenerationSession = isClaudeTitleGenerationProject(project);
     const meta: ConversationMeta = {
       id: `claude-code:${source.sessionId}`,
       provider: this.name,
-      title: buildConversationTitle(source.displayTitleHint, source.firstPromptHint),
+      title: buildConversationTitle(managedTitle ?? undefined, source.displayTitleHint, source.firstPromptHint),
       project,
       projectKey: source.projectKey,
       projectId: canonicalizeProjectPath(project) || source.projectKey,
@@ -1082,7 +1188,10 @@ export class ClaudeCodeProvider implements ConversationProvider {
       filePath: source.key,
       contentStatus: historyMessageCount > 0 ? "history-only" : "metadata-only",
       cleanupCandidate: isClaudeCleanupCandidate(source),
-      badges: buildClaudeHintBadges(source, historyMessageCount),
+      badges: mergeClaudeBadges(
+        buildClaudeHintBadges(source, historyMessageCount),
+        isTitleGenerationSession ? buildClaudeTitleGenerationBadges() : undefined
+      ),
     };
 
     setCache(source.key, source.updatedAtHint, meta);
@@ -1180,10 +1289,18 @@ export class ClaudeCodeProvider implements ConversationProvider {
       }
     );
 
+    const managedTitle = await this.getManagedTitle(source.sessionId);
+    const isTitleGenerationSession = isClaudeTitleGenerationProject(project);
     const meta: ConversationMeta = {
       id: `claude-code:${source.sessionId}`,
       provider: this.name,
-      title: buildConversationTitle(inlineTitleHint, source.displayTitleHint, transcriptTitle, source.firstPromptHint),
+      title: buildConversationTitle(
+        managedTitle ?? undefined,
+        inlineTitleHint,
+        source.displayTitleHint,
+        transcriptTitle,
+        source.firstPromptHint
+      ),
       project,
       projectKey: source.projectKey,
       projectId: canonicalizeProjectPath(project) || source.projectKey,
@@ -1193,6 +1310,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
       fileSize: fileStat.size,
       filePath: source.key,
       contentStatus: "full",
+      badges: mergeClaudeBadges(
+        isTitleGenerationSession ? buildClaudeTitleGenerationBadges() : undefined
+      ),
     };
 
     setCache(source.key, source.updatedAtHint, meta);
@@ -1451,6 +1571,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
       customTitle: normalizedTitle,
       summary: normalizedTitle,
     });
+    if (source.transcriptPath) {
+      await this.upsertTranscriptCustomTitle(source.transcriptPath, sessionId, normalizedTitle);
+    }
     this.invalidateConversationCaches(source.key);
   }
 
