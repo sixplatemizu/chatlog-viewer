@@ -42,6 +42,9 @@ export default function App() {
     total,
     providerCounts,
     loading,
+    loadingMore,
+    listTruncated,
+    loadMoreConversations,
     activeProviders,
     toggleProvider,
     search,
@@ -378,6 +381,9 @@ export default function App() {
           sort={sort}
           onSortChange={setSort}
           loading={loading}
+          loadingMore={loadingMore}
+          listTruncated={listTruncated}
+          onLoadMore={loadMoreConversations}
           total={total}
           providerCounts={providerCounts}
           selectedIds={selectedIds}

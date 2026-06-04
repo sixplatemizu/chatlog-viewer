@@ -15,6 +15,7 @@ import type { ToastPayload } from "../components/ToastViewport";
 
 const SEARCH_DEBOUNCE_MS = 350;
 const DETAIL_PAGE_SIZE = 200;
+const CONVERSATION_LIST_PAGE_SIZE = 5_000;
 
 interface UseConversationsOptions {
   onNotify?: (toast: ToastPayload) => void;
@@ -93,6 +94,22 @@ function removeConversationItem(items: ConversationMeta[], id: string): Conversa
   return items.filter((item) => item.id !== id);
 }
 
+function appendUniqueConversations(
+  current: ConversationMeta[],
+  nextPage: ConversationMeta[]
+): ConversationMeta[] {
+  const seen = new Set(current.map((item) => item.id));
+  const merged = [...current];
+
+  for (const item of nextPage) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    merged.push(item);
+  }
+
+  return merged.length > current.length ? merged : current;
+}
+
 export function useConversations(options: UseConversationsOptions = {}) {
   const { onNotify } = options;
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -100,6 +117,9 @@ export function useConversations(options: UseConversationsOptions = {}) {
   const [total, setTotal] = useState(0);
   const [providerCounts, setProviderCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [listTruncated, setListTruncated] = useState(false);
+  const [nextOffset, setNextOffset] = useState<number | undefined>();
   const [activeProviders, setActiveProviders] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState("updatedAt");
@@ -113,6 +133,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
   const [partialSearch, setPartialSearch] = useState(false);
   const [searchWarnings, setSearchWarnings] = useState<string[]>([]);
   const [codexModelProviderCounts, setCodexModelProviderCounts] = useState<Record<string, number>>({});
+  const [providerDataReady, setProviderDataReady] = useState(false);
   const detailAbortRef = useRef<AbortController | null>(null);
   const activeProvidersRef = useRef(activeProviders);
   const activeModelProvidersRef = useRef(activeModelProviders);
@@ -182,10 +203,16 @@ export function useConversations(options: UseConversationsOptions = {}) {
   useEffect(() => {
     const abortController = new AbortController();
 
+    setProviderDataReady(false);
     loadProviderData(abortController.signal)
       .catch((error) => {
         if (!isAbortError(error)) {
           notifyError("初始化数据加载失败", error, "初始化数据加载失败");
+        }
+      })
+      .finally(() => {
+        if (!abortController.signal.aborted) {
+          setProviderDataReady(true);
         }
       });
 
@@ -224,6 +251,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
         search: debouncedSearch || undefined,
         sort,
         modelProvider: modelProviderParam,
+        limit: CONVERSATION_LIST_PAGE_SIZE,
+        offset: 0,
         signal,
       });
       setConversations(data.conversations);
@@ -234,6 +263,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
       setPartialSearch(!!data.partialSearch);
       setSearchWarnings(data.warnings ?? []);
       setCodexModelProviderCounts(data.codexModelProviderCounts ?? {});
+      setListTruncated(!!data.listTruncated && typeof data.nextOffset === "number");
+      setNextOffset(typeof data.nextOffset === "number" ? data.nextOffset : undefined);
       return data;
     } catch (error) {
       if (!isAbortError(error)) {
@@ -241,6 +272,8 @@ export function useConversations(options: UseConversationsOptions = {}) {
       }
       setPartialSearch(false);
       setSearchWarnings([]);
+      setListTruncated(false);
+      setNextOffset(undefined);
       return null;
     } finally {
       if (!signal?.aborted) {
@@ -249,11 +282,69 @@ export function useConversations(options: UseConversationsOptions = {}) {
     }
   }, [activeModelProviders, activeProviders, codexModelProviders, debouncedSearch, notifyError, providers, sort]);
 
+  const loadMoreConversations = useCallback(async () => {
+    if (loadingMore || !listTruncated || nextOffset === undefined) return null;
+
+    const providerParam = providers.length > 0
+      ? Array.from(activeProviders).join(",")
+      : undefined;
+    const modelProviderParam = getModelProviderParam(
+      activeProviders,
+      activeModelProviders,
+      codexModelProviders
+    );
+
+    setLoadingMore(true);
+
+    try {
+      const data = await fetchConversations({
+        provider: providerParam,
+        search: debouncedSearch || undefined,
+        sort,
+        modelProvider: modelProviderParam,
+        limit: CONVERSATION_LIST_PAGE_SIZE,
+        offset: nextOffset,
+      });
+
+      const mergedConversations = appendUniqueConversations(conversations, data.conversations);
+      setConversations(mergedConversations);
+      setTotal(data.total);
+      setProviderCounts(
+        data.providerCounts ?? buildConversationProviderCountMap(providers, mergedConversations)
+      );
+      setPartialSearch(!!data.partialSearch);
+      setSearchWarnings(data.warnings ?? []);
+      setCodexModelProviderCounts(data.codexModelProviderCounts ?? {});
+      setListTruncated(!!data.listTruncated && typeof data.nextOffset === "number");
+      setNextOffset(typeof data.nextOffset === "number" ? data.nextOffset : undefined);
+      return data;
+    } catch (error) {
+      notifyError("加载更多对话失败", error, "加载更多对话失败");
+      return null;
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [
+    activeModelProviders,
+    activeProviders,
+    codexModelProviders,
+    conversations,
+    debouncedSearch,
+    listTruncated,
+    loadingMore,
+    nextOffset,
+    notifyError,
+    providers,
+    sort,
+  ]);
+
   useEffect(() => {
+    if (!providerDataReady) return;
+
     const abortController = new AbortController();
     void loadConversations(abortController.signal);
     return () => abortController.abort();
-  }, [loadConversations]);
+  }, [loadConversations, providerDataReady]);
 
   // 当前选中项如果不在过滤后的列表中，则清空详情
   useEffect(() => {
@@ -602,6 +693,9 @@ export function useConversations(options: UseConversationsOptions = {}) {
     total,
     providerCounts,
     loading,
+    loadingMore,
+    listTruncated,
+    loadMoreConversations,
     activeProviders,
     toggleProvider,
     search,

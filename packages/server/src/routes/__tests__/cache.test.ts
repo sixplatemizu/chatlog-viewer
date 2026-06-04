@@ -68,6 +68,20 @@ test("indexed list cache 过期后返回 null", () => {
   invalidateListCache(cacheKey);
 });
 
+test("indexed list cache 有 source signature 时可跳过 TTL", () => {
+  const cacheKey = `test-indexed-source-signature-${Date.now()}`;
+  const items = [createConversationMeta("codex:source-signature")];
+  const sourceSignature = `sig-${Date.now()}`;
+
+  setIndexedListCache(cacheKey, items, { sourceSignature });
+  const cached = getIndexedListCache(cacheKey, -1, { sourceSignature });
+
+  assert.deepEqual(cached, items);
+  assert.equal(getIndexedListCache(cacheKey, -1, { sourceSignature: `${sourceSignature}-changed` }), null);
+
+  invalidateListCache(cacheKey);
+});
+
 test("conversation index 支持按消息内容搜索", () => {
   const cacheKey = `test-index-search-${Date.now()}`;
   const needle = `needle-${Date.now()}`;

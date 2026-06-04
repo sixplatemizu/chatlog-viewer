@@ -137,6 +137,55 @@ describe("Sidebar", () => {
     expect(screen.getByRole("button", { name: /iFlow\s*1/ })).toBeInTheDocument();
   });
 
+  it("列表截断时显示加载更多入口", () => {
+    const onLoadMore = vi.fn();
+
+    render(
+      <Sidebar
+        providers={providers}
+        activeProviders={new Set(["codex"])}
+        toggleProvider={() => {}}
+        conversations={[createConversation({ id: "codex:1", provider: "codex" })]}
+        selectedId={null}
+        onSelect={() => {}}
+        search=""
+        onSearchChange={() => {}}
+        sort="updatedAt"
+        onSortChange={() => {}}
+        loading={false}
+        loadingMore={false}
+        listTruncated
+        onLoadMore={onLoadMore}
+        total={2}
+        providerCounts={{ codex: 2, "claude-code": 0, iflow: 0 }}
+        selectedIds={new Set()}
+        onToggleSelect={() => {}}
+        onSelectAll={() => {}}
+        onDeselectAll={() => {}}
+        onToggleSelectGroup={() => {}}
+        onBatchExport={() => {}}
+        onBatchDelete={() => {}}
+        onBatchDeleteEmpty={() => {}}
+        onBatchGenerate={() => {}}
+        onBatchChangeModelProvider={() => {}}
+        onBatchMove={() => {}}
+        width={320}
+        onWidthChange={() => {}}
+        batchGenerating={false}
+        onMoveConversation={() => {}}
+        codexModelProviderCounts={{}}
+        codexModelProviders={[]}
+        activeModelProviders={new Set()}
+        onToggleModelProvider={() => {}}
+        partialSearch={false}
+        searchWarnings={[]}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+  });
+
   it("全部选中 Codex 对话时显示批量 provider 切换控件", () => {
     const onBatchChangeModelProvider = vi.fn();
 

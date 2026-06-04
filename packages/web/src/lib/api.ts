@@ -169,6 +169,8 @@ export interface ConversationListResponse {
   conversations: ConversationMeta[];
   providerCounts?: Record<string, number>;
   codexModelProviderCounts?: Record<string, number>;
+  listTruncated?: boolean;
+  nextOffset?: number;
   partialSearch?: boolean;
   warnings?: string[];
 }
@@ -202,6 +204,8 @@ export async function fetchConversations(params: {
   search?: string;
   sort?: string;
   modelProvider?: string;
+  limit?: number;
+  offset?: number;
   signal?: AbortSignal;
 }): Promise<ConversationListResponse> {
   const qs = new URLSearchParams();
@@ -209,6 +213,8 @@ export async function fetchConversations(params: {
   if (params.search) qs.set("search", params.search);
   if (params.sort) qs.set("sort", params.sort);
   if (params.modelProvider !== undefined) qs.set("modelProvider", params.modelProvider);
+  if (params.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params.offset !== undefined) qs.set("offset", String(params.offset));
   return requestJson<ConversationListResponse>(
     `${BASE}/conversations?${qs}`,
     { signal: params.signal }
@@ -363,8 +369,20 @@ export async function updateTitle(
 
 export async function generateAiTitle(
   id: string
-): Promise<{ success: boolean; title: string; usedCli: string; error?: string }> {
-  return requestJson<{ success: boolean; title: string; usedCli: string; error?: string }>(
+): Promise<{
+  success: boolean;
+  title: string;
+  usedCli: string;
+  cleanedTitleSessions?: number;
+  error?: string;
+}> {
+  return requestJson<{
+    success: boolean;
+    title: string;
+    usedCli: string;
+    cleanedTitleSessions?: number;
+    error?: string;
+  }>(
     `${BASE}/conversations/${encodeURIComponent(id)}/generate-title`,
     { method: "POST" }
   );
@@ -374,6 +392,7 @@ export interface BatchTitleGenerationResult {
   id: string;
   title?: string;
   usedCli?: string;
+  cleanedTitleSessions?: number;
   error?: string;
 }
 

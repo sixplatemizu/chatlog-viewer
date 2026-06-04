@@ -9,6 +9,7 @@ import { getErrorMessage } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 
 const PARTIAL_EXPORT_MESSAGE_LIMIT = 500;
+const MAX_EXPORT_IDS = 500;
 
 interface ExportFailure {
   id: string;
@@ -40,14 +41,32 @@ export function createExportRoutes(providers: ConversationProvider[]) {
 
   app.post("/export", async (c) => {
     const body = await c.req.json<{
-      ids: string[];
-      format: "json" | "markdown";
+      ids?: unknown;
+      format?: unknown;
       mode?: "full" | "partial";
     }>();
-    const { ids, format } = body;
-    const mode = body.mode === "partial" ? "partial" : "full";
 
-    if (!ids?.length) return c.json({ error: "请提供要导出的对话 ID" }, 400);
+    if (!Array.isArray(body?.ids)) {
+      return c.json({ error: "ids 必须是数组" }, 400);
+    }
+
+    const ids = [...new Set(
+      body.ids
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )];
+    if (ids.length === 0) return c.json({ error: "请提供要导出的对话 ID" }, 400);
+    if (ids.length > MAX_EXPORT_IDS) {
+      return c.json({ error: `单次最多导出 ${MAX_EXPORT_IDS} 条对话` }, 400);
+    }
+
+    if (body.format !== "json" && body.format !== "markdown") {
+      return c.json({ error: "format 必须是 json 或 markdown" }, 400);
+    }
+
+    const format = body.format;
+    const mode = body.mode === "partial" ? "partial" : "full";
 
     const prepared = await prepareExportFile({
       providers,

@@ -24,7 +24,7 @@ import {
   type IndexedCacheItem,
 } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderConfigPath, getProviderPaths } from "../utils/provider-paths.js";
 import { isNotFoundError } from "../utils/errors.js";
 import {
   collectGlobFileStates,
@@ -36,6 +36,7 @@ import {
   type ConversationSearchIndex,
   type ConversationSearchIndexBuilder,
 } from "../utils/search-index.js";
+import { getNativeTitle } from "../utils/title-store.js";
 import {
   assignStableMessageIds,
   createMessageSourceKey,
@@ -87,8 +88,9 @@ interface CodexMessageIdentityCacheEntry {
 }
 
 const CODEX_STATE_ONLY_PREFIX = "codex-state://";
-const CODEX_LIST_SOURCE_VERSION = "codex-list-v3-native-title-cache";
+const CODEX_LIST_SOURCE_VERSION = "codex-list-v12-fork-explicit-title";
 const CODEX_TITLE_FALLBACK_BADGE_LABEL = "标题回退";
+const CODEX_TITLE_GENERATION_BADGE_LABEL = "标题生成";
 const CODEX_WEAK_TITLE_SET = new Set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽"]);
 const codexMessageIdentityCache = new Map<string, CodexMessageIdentityCacheEntry>();
 
@@ -103,9 +105,36 @@ function extractContent(content: Array<{ type: string; text?: string }>): string
     .join("\n");
 }
 
+function getDisplayableCodexResponseContent(entry: CodexEntry): string | null {
+  if (entry.type !== "response_item" || !entry.payload?.role) return null;
+
+  const role = entry.payload.role as "user" | "assistant";
+  if (role !== "user" && role !== "assistant") return null;
+
+  const content = entry.payload.content
+    ? extractContent(entry.payload.content)
+    : "";
+  if (content.includes("<environment_context>")) return null;
+  if (!content.trim()) return null;
+  return content;
+}
+
 function normalizeCodexDisplayText(value?: string | null): string | undefined {
   const normalized = value?.replace(/<[^>]+>/g, "").trim();
   return normalized ? normalized : undefined;
+}
+
+function normalizeCodexPathForCompare(value?: string | null): string {
+  return normalizePath(value ?? "").replace(/^\/\/\?\//, "").toLowerCase();
+}
+
+function getCodexTitleSessionProjectPath(): string {
+  return join(dirname(getProviderConfigPath()), "ai-title-sessions", "codex");
+}
+
+function isCodexTitleGenerationProject(value?: string | null): boolean {
+  const normalized = normalizeCodexPathForCompare(value);
+  return !!normalized && normalized === normalizeCodexPathForCompare(getCodexTitleSessionProjectPath());
 }
 
 function isWeakCodexTitle(value?: string | null): boolean {
@@ -115,14 +144,51 @@ function isWeakCodexTitle(value?: string | null): boolean {
   return !!normalized && CODEX_WEAK_TITLE_SET.has(normalized);
 }
 
+function isUsableCodexTitle(value?: string | null): value is string {
+  const normalized = normalizeCodexDisplayText(value);
+  return !!normalized && normalized !== "未知对话" && !isWeakCodexTitle(normalized);
+}
+
+function pickUsableCodexTitle(values: Array<string | null | undefined>): string | null {
+  return values.map((value) => normalizeCodexDisplayText(value)).find(isUsableCodexTitle) ?? null;
+}
+
+function hasUsableCodexTitle(values: Array<string | null | undefined>): boolean {
+  return pickUsableCodexTitle(values) !== null;
+}
+
+function getCodexForkedFromId(entry?: CodexEntry): string {
+  const value = entry?.payload?.forked_from_id ?? entry?.payload?.forkedFromId;
+  return typeof value === "string" ? value.trim() : "";
+}
+
 function pickCodexConversationTitle(options: {
+  managedTitle?: string;
+  transcriptTitle?: string;
   nativeTitle?: string;
   firstUserMessage?: string;
+  preview?: string;
   fallbackTitle?: string;
 }): { title: string; usedFallback: boolean } {
+  const managedTitle = normalizeCodexDisplayText(options.managedTitle);
+  if (managedTitle) {
+    return { title: managedTitle, usedFallback: false };
+  }
+
+  const transcriptTitle = normalizeCodexDisplayText(options.transcriptTitle);
   const nativeTitle = normalizeCodexDisplayText(options.nativeTitle);
   const firstUserMessage = normalizeCodexDisplayText(options.firstUserMessage);
+  const preview = normalizeCodexDisplayText(options.preview);
   const fallbackTitle = normalizeCodexDisplayText(options.fallbackTitle);
+  const nativeDisplayTitle = pickUsableCodexTitle([nativeTitle, firstUserMessage, preview]);
+  if (nativeDisplayTitle) {
+    return { title: nativeDisplayTitle, usedFallback: false };
+  }
+
+  if (transcriptTitle && !isWeakCodexTitle(transcriptTitle)) {
+    return { title: transcriptTitle, usedFallback: false };
+  }
+
   const canUseFallback = !!fallbackTitle && !isWeakCodexTitle(fallbackTitle);
   const nativeTitleIsWeak = !!nativeTitle && isWeakCodexTitle(nativeTitle);
   const nativeLooksOriginal = !firstUserMessage || firstUserMessage === nativeTitle || isWeakCodexTitle(firstUserMessage);
@@ -146,8 +212,25 @@ function buildCodexTitleFallbackBadges(): ConversationBadge[] {
   }];
 }
 
+function buildCodexTitleGenerationBadges(): ConversationBadge[] {
+  return [{
+    label: CODEX_TITLE_GENERATION_BADGE_LABEL,
+    tone: "cyan",
+    title: "ChatLog Viewer AI 标题生成产生的 Codex session",
+  }];
+}
+
+function mergeCodexBadges(...groups: Array<ConversationBadge[] | undefined>): ConversationBadge[] | undefined {
+  const badges = groups.flatMap((group) => group ?? []);
+  return badges.length > 0 ? badges : undefined;
+}
+
 function hasCodexTitleFallbackBadge(meta?: ConversationMeta): boolean {
   return meta?.badges?.some((badge) => badge.label === CODEX_TITLE_FALLBACK_BADGE_LABEL) ?? false;
+}
+
+function hasCodexTitleGenerationBadge(meta?: ConversationMeta): boolean {
+  return meta?.badges?.some((badge) => badge.label === CODEX_TITLE_GENERATION_BADGE_LABEL) ?? false;
 }
 
 function isCodexNativeOriginalWeakTitle(metadata: CodexThreadMetadata): boolean {
@@ -164,6 +247,7 @@ function isReusableCodexMetaHint(
   threadMetadata: CodexThreadMetadata
 ): metaHint is ConversationMeta {
   if (!metaHint) return false;
+  if (isCodexTitleGenerationProject(metaHint.project) && !hasCodexTitleGenerationBadge(metaHint)) return false;
   if (metaHint.updatedAt !== fileStat.mtimeMs || metaHint.fileSize !== fileStat.size) return false;
   if (metaHint.modelProvider !== threadMetadata.modelProvider) return false;
 
@@ -244,15 +328,36 @@ function buildCodexTitleGenerationHint(thread: CodexThreadRow): string | undefin
   return `当前对话缺少 transcript，请仅根据以下 metadata 生成标题：\n${parts.join("\n")}`;
 }
 
-function buildCodexProjectStorageKey(projectPath: string): string {
-  const normalized = normalizePath(projectPath);
-  if (!normalized) return "unknown-project";
-  const key = normalized.replace(/[:/\\]/g, "-").replace(/^-+/, "");
-  return key || "unknown-project";
+function formatCodexTimestampPathParts(timestampMs: number): {
+  year: string;
+  month: string;
+  day: string;
+  fileTimestamp: string;
+} {
+  const date = new Date(Number.isFinite(timestampMs) ? timestampMs : Date.now());
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hour = String(date.getHours()).padStart(2, "0");
+  const minute = String(date.getMinutes()).padStart(2, "0");
+  const second = String(date.getSeconds()).padStart(2, "0");
+  return {
+    year,
+    month,
+    day,
+    fileTimestamp: `${year}-${month}-${day}T${hour}-${minute}-${second}`,
+  };
 }
 
-function buildCodexTranscriptPath(storagePath: string, projectPath: string, sessionId: string): string {
-  return normalizePath(join(storagePath, buildCodexProjectStorageKey(projectPath), `${sessionId}.jsonl`));
+function buildCodexTranscriptPath(storagePath: string, sessionId: string, createdAtMs: number): string {
+  const timestamp = formatCodexTimestampPathParts(createdAtMs);
+  return normalizePath(join(
+    storagePath,
+    timestamp.year,
+    timestamp.month,
+    timestamp.day,
+    `rollout-${timestamp.fileTimestamp}-${sessionId}.jsonl`
+  ));
 }
 
 function applyMessageActionFlags(records: MessageRecord<CodexEntry>[]): MessageRecord<CodexEntry>[] {
@@ -433,16 +538,9 @@ function buildMessageRecords(
   const records: MessageRecord<CodexEntry>[] = [];
   for (const entry of entries) {
     const value = entry.value;
-    if (value.type !== "response_item" || !value.payload?.role) continue;
-
+    const content = getDisplayableCodexResponseContent(value);
+    if (content === null) continue;
     const role = value.payload.role as "user" | "assistant";
-    if (role !== "user" && role !== "assistant") continue;
-
-    const content = value.payload.content
-      ? extractContent(value.payload.content)
-      : "";
-    if (content.includes("<environment_context>")) continue;
-    if (!content.trim()) continue;
 
     records.push({
       entry: value,
@@ -488,16 +586,9 @@ function appendSearchIndexEntry(
   builder: ConversationSearchIndexBuilder,
   entry: CodexEntry
 ): void {
-  if (entry.type !== "response_item" || !entry.payload?.role) return;
-
+  const content = getDisplayableCodexResponseContent(entry);
+  if (content === null) return;
   const role = entry.payload.role as "user" | "assistant";
-  if (role !== "user" && role !== "assistant") return;
-
-  const content = entry.payload.content
-    ? extractContent(entry.payload.content)
-    : "";
-  if (content.includes("<environment_context>")) return;
-  if (!content.trim()) return;
 
   builder.addMessage({
     role,
@@ -542,6 +633,16 @@ export class CodexProvider implements ConversationProvider {
     const pattern = join(this.getStoragePath(), "**", "*.jsonl").replace(/\\/g, "/");
     const fileStates = await collectGlobFileStates(pattern);
 
+    const threadsSignature = this.sqliteClient.getThreadsSignature();
+    if (threadsSignature) {
+      fileStates.push({
+        path: this.getNormalizedStateDbPath(),
+        mtimeMs: Number.parseInt(threadsSignature.slice(0, 12), 16),
+        size: Number.parseInt(threadsSignature.slice(12, 24), 16),
+      });
+      return fileStates;
+    }
+
     try {
       const fileStat = await stat(this.getStateDbPath());
       fileStates.push({
@@ -557,6 +658,7 @@ export class CodexProvider implements ConversationProvider {
   }
 
   private buildStateOnlyMeta(thread: CodexThreadRow): ConversationMeta | null {
+    const isTitleGenerationSession = isCodexTitleGenerationProject(thread.cwd);
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(thread.cwd);
     const normalizedTitle = normalizeCodexDisplayText(thread.title);
     const normalizedFirstUserMessage = normalizeCodexDisplayText(thread.firstUserMessage);
@@ -583,7 +685,10 @@ export class CodexProvider implements ConversationProvider {
       transcriptMissing: true,
       contentStatus: "metadata-only",
       titleGenerationHint: buildCodexTitleGenerationHint(thread),
-      badges: buildCodexStateOnlyBadges(),
+      badges: mergeCodexBadges(
+        buildCodexStateOnlyBadges(),
+        isTitleGenerationSession ? buildCodexTitleGenerationBadges() : undefined
+      ),
     };
   }
 
@@ -599,14 +704,266 @@ export class CodexProvider implements ConversationProvider {
     this.sqliteClient.writeDisplayTitle(sessionId, normalizedTitle, options);
   }
 
+  private async getManagedTitle(sessionId: string): Promise<string | null> {
+    return normalizeCodexDisplayText(await getNativeTitle(`codex:${sessionId}`)) ?? null;
+  }
+
+  private async syncThreadDisplayTitleFromManagedTitle(
+    sessionId: string,
+    managedTitle: string,
+    transcriptTitle: string | undefined,
+    threadMetadata: CodexThreadMetadata,
+    filePath: string
+  ): Promise<boolean> {
+    const normalizedTitle = managedTitle.trim();
+    if (!normalizedTitle) return false;
+
+    if (
+      normalizeCodexDisplayText(threadMetadata.title) !== normalizedTitle
+      || normalizeCodexDisplayText(threadMetadata.firstUserMessage) !== normalizedTitle
+      || normalizeCodexDisplayText(threadMetadata.preview) !== normalizedTitle
+    ) {
+      try {
+        this.writeThreadDisplayTitle(sessionId, normalizedTitle);
+      } catch {
+        // Codex TUI 可能短暂占用 state db；下一次扫描会继续按 UI 来源修复。
+      }
+    }
+
+    await this.upsertSessionIndexThreadName(sessionId, normalizedTitle);
+
+    if (normalizeCodexDisplayText(transcriptTitle) === normalizedTitle) {
+      return false;
+    }
+
+    return await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
+      return {
+        ...payload,
+        id: payload.id || sessionId,
+        title: normalizedTitle,
+      };
+    });
+  }
+
+  private async syncThreadDisplayTitleFromTranscript(
+    sessionId: string,
+    transcriptTitle: string | undefined,
+    threadMetadata: CodexThreadMetadata,
+    filePath: string
+  ): Promise<boolean> {
+    const normalizedTitle = normalizeCodexDisplayText(transcriptTitle);
+    const currentDisplayTitle = pickUsableCodexTitle([
+      threadMetadata.title,
+      threadMetadata.firstUserMessage,
+      threadMetadata.preview,
+    ]);
+
+    if (currentDisplayTitle) {
+      if (!normalizedTitle) return false;
+
+      await this.upsertSessionIndexThreadName(sessionId, currentDisplayTitle);
+      if (normalizedTitle === currentDisplayTitle) return false;
+
+      return await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
+        return {
+          ...payload,
+          id: payload.id || sessionId,
+          title: currentDisplayTitle,
+        };
+      });
+    }
+
+    if (!normalizedTitle || isWeakCodexTitle(normalizedTitle)) return false;
+
+    const currentTitle = normalizeCodexDisplayText(threadMetadata.title);
+    const currentFirstUserMessage = normalizeCodexDisplayText(threadMetadata.firstUserMessage);
+    if (currentTitle !== normalizedTitle || currentFirstUserMessage !== normalizedTitle) {
+      try {
+        this.writeThreadDisplayTitle(sessionId, normalizedTitle);
+      } catch {
+        // Codex TUI 可能短暂占用 state db；ChatLog Viewer 仍以 transcript 标题为准。
+      }
+    }
+
+    await this.upsertSessionIndexThreadName(sessionId, normalizedTitle);
+    return false;
+  }
+
+  private async resolveForkParentTitle(parentSessionId: string): Promise<string | null> {
+    const threadMetadata = this.sqliteClient.getThreadMetadata(parentSessionId);
+    const metadataTitle = pickUsableCodexTitle([
+      threadMetadata.title,
+      threadMetadata.firstUserMessage,
+      threadMetadata.preview,
+    ]);
+    if (metadataTitle) return metadataTitle;
+
+    try {
+      const filePath = await this.findConversationFilePath(parentSessionId);
+      const headEntries = await parseJsonlHead<CodexEntry>(filePath, 20);
+      const sessionMeta = headEntries.find((entry) => entry.type === "session_meta");
+      return pickUsableCodexTitle([
+        typeof sessionMeta?.payload?.title === "string" ? sessionMeta.payload.title : undefined,
+        ...headEntries.map((entry) => getCodexUserTitleCandidate(entry)),
+      ]);
+    } catch {
+      return null;
+    }
+  }
+
+  private async maybeInheritForkTitle(options: {
+    sessionId: string;
+    filePath: string;
+    forkedFromId: string;
+    threadMetadata: CodexThreadMetadata;
+    transcriptTitle?: string;
+    defaultTitle?: string;
+    fallbackTitle?: string;
+  }): Promise<string | null> {
+    const forkedFromId = options.forkedFromId.trim();
+    if (!forkedFromId || forkedFromId === options.sessionId) return null;
+
+    const explicitChildTitles = [
+      options.transcriptTitle,
+      options.threadMetadata.title,
+      options.threadMetadata.firstUserMessage,
+      options.threadMetadata.preview,
+    ];
+    if (hasUsableCodexTitle(explicitChildTitles)) return null;
+
+    const parentTitle = await this.resolveForkParentTitle(forkedFromId);
+    if (!parentTitle) return null;
+
+    try {
+      this.writeThreadDisplayTitle(options.sessionId, parentTitle);
+    } catch {
+      // Codex TUI 可能短暂占用 state db；仍继续同步 transcript 与 session_index。
+    }
+
+    await this.upsertSessionIndexThreadName(options.sessionId, parentTitle);
+    await this.rewriteTranscriptSessionMeta(options.filePath, options.sessionId, (payload) => {
+      return {
+        ...payload,
+        id: payload.id || options.sessionId,
+        forked_from_id: typeof payload.forked_from_id === "string" ? payload.forked_from_id : forkedFromId,
+        title: parentTitle,
+      };
+    });
+
+    return parentTitle;
+  }
+
   private getSessionIdFromMetaOrPath(meta: ConversationMeta | undefined, filePath: string): string {
     return meta?.id.startsWith("codex:")
       ? meta.id.replace("codex:", "")
       : filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
   }
 
+  private getSessionIndexPath(): string {
+    return join(dirname(this.getStoragePath()), "session_index.jsonl");
+  }
+
+  private async upsertSessionIndexThreadName(sessionId: string, title: string): Promise<boolean> {
+    const indexPath = this.getSessionIndexPath();
+    let originalContent: string;
+    try {
+      originalContent = await readFile(indexPath, "utf-8");
+    } catch {
+      originalContent = "";
+    }
+
+    let matched = false;
+    let changed = false;
+    const now = new Date().toISOString();
+    const rewrittenLines = originalContent
+      .split(/\r?\n/)
+      .filter((line, index, lines) => line.trim() || index < lines.length - 1)
+      .map((line) => {
+        if (!line.trim()) return line;
+        try {
+          const entry = JSON.parse(line) as { id?: string; thread_name?: string; updated_at?: string; [key: string]: unknown };
+          if (entry.id !== sessionId) return line;
+
+          matched = true;
+          const nextEntry = {
+            ...entry,
+            thread_name: title,
+            updated_at: now,
+          };
+          const nextLine = JSON.stringify(nextEntry);
+          if (nextLine !== line) changed = true;
+          return nextLine;
+        } catch {
+          return line;
+        }
+      });
+
+    if (!matched) {
+      rewrittenLines.push(JSON.stringify({
+        id: sessionId,
+        thread_name: title,
+        updated_at: now,
+      }));
+      changed = true;
+    }
+
+    if (!changed) return false;
+    const rewrittenContent = rewrittenLines.join("\n") + "\n";
+    await mkdir(dirname(indexPath), { recursive: true });
+    await writeFile(indexPath, rewrittenContent, "utf-8");
+    return true;
+  }
+
+  private async rewriteTranscriptSessionMeta(
+    filePath: string,
+    sessionId: string,
+    updatePayload: (payload: CodexEntry["payload"]) => CodexEntry["payload"]
+  ): Promise<boolean> {
+    const fileStat = await stat(filePath);
+    const originalContent = await readFile(filePath, "utf-8");
+    let matched = false;
+    let changed = false;
+
+    const rewrittenContent = originalContent
+      .split("\n")
+      .map((line) => {
+        if (!line.trim()) return line;
+        try {
+          const entry = JSON.parse(line) as CodexEntry;
+          if (entry.type !== "session_meta") return line;
+          if (entry.payload?.id && entry.payload.id !== sessionId) return line;
+
+          matched = true;
+          const nextEntry: CodexEntry = {
+            ...entry,
+            payload: updatePayload({ ...entry.payload }),
+          };
+          const nextLine = JSON.stringify(nextEntry);
+          if (nextLine !== line) changed = true;
+          return nextLine;
+        } catch {
+          return line;
+        }
+      })
+      .join("\n");
+
+    if (!matched || !changed) return false;
+
+    await writeFile(filePath, rewrittenContent, "utf-8");
+    const nextFileStat = await stat(filePath);
+    carryCodexMessageIdentityCacheAcrossEdit(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs);
+    invalidateCache(filePath);
+    invalidateMessageActionIndex(filePath);
+    invalidateListCache(this.getListCacheKey());
+    return true;
+  }
+
   getStoragePath(): string {
     return getProviderPaths("codex").storagePath;
+  }
+
+  private getListCacheKey(storagePath = this.getStoragePath()): string {
+    return getListCacheKey(this.name, `${storagePath}::${CODEX_LIST_SOURCE_VERSION}`);
   }
 
   async detect(): Promise<boolean> {
@@ -635,22 +992,27 @@ export class CodexProvider implements ConversationProvider {
   }
 
   private scheduleBackgroundIndexRefresh(): void {
-    const cacheKey = getListCacheKey(this.name, this.getStoragePath());
+    const cacheKey = this.getListCacheKey();
     if (this.backgroundRefreshes.has(cacheKey)) {
       return;
     }
 
-    const task = this.listInternal({
-      eagerSearchIndex: true,
-      allowBackground: false,
-    })
-      .then(() => undefined)
-      .catch((error) => {
-        logProviderError("conversations.index.background", this.name, error);
-      })
-      .finally(() => {
-        this.backgroundRefreshes.delete(cacheKey);
-      });
+    const task = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.listInternal({
+          eagerSearchIndex: true,
+          allowBackground: false,
+        })
+          .then(() => undefined)
+          .catch((error) => {
+            logProviderError("conversations.index.background", this.name, error);
+          })
+          .finally(() => {
+            this.backgroundRefreshes.delete(cacheKey);
+            resolve();
+          });
+      }, 250);
+    });
 
     this.backgroundRefreshes.set(cacheKey, task);
   }
@@ -660,7 +1022,7 @@ export class CodexProvider implements ConversationProvider {
     allowBackground: boolean;
   }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
-    const cacheKey = getListCacheKey(this.name, basePath);
+    const cacheKey = this.getListCacheKey(basePath);
     const fileStates = await this.getListSourceFiles();
     const sourceSignature = this.createListSourceSignature(fileStates);
     const cachedList = getIndexedListCache(cacheKey, undefined, {
@@ -671,7 +1033,9 @@ export class CodexProvider implements ConversationProvider {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
+    const previousItems = getIndexedCacheSnapshot(cacheKey, {
+      includeSearchData: options.eagerSearchIndex,
+    }) ?? [];
     const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
     const transcriptFileStates = fileStates.filter((fileState) => fileState.path !== this.getNormalizedStateDbPath());
 
@@ -750,7 +1114,11 @@ export class CodexProvider implements ConversationProvider {
     }
 
     const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
-    setIndexedListCache(cacheKey, results, { searchReady, sourceSignature });
+    setIndexedListCache(cacheKey, results, {
+      searchReady,
+      sourceSignature,
+      writeSearchData: options.eagerSearchIndex || searchReady,
+    });
 
     if (!searchReady && options.allowBackground) {
       this.scheduleBackgroundIndexRefresh();
@@ -783,7 +1151,7 @@ export class CodexProvider implements ConversationProvider {
     }
 
     if (!options.includeSearchIndex) {
-      const meta = await this.extractMeta(filePath);
+      const meta = await this.extractMeta(filePath, metaHint);
       return meta ? { meta } : null;
     }
 
@@ -801,11 +1169,14 @@ export class CodexProvider implements ConversationProvider {
   ): Promise<IndexedCacheItem | null> {
     let sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     let cwd = "";
+    let transcriptTitle = "";
+    let forkedFromId = "";
     let defaultTitle = "";
     let fallbackTitle = "";
     let userMessageCount = 0;
     let messageCount = 0;
     let firstTimestamp: number | undefined;
+    let capturedSessionMeta = false;
     const searchBuilder = includeSearchIndex ? createConversationSearchIndexBuilder() : null;
 
     await visitJsonl<CodexEntry>(filePath, (entry) => {
@@ -817,8 +1188,15 @@ export class CodexProvider implements ConversationProvider {
       }
 
       if (entry.type === "session_meta") {
-        sessionId = entry.payload?.id || sessionId;
-        cwd = entry.payload?.cwd || cwd;
+        if (!capturedSessionMeta) {
+          sessionId = entry.payload?.id || sessionId;
+          cwd = entry.payload?.cwd || cwd;
+          forkedFromId = getCodexForkedFromId(entry) || forkedFromId;
+          if (typeof entry.payload?.title === "string") {
+            transcriptTitle = normalizeCodexDisplayText(entry.payload.title) || transcriptTitle;
+          }
+          capturedSessionMeta = true;
+        }
         return;
       }
 
@@ -838,15 +1216,12 @@ export class CodexProvider implements ConversationProvider {
         return;
       }
 
-      if (entry.type !== "response_item") {
+      const content = getDisplayableCodexResponseContent(entry);
+      if (content === null) {
         return;
       }
 
-      const role = entry.payload?.role;
-      if (role !== "user" && role !== "assistant") {
-        return;
-      }
-
+      const role = entry.payload.role;
       messageCount += 1;
       if (role === "user") {
         const candidateTitle = getCodexUserTitleCandidate(entry);
@@ -862,18 +1237,58 @@ export class CodexProvider implements ConversationProvider {
       }
     });
 
-    if (messageCount === 0 && userMessageCount === 0) {
+    const displayMessageCount = messageCount > 0 ? messageCount : userMessageCount;
+    if (displayMessageCount === 0) {
       return null;
     }
+    const isTitleGenerationSession = isCodexTitleGenerationProject(cwd);
 
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
     if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
       fallbackTitle = await findCodexFallbackTitle(filePath);
     }
+    let currentFileStat = fileStat;
+    let effectiveTranscriptTitle = transcriptTitle;
+    const managedTitle = await this.getManagedTitle(sessionId);
+    if (managedTitle) {
+      effectiveTranscriptTitle = managedTitle;
+      const transcriptRewritten = await this.syncThreadDisplayTitleFromManagedTitle(
+        sessionId,
+        managedTitle,
+        transcriptTitle,
+        threadMetadata,
+        filePath
+      );
+      if (transcriptRewritten) {
+        currentFileStat = await stat(filePath);
+      }
+    } else {
+      const inheritedForkTitle = await this.maybeInheritForkTitle({
+        sessionId,
+        filePath,
+        forkedFromId,
+        threadMetadata,
+        transcriptTitle,
+        defaultTitle,
+        fallbackTitle,
+      });
+      if (inheritedForkTitle) {
+        effectiveTranscriptTitle = inheritedForkTitle;
+        currentFileStat = await stat(filePath);
+      } else {
+        const transcriptRewritten = await this.syncThreadDisplayTitleFromTranscript(sessionId, transcriptTitle, threadMetadata, filePath);
+        if (transcriptRewritten) {
+          currentFileStat = await stat(filePath);
+        }
+      }
+    }
     const titleChoice = pickCodexConversationTitle({
+      managedTitle: managedTitle ?? undefined,
+      transcriptTitle: effectiveTranscriptTitle,
       nativeTitle: threadMetadata.title,
       firstUserMessage: threadMetadata.firstUserMessage,
+      preview: threadMetadata.preview,
       fallbackTitle: fallbackTitle || defaultTitle,
     });
 
@@ -885,16 +1300,19 @@ export class CodexProvider implements ConversationProvider {
       projectKey: normalizedCwd,
       projectId: normalizedCwd,
       createdAt: firstTimestamp ?? fileStat.birthtimeMs,
-      updatedAt: fileStat.mtimeMs,
-      messageCount: Math.max(messageCount, userMessageCount),
-      fileSize: fileStat.size,
+      updatedAt: currentFileStat.mtimeMs,
+      messageCount: displayMessageCount,
+      fileSize: currentFileStat.size,
       filePath,
       modelProvider: threadMetadata.modelProvider,
       contentStatus: "full",
-      badges: titleChoice.usedFallback ? buildCodexTitleFallbackBadges() : undefined,
+      badges: mergeCodexBadges(
+        isTitleGenerationSession ? buildCodexTitleGenerationBadges() : undefined,
+        titleChoice.usedFallback ? buildCodexTitleFallbackBadges() : undefined
+      ),
     };
 
-    setCache(filePath, fileStat.mtimeMs, meta);
+    setCache(filePath, currentFileStat.mtimeMs, meta);
 
     if (!searchBuilder) {
       return { meta };
@@ -914,7 +1332,7 @@ export class CodexProvider implements ConversationProvider {
     return builder.build();
   }
 
-  private async extractMeta(filePath: string): Promise<ConversationMeta | null> {
+  private async extractMeta(filePath: string, metaHint?: ConversationMeta): Promise<ConversationMeta | null> {
     const fileStat = await stat(filePath);
     const cached = getCached(filePath, fileStat.mtimeMs);
     if (cached) {
@@ -932,30 +1350,40 @@ export class CodexProvider implements ConversationProvider {
     const sessionMeta = headEntries.find((e) => e.type === "session_meta");
     const sessionId = sessionMeta?.payload?.id || filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     const cwd = sessionMeta?.payload?.cwd || "";
+    const forkedFromId = getCodexForkedFromId(sessionMeta);
+    const transcriptTitle = typeof sessionMeta?.payload?.title === "string"
+      ? normalizeCodexDisplayText(sessionMeta.payload.title)
+      : "";
+    const isTitleGenerationSession = isCodexTitleGenerationProject(cwd);
 
     const userMessages = headEntries.filter(
       (e) => e.type === "event_msg" && e.payload?.type === "user_message" && e.payload.message
     );
 
-    const defaultTitle = getCodexUserTitleCandidate(userMessages[0]) || "未知对话";
+    const defaultTitleCandidate = getCodexUserTitleCandidate(userMessages[0]);
+    const defaultTitle = defaultTitleCandidate || "未知对话";
     let fallbackTitle = userMessages
       .map((entry) => getCodexUserTitleCandidate(entry))
       .find((title) => !!title && !isWeakCodexTitle(title));
 
     // 快速行计数
-    const messageCount = await countLines(
-      filePath,
-      (value) => {
-        if (!value || typeof value !== "object") return false;
-        const entry = value as CodexEntry;
-        return entry.type === "response_item"
-          && (entry.payload?.role === "user" || entry.payload?.role === "assistant");
-      },
-      {
-        fastIncludes: ['"type":"response_item"', '"role":"user"', '"role":"assistant"'],
-      }
-    );
-    if (messageCount === 0 && userMessages.length === 0) return null;
+    const expectedId = `codex:${sessionId}`;
+    const canReuseMessageCount = metaHint?.id === expectedId && metaHint.filePath === filePath;
+    const messageCount = canReuseMessageCount
+      ? metaHint.messageCount
+      : await countLines(
+          filePath,
+          (value) => {
+            if (!value || typeof value !== "object") return false;
+            const entry = value as CodexEntry;
+            return getDisplayableCodexResponseContent(entry) !== null;
+          },
+          {
+            fastIncludes: ['"type":"response_item"', '"role":"user"', '"role":"assistant"'],
+          }
+        );
+    const displayMessageCount = messageCount > 0 ? messageCount : userMessages.length;
+    if (displayMessageCount === 0) return null;
 
     const firstTs = new Date(headEntries[0].timestamp).getTime();
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
@@ -964,9 +1392,47 @@ export class CodexProvider implements ConversationProvider {
     if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
       fallbackTitle = await findCodexFallbackTitle(filePath);
     }
+    let currentFileStat = fileStat;
+    let effectiveTranscriptTitle = transcriptTitle;
+    const managedTitle = await this.getManagedTitle(sessionId);
+    if (managedTitle) {
+      effectiveTranscriptTitle = managedTitle;
+      const transcriptRewritten = await this.syncThreadDisplayTitleFromManagedTitle(
+        sessionId,
+        managedTitle,
+        transcriptTitle,
+        threadMetadata,
+        filePath
+      );
+      if (transcriptRewritten) {
+        currentFileStat = await stat(filePath);
+      }
+    } else {
+      const inheritedForkTitle = await this.maybeInheritForkTitle({
+        sessionId,
+        filePath,
+        forkedFromId,
+        threadMetadata,
+        transcriptTitle,
+        defaultTitle: defaultTitleCandidate,
+        fallbackTitle,
+      });
+      if (inheritedForkTitle) {
+        effectiveTranscriptTitle = inheritedForkTitle;
+        currentFileStat = await stat(filePath);
+      } else {
+        const transcriptRewritten = await this.syncThreadDisplayTitleFromTranscript(sessionId, transcriptTitle, threadMetadata, filePath);
+        if (transcriptRewritten) {
+          currentFileStat = await stat(filePath);
+        }
+      }
+    }
     const titleChoice = pickCodexConversationTitle({
+      managedTitle: managedTitle ?? undefined,
+      transcriptTitle: effectiveTranscriptTitle,
       nativeTitle: threadMetadata.title,
       firstUserMessage: threadMetadata.firstUserMessage,
+      preview: threadMetadata.preview,
       fallbackTitle: fallbackTitle || defaultTitle,
     });
 
@@ -978,16 +1444,19 @@ export class CodexProvider implements ConversationProvider {
       projectKey: normalizedCwd,
       projectId: normalizedCwd,
       createdAt: firstTs,
-      updatedAt: fileStat.mtimeMs,
-      messageCount: Math.max(messageCount, userMessages.length),
-      fileSize: fileStat.size,
+      updatedAt: currentFileStat.mtimeMs,
+      messageCount: displayMessageCount,
+      fileSize: currentFileStat.size,
       filePath,
       modelProvider: threadMetadata.modelProvider,
       contentStatus: "full",
-      badges: titleChoice.usedFallback ? buildCodexTitleFallbackBadges() : undefined,
+      badges: mergeCodexBadges(
+        titleChoice.usedFallback ? buildCodexTitleFallbackBadges() : undefined,
+        isTitleGenerationSession ? buildCodexTitleGenerationBadges() : undefined
+      ),
     };
 
-    setCache(filePath, fileStat.mtimeMs, meta);
+    setCache(filePath, currentFileStat.mtimeMs, meta);
     return meta;
   }
 
@@ -1054,7 +1523,7 @@ export class CodexProvider implements ConversationProvider {
     invalidateCache(filePath);
     invalidateMessageActionIndex(filePath);
     invalidateCodexMessageIdentityCache(filePath);
-    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+    invalidateListCache(this.getListCacheKey());
   }
 
   private async resolveMessageLineNumbers(
@@ -1163,7 +1632,7 @@ export class CodexProvider implements ConversationProvider {
     }
 
     if (!filePath) {
-      invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+      invalidateListCache(this.getListCacheKey());
     }
   }
 
@@ -1190,12 +1659,14 @@ export class CodexProvider implements ConversationProvider {
       if (existingThread && !updated) {
         throw new Error(`未能同步 Codex state db: ${id}`);
       }
-      invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+      invalidateListCache(this.getListCacheKey());
       return;
     }
 
     const originalFilePath = filePath;
-    const targetFilePath = buildCodexTranscriptPath(this.getStoragePath(), canonicalTargetProject, sessionId);
+    const originalFileStat = await stat(originalFilePath);
+    const createdAtMs = existingThread?.createdAt ?? originalFileStat.birthtimeMs;
+    const targetFilePath = buildCodexTranscriptPath(this.getStoragePath(), sessionId, createdAtMs);
     const movedToTarget = normalizePath(originalFilePath) !== targetFilePath;
     const originalContent = await readFile(originalFilePath, "utf-8");
     const newCwd = formatCodexStoredPath(normalizedTargetProject) ?? normalizedTargetProject;
@@ -1263,7 +1734,7 @@ export class CodexProvider implements ConversationProvider {
         invalidateCodexMessageIdentityCache(originalFilePath);
         invalidateCache(originalFilePath);
         invalidateMessageActionIndex(originalFilePath);
-        invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+        invalidateListCache(this.getListCacheKey());
       }
 
       throw error;
@@ -1286,7 +1757,7 @@ export class CodexProvider implements ConversationProvider {
 
     invalidateCache(currentFilePath);
     invalidateMessageActionIndex(currentFilePath);
-    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+    invalidateListCache(this.getListCacheKey());
   }
 
   async updateTitle(id: string, title: string): Promise<void> {
@@ -1312,10 +1783,18 @@ export class CodexProvider implements ConversationProvider {
     }
 
     await this.writeThreadDisplayTitle(sessionId, normalizedTitle);
+    await this.upsertSessionIndexThreadName(sessionId, normalizedTitle);
     if (filePath) {
+      await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
+        return {
+          ...payload,
+          id: payload.id || sessionId,
+          title: normalizedTitle,
+        };
+      });
       this.invalidateConversationCaches(filePath);
     } else {
-      invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+      invalidateListCache(this.getListCacheKey());
     }
   }
 
@@ -1352,7 +1831,7 @@ export class CodexProvider implements ConversationProvider {
     carryCodexMessageIdentityCacheAcrossEdit(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs);
     invalidateCache(filePath);
     invalidateMessageActionIndex(filePath);
-    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+    invalidateListCache(this.getListCacheKey());
   }
 
   async deleteMessage(id: string, messageId: string): Promise<void> {
@@ -1373,7 +1852,7 @@ export class CodexProvider implements ConversationProvider {
     carryCodexMessageIdentityCacheAcrossDelete(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs, uniqueMessageIds);
     invalidateCache(filePath);
     invalidateMessageActionIndex(filePath);
-    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+    invalidateListCache(this.getListCacheKey());
   }
 
   async listProjects(): Promise<string[]> {
@@ -1425,22 +1904,30 @@ export class CodexProvider implements ConversationProvider {
       return id.replace("codex:", "");
     });
 
-    const filePaths = await Promise.all(
+    const transcriptTargets = await Promise.all(
       sessionIds.map(async (sessionId) => {
         try {
-          return await this.findConversationFilePath(sessionId);
+          return {
+            sessionId,
+            filePath: await this.findConversationFilePath(sessionId),
+          };
         } catch {
-          return null;
+          return { sessionId, filePath: null };
         }
       })
     );
 
     this.sqliteClient.changeModelProvidersForSessions(sessionIds, normalizedProvider);
 
-    for (const filePath of new Set(filePaths.filter((item): item is string => !!item))) {
-      invalidateCache(filePath);
+    for (const target of transcriptTargets) {
+      if (!target.filePath) continue;
+      await this.rewriteTranscriptSessionMeta(target.filePath, target.sessionId, (payload) => ({
+        ...payload,
+        model_provider: normalizedProvider,
+      }));
+      invalidateCache(target.filePath);
     }
-    invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+    invalidateListCache(this.getListCacheKey());
 
     return sessionIds.length;
   }

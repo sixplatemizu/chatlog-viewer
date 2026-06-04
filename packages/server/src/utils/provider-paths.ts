@@ -481,7 +481,8 @@ async function migrateProviderPaths(
         "storagePath",
         currentResolved.storagePath,
         nextResolved.storagePath,
-        "directory"
+        "directory",
+        homeDir
       );
       if (storageResult) results.push(storageResult);
     }
@@ -492,7 +493,8 @@ async function migrateProviderPaths(
         "stateDbPath",
         currentResolved.stateDbPath,
         nextResolved.stateDbPath,
-        "file"
+        "file",
+        homeDir
       );
       if (stateDbResult) results.push(stateDbResult);
     }
@@ -506,10 +508,12 @@ async function maybeMigrateResolvedPath(
   pathType: "storagePath" | "stateDbPath",
   fromPath: string,
   toPath: string,
-  kind: PathKind
+  kind: PathKind,
+  homeDir: string
 ): Promise<ProviderPathMigrationResult | null> {
   if (!fromPath || !toPath) return null;
   if (getPathKey(fromPath) === getPathKey(toPath)) return null;
+  assertSafeMigrationPath(providerName, pathType, fromPath, toPath, kind, homeDir);
 
   const sourceExists = await pathExistsAsync(fromPath, kind);
   if (!sourceExists) return null;
@@ -529,6 +533,65 @@ async function maybeMigrateResolvedPath(
     mode,
     message: `${providerName} ${label} ${action}到新路径`,
   };
+}
+
+function assertSafeMigrationPath(
+  providerName: ResolvedProviderName,
+  pathType: "storagePath" | "stateDbPath",
+  fromPath: string,
+  toPath: string,
+  kind: PathKind,
+  homeDir: string
+): void {
+  const fromContainer = kind === "file" ? fromPath : fromPath;
+  const toContainer = kind === "file" ? toPath : toPath;
+
+  if (isDangerousMigrationRoot(fromContainer, homeDir)) {
+    throw new Error(`自动迁移失败：源路径过于宽泛或敏感 ${fromPath}`);
+  }
+  if (isDangerousMigrationRoot(toContainer, homeDir)) {
+    throw new Error(`自动迁移失败：目标路径过于宽泛或敏感 ${toPath}`);
+  }
+  if (kind === "directory" && isPathInside(toPath, fromPath)) {
+    throw new Error(`自动迁移失败：目标路径不能位于源目录内部 ${toPath}`);
+  }
+  if (kind === "directory" && isPathInside(fromPath, toPath)) {
+    throw new Error(`自动迁移失败：源路径不能位于目标目录内部 ${fromPath}`);
+  }
+
+  if (pathType === "stateDbPath" && !/\.(sqlite|sqlite3|db)$/i.test(toPath)) {
+    throw new Error(`自动迁移失败：${providerName} State DB 目标路径必须是 sqlite/db 文件`);
+  }
+}
+
+function isDangerousMigrationRoot(path: string, homeDir: string): boolean {
+  const normalized = getPathKey(path);
+  const normalizedHome = getPathKey(homeDir);
+  const normalizedParent = getPathKey(dirnameStyledPath(path));
+  if (!normalized || normalized === "." || normalized === normalizedParent) return true;
+  if (normalized === normalizedHome) return true;
+
+  if (usesWindowsPathStyle(path, homeDir)) {
+    const windowsPath = win32.normalize(normalizeWindowsLikePath(path)).toLowerCase();
+    if (/^[a-z]:\\?$/.test(windowsPath)) return true;
+    return [
+      "c:\\windows",
+      "c:\\program files",
+      "c:\\program files (x86)",
+      "c:\\programdata",
+    ].some((root) => windowsPath === root || windowsPath.startsWith(`${root}\\`));
+  }
+
+  return ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/root", "/sbin", "/sys", "/usr", "/var"]
+    .some((root) => normalized === root || normalized.startsWith(`${root}/`));
+}
+
+function isPathInside(path: string, possibleParent: string): boolean {
+  const normalizedPath = getPathKey(path);
+  const normalizedParent = getPathKey(possibleParent);
+  if (normalizedPath === normalizedParent) return false;
+  const separator = usesWindowsPathStyle(path, possibleParent) ? "\\" : "/";
+  return normalizedPath.startsWith(`${normalizedParent}${separator}`);
 }
 
 async function moveDirectoryTree(sourceDir: string, targetDir: string): Promise<"moved" | "merged"> {

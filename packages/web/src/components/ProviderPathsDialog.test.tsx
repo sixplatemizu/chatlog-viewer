@@ -69,7 +69,7 @@ describe("ProviderPathsDialog", () => {
     ]);
   });
 
-  it("修改路径时默认勾选自动迁移并把迁移选项传给 API", async () => {
+  it("修改路径时默认不勾选自动迁移，显式勾选后把迁移选项传给 API", async () => {
     const settings = createSettings();
     const onSaved = vi.fn();
     const onNotify = vi.fn();
@@ -137,8 +137,9 @@ describe("ProviderPathsDialog", () => {
       target: { value: "/data/claude/projects-new" },
     });
 
-    const checkbox = screen.getByLabelText("保存时自动迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。");
-    expect(checkbox).toBeChecked();
+    const checkbox = screen.getByLabelText("勾选后会在保存时迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。");
+    expect(checkbox).not.toBeChecked();
+    fireEvent.click(checkbox);
 
     fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
 
@@ -180,7 +181,7 @@ describe("ProviderPathsDialog", () => {
       target: { value: "/data/claude/projects-new" },
     });
 
-    expect(screen.queryByLabelText("保存时自动迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。")).toBeNull();
+    expect(screen.queryByLabelText("勾选后会在保存时迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。")).toBeNull();
   });
 
   it("会显示更准确的 CLI 发现与健康状态", async () => {

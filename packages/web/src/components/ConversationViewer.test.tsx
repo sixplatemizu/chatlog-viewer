@@ -350,5 +350,7 @@ describe("ConversationViewer", () => {
 
     expect(handleLoadEarlier).toHaveBeenCalledTimes(1);
     expect(screen.getByText("已加载最近 2 / 3 条消息")).toBeInTheDocument();
+    expect(screen.getByText("#2/3")).toBeInTheDocument();
+    expect(screen.getByText("#3/3")).toBeInTheDocument();
   });
 });

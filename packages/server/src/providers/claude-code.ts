@@ -52,6 +52,8 @@ import {
   applyProjectDisplayPathHints,
 } from "./shared/provider-utils.js";
 
+const CLAUDE_CODE_LIST_SOURCE_VERSION = "claude-code-list-v2-recover-index-prefix";
+
 interface ClaudeCodeEntry {
   type: string;
   subtype?: string;
@@ -277,6 +279,60 @@ function pickHistorySession(
   return candidate.messages.length > current.messages.length ? candidate : current;
 }
 
+function parseJsonObjectPrefix<T>(content: string): T | null {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let startIndex = -1;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+
+    if (startIndex < 0) {
+      if (/\s/.test(char ?? "")) continue;
+      if (char !== "{") return null;
+      startIndex = index;
+      depth = 1;
+      continue;
+    }
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = inString;
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(content.slice(startIndex, index + 1)) as T;
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 function mergeClaudeSessionSource(
   current: ClaudeCodeSessionSource | undefined,
   candidate: ClaudeCodeSessionSource
@@ -486,17 +542,22 @@ export class ClaudeCodeProvider implements ConversationProvider {
       return;
     }
 
-    const task = this.listInternal({
-      eagerSearchIndex: true,
-      allowBackground: false,
-    })
-      .then(() => undefined)
-      .catch((error) => {
-        logProviderError("conversations.index.background", this.name, error);
-      })
-      .finally(() => {
-        this.backgroundRefreshes.delete(cacheKey);
-      });
+    const task = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.listInternal({
+          eagerSearchIndex: true,
+          allowBackground: false,
+        })
+          .then(() => undefined)
+          .catch((error) => {
+            logProviderError("conversations.index.background", this.name, error);
+          })
+          .finally(() => {
+            this.backgroundRefreshes.delete(cacheKey);
+            resolve();
+          });
+      }, 250);
+    });
 
     this.backgroundRefreshes.set(cacheKey, task);
   }
@@ -516,7 +577,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
+    const previousItems = getIndexedCacheSnapshot(cacheKey, {
+      includeSearchData: options.eagerSearchIndex,
+    }) ?? [];
     const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
 
     const results: IndexedCacheItem[] = [];
@@ -558,7 +621,11 @@ export class ClaudeCodeProvider implements ConversationProvider {
 
     const normalizedResults = applyProjectDisplayPathHints(results);
     const searchReady = options.eagerSearchIndex || sourcesToRefresh.length === 0;
-    setIndexedListCache(cacheKey, normalizedResults, { searchReady, sourceSignature });
+    setIndexedListCache(cacheKey, normalizedResults, {
+      searchReady,
+      sourceSignature,
+      writeSearchData: options.eagerSearchIndex || searchReady,
+    });
 
     if (!searchReady && options.allowBackground) {
       this.scheduleBackgroundIndexRefresh();
@@ -786,18 +853,28 @@ export class ClaudeCodeProvider implements ConversationProvider {
   private async readSessionIndexFile(indexPath: string): Promise<ClaudeCodeSessionIndexFile> {
     try {
       const content = await readFile(indexPath, "utf-8");
-      const parsed = JSON.parse(content) as ClaudeCodeSessionIndexFile;
-      return {
-        version: parsed.version ?? 1,
-        entries: Array.isArray(parsed.entries) ? parsed.entries : [],
-        originalPath: parsed.originalPath,
-      };
+      let parsed: ClaudeCodeSessionIndexFile | null = null;
+      try {
+        parsed = JSON.parse(content) as ClaudeCodeSessionIndexFile;
+      } catch {
+        parsed = parseJsonObjectPrefix<ClaudeCodeSessionIndexFile>(content);
+      }
+
+      if (parsed) {
+        return {
+          version: parsed.version ?? 1,
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+          originalPath: parsed.originalPath,
+        };
+      }
     } catch {
-      return {
-        version: 1,
-        entries: [],
-      };
+      // 继续返回空索引
     }
+
+    return {
+      version: 1,
+      entries: [],
+    };
   }
 
   private async collectSessionSources(): Promise<{ sources: ClaudeCodeSessionSource[]; sourceSignature: string }> {
@@ -948,15 +1025,17 @@ export class ClaudeCodeProvider implements ConversationProvider {
     }
 
     const sources = [...sourceBySessionId.values()].sort((a, b) => b.updatedAtHint - a.updatedAtHint);
-    const sourceSignature = createIndexedListSourceSignature(
-      signatureFiles
-        .map((item) => ({
-          path: normalizePath(item.path),
-          mtimeMs: item.mtimeMs,
-          size: item.size,
-        }))
-        .sort((a, b) => a.path.localeCompare(b.path))
-    );
+    const sourceSignature = `${CLAUDE_CODE_LIST_SOURCE_VERSION}:${
+      createIndexedListSourceSignature(
+        signatureFiles
+          .map((item) => ({
+            path: normalizePath(item.path),
+            mtimeMs: item.mtimeMs,
+            size: item.size,
+          }))
+          .sort((a, b) => a.path.localeCompare(b.path))
+      )
+    }`;
 
     return { sources, sourceSignature };
   }

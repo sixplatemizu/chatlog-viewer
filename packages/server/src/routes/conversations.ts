@@ -8,15 +8,84 @@ import type {
   Message,
 } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
-import { getAllTitles, getTitle, setTitle, deleteTitle } from "../utils/title-store.js";
+import { getAllTitles, getTitle, setTitle, deleteTitle, setNativeTitle, deleteNativeTitle } from "../utils/title-store.js";
 import { generateTitle } from "../utils/ai.js";
 import { getIndexedListSnapshot, hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
 import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
-import { getTitleGenerationCliPriority, getTitleGenerationCliSessionReuse } from "../utils/provider-paths.js";
+import {
+  getTitleGenerationCliPriority,
+  getTitleGenerationCliSessionModes,
+  getTitleGenerationCliSessionReuse,
+  type TitleGenerationCli,
+} from "../utils/provider-paths.js";
+
+const MAX_BATCH_CONVERSATION_IDS = 500;
+const MAX_BATCH_MESSAGE_IDS = 2_000;
+const MAX_TITLE_LENGTH = 100;
+const MAX_MODEL_PROVIDER_LENGTH = 100;
+const DEFAULT_CONVERSATION_LIST_LIMIT = 5_000;
+const MAX_CONVERSATION_LIST_LIMIT = 5_000;
+const TITLE_GENERATION_BADGE_LABEL = "标题生成";
+const TITLE_GENERATION_CLI_PROVIDER: Record<TitleGenerationCli, string> = {
+  codex: "codex",
+  claude: "claude-code",
+  opencode: "opencode",
+};
+
+function isTitleGenerationCli(value: string): value is TitleGenerationCli {
+  return Object.hasOwn(TITLE_GENERATION_CLI_PROVIDER, value);
+}
+
+function hasTitleGenerationBadge(conversation: ConversationMeta): boolean {
+  return conversation.badges?.some((badge) => badge.label === TITLE_GENERATION_BADGE_LABEL) ?? false;
+}
 
 function normalizeProjectDisplayPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
+}
+
+function normalizeStringArrayField(
+  value: unknown,
+  fieldName: string,
+  options: { maxItems: number; emptyMessage: string }
+): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} 必须是数组`);
+  }
+
+  const items = [...new Set(
+    value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean)
+  )];
+
+  if (items.length === 0) {
+    throw new Error(options.emptyMessage);
+  }
+  if (items.length > options.maxItems) {
+    throw new Error(`${fieldName} 单次最多支持 ${options.maxItems} 项`);
+  }
+
+  return items;
+}
+
+function normalizeBoundedStringField(
+  value: unknown,
+  fieldName: string,
+  options: { maxLength: number; emptyMessage: string }
+): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(options.emptyMessage);
+  }
+
+  const normalized = value.trim();
+  if (normalized.length > options.maxLength) {
+    throw new Error(`${fieldName} 不能超过 ${options.maxLength} 个字符`);
+  }
+
+  return normalized;
 }
 
 function getProjectDisplayScore(project: string, projectKey: string): number {
@@ -123,6 +192,7 @@ async function persistConversationTitle(
 
   if (provider.updateTitle) {
     await provider.updateTitle(id, normalizedTitle);
+    await setNativeTitle(id, normalizedTitle);
     await deleteTitle(id);
     return;
   }
@@ -175,6 +245,7 @@ async function deleteConversationWithCleanup(
   try {
     await provider.delete(id);
     await deleteTitle(id);
+    await deleteNativeTitle(id);
     return { cleanedStale: false };
   } catch (error) {
     if (!isNotFoundError(error)) {
@@ -182,6 +253,7 @@ async function deleteConversationWithCleanup(
     }
 
     await deleteTitle(id);
+    await deleteNativeTitle(id);
     return { cleanedStale: true };
   }
 }
@@ -189,6 +261,33 @@ async function deleteConversationWithCleanup(
 export function createConversationRoutes(providers: ConversationProvider[]) {
   const app = new Hono();
   const providerByName = new Map(providers.map((provider) => [provider.name, provider]));
+
+  async function cleanupFreshTitleGenerationSessions(usedCli: string): Promise<number> {
+    if (!isTitleGenerationCli(usedCli)) return 0;
+
+    const modes = getTitleGenerationCliSessionModes();
+    if (modes[usedCli] !== "fresh") return 0;
+
+    const providerName = TITLE_GENERATION_CLI_PROVIDER[usedCli];
+    const cleanupProvider = providerByName.get(providerName);
+    if (!cleanupProvider) return 0;
+
+    const conversations = await cleanupProvider.list({ eagerSearchIndex: false });
+    let deleted = 0;
+
+    for (const conversation of conversations) {
+      if (!hasTitleGenerationBadge(conversation)) continue;
+
+      try {
+        await deleteConversationWithCleanup(cleanupProvider, conversation.id);
+        deleted += 1;
+      } catch (error) {
+        logProviderError("conversations.generate-title.cleanup", cleanupProvider.name, error);
+      }
+    }
+
+    return deleted;
+  }
 
   function getProviderListCacheKey(provider: ConversationProvider): string {
     return `${provider.name}::${provider.getStoragePath()}::indexed`;
@@ -214,6 +313,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const sort = c.req.query("sort") || "updatedAt";
     const modelProviderFilter = c.req.query("modelProvider");
     const requireSearchReady = !!search;
+    const limitParam = c.req.query("limit");
+    const offsetParam = c.req.query("offset");
+    const requestedLimit = limitParam ? Number.parseInt(limitParam, 10) : DEFAULT_CONVERSATION_LIST_LIMIT;
+    const requestedOffset = offsetParam ? Number.parseInt(offsetParam, 10) : 0;
+    const listLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, MAX_CONVERSATION_LIST_LIMIT)
+      : DEFAULT_CONVERSATION_LIST_LIMIT;
+    const listOffset = Number.isFinite(requestedOffset) && requestedOffset > 0 ? requestedOffset : 0;
 
     const providerNames = providerFilter !== undefined
       ? providerFilter
@@ -231,36 +338,54 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       ? modelProviderFilter.split(",").map((name) => name.trim()).filter(Boolean)
       : undefined;
 
-    for (const provider of providers) {
+    const providerRefreshResults = await Promise.all(providers.map(async (provider) => {
       const shouldReportWarning = activeProviderNameSet.has(provider.name);
       try {
         const cacheKey = getProviderListCacheKey(provider);
         if (!(await provider.detect())) {
           if (requireSearchReady && shouldReportWarning) {
-            searchWarnings.add(`${provider.displayName} 当前不可用，搜索结果可能不完整`);
+            return {
+              warning: `${provider.displayName} 当前不可用，搜索结果可能不完整`,
+            };
           }
-          continue;
+          return {};
         }
         const sourceSignature = (await provider.getListSourceSignature?.()) ?? undefined;
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
-          indexedCacheKeys.push(cacheKey);
-          continue;
+          return { cacheKey };
         }
 
         const refreshedItems = await provider.list({ eagerSearchIndex: requireSearchReady });
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
-          indexedCacheKeys.push(cacheKey);
-        } else {
-          refreshedByProvider.set(provider.name, refreshedItems);
-          if (requireSearchReady && shouldReportWarning) {
-            searchWarnings.add(`${provider.displayName} 搜索索引尚未就绪，当前仅匹配标题和目录`);
-          }
+          return { cacheKey };
         }
+
+        return {
+          providerName: provider.name,
+          refreshedItems,
+          warning: requireSearchReady && shouldReportWarning
+            ? `${provider.displayName} 搜索索引尚未就绪，当前仅匹配标题和目录`
+            : undefined,
+        };
       } catch (error) {
         logProviderError("conversations.list", provider.name, error);
-        if (requireSearchReady && shouldReportWarning) {
-          searchWarnings.add(`${provider.displayName} 刷新失败，搜索结果可能不完整`);
-        }
+        return {
+          warning: requireSearchReady && shouldReportWarning
+            ? `${provider.displayName} 刷新失败，搜索结果可能不完整`
+            : undefined,
+        };
+      }
+    }));
+
+    for (const result of providerRefreshResults) {
+      if (result.cacheKey) {
+        indexedCacheKeys.push(result.cacheKey);
+      }
+      if (result.providerName && result.refreshedItems) {
+        refreshedByProvider.set(result.providerName, result.refreshedItems);
+      }
+      if (result.warning) {
+        searchWarnings.add(result.warning);
       }
     }
 
@@ -336,11 +461,17 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         return b.updatedAt - a.updatedAt;
       });
 
+    const conversationsPage = filtered.slice(listOffset, listOffset + listLimit);
+
     return c.json({
       total: filtered.length,
-      conversations: filtered,
+      conversations: conversationsPage,
       providerCounts,
       codexModelProviderCounts,
+      listTruncated: conversationsPage.length + listOffset < filtered.length,
+      nextOffset: conversationsPage.length + listOffset < filtered.length
+        ? listOffset + conversationsPage.length
+        : undefined,
       partialSearch: requireSearchReady && searchWarnings.size > 0,
       warnings: [...searchWarnings],
     });
@@ -412,16 +543,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     }
 
     const body = await c.req.json<{ messageIds?: unknown }>();
-    if (!Array.isArray(body?.messageIds)) {
-      return c.json({ error: "messageIds 必须是数组" }, 400);
-    }
-
-    const messageIds = body.messageIds
-      .filter((item): item is string => typeof item === "string")
-      .map((item) => item.trim())
-      .filter(Boolean);
-    if (messageIds.length === 0) {
-      return c.json({ error: "待删除消息不能为空" }, 400);
+    let messageIds: string[];
+    try {
+      messageIds = normalizeStringArrayField(body?.messageIds, "messageIds", {
+        maxItems: MAX_BATCH_MESSAGE_IDS,
+        emptyMessage: "待删除消息不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
     }
 
     try {
@@ -458,18 +587,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
   app.post("/conversations/batch-delete", async (c) => {
     const body = await c.req.json<{ ids?: unknown }>();
-    if (!Array.isArray(body?.ids)) {
-      return c.json({ error: "ids 必须是数组" }, 400);
-    }
-
-    const ids = [...new Set(
-      body.ids
-        .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim())
-        .filter(Boolean)
-    )];
-    if (ids.length === 0) {
-      return c.json({ error: "待删除对话不能为空" }, 400);
+    let ids: string[];
+    try {
+      ids = normalizeStringArrayField(body?.ids, "ids", {
+        maxItems: MAX_BATCH_CONVERSATION_IDS,
+        emptyMessage: "待删除对话不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
     }
 
     const settled = await Promise.allSettled(ids.map(async (id) => {
@@ -523,11 +648,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const disabledReason = getTitleMutationDisabledReason(provider, "update");
     if (disabledReason) return c.json({ error: disabledReason }, 400);
 
-    const body = await c.req.json<{ title: string }>();
-    if (!body.title?.trim()) return c.json({ error: "标题不能为空" }, 400);
+    const body = await c.req.json<{ title?: unknown }>();
+    let title: string;
+    try {
+      title = normalizeBoundedStringField(body?.title, "title", {
+        maxLength: MAX_TITLE_LENGTH,
+        emptyMessage: "标题不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
+    }
 
-    await persistConversationTitle(provider, id, body.title.trim());
-    return c.json({ success: true, title: body.title.trim() });
+    await persistConversationTitle(provider, id, title);
+    return c.json({ success: true, title });
   });
 
   // AI 生成标题
@@ -547,7 +680,13 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         projectDir: conversation.project,
       });
       await persistConversationTitle(provider, id, result.title);
-      return c.json({ success: true, title: result.title, usedCli: result.usedCli });
+      const cleanedTitleSessions = await cleanupFreshTitleGenerationSessions(result.usedCli);
+      return c.json({
+        success: true,
+        title: result.title,
+        usedCli: result.usedCli,
+        cleanedTitleSessions,
+      });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
@@ -555,21 +694,23 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
 
   app.post("/conversations/generate-title/batch", async (c) => {
     const body = await c.req.json<{ ids?: unknown }>();
-    if (!Array.isArray(body?.ids)) {
-      return c.json({ error: "ids 必须是数组" }, 400);
+    let ids: string[];
+    try {
+      ids = normalizeStringArrayField(body?.ids, "ids", {
+        maxItems: MAX_BATCH_CONVERSATION_IDS,
+        emptyMessage: "待生成标题的对话不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
     }
 
-    const ids = [...new Set(
-      body.ids
-        .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim())
-        .filter(Boolean)
-    )];
-    if (ids.length === 0) {
-      return c.json({ error: "待生成标题的对话不能为空" }, 400);
-    }
-
-    const results: Array<{ id: string; title?: string; usedCli?: string; error?: string }> = [];
+    const results: Array<{
+      id: string;
+      title?: string;
+      usedCli?: string;
+      cleanedTitleSessions?: number;
+      error?: string;
+    }> = [];
 
     for (const id of ids) {
       const providerName = id.split(":")[0];
@@ -592,10 +733,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
           projectDir: conversation.project,
         });
         await persistConversationTitle(provider, id, result.title);
+        const cleanedTitleSessions = await cleanupFreshTitleGenerationSessions(result.usedCli);
         results.push({
           id,
           title: result.title,
           usedCli: result.usedCli,
+          cleanedTitleSessions,
         });
       } catch (e) {
         results.push({
@@ -622,11 +765,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
     if (!provider.move) return c.json({ error: `${provider.displayName} 不支持移动对话` }, 400);
 
-    const body = await c.req.json<{ targetProjectKey: string }>();
-    if (!body.targetProjectKey?.trim()) return c.json({ error: "目标文件夹不能为空" }, 400);
+    const body = await c.req.json<{ targetProjectKey?: unknown }>();
+    let targetProjectKey: string;
+    try {
+      targetProjectKey = normalizeBoundedStringField(body?.targetProjectKey, "targetProjectKey", {
+        maxLength: 1_000,
+        emptyMessage: "目标文件夹不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
+    }
 
     try {
-      await provider.move(id, body.targetProjectKey.trim());
+      await provider.move(id, targetProjectKey);
       return c.json({ success: true });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
@@ -636,21 +787,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   // 批量移动对话到同一 provider 下的指定项目文件夹
   app.post("/conversations/move/batch", async (c) => {
     const body = await c.req.json<{ ids?: unknown; targetProjectKey?: unknown }>();
-    if (!Array.isArray(body?.ids)) {
-      return c.json({ error: "ids 必须是数组" }, 400);
-    }
-    if (typeof body.targetProjectKey !== "string" || !body.targetProjectKey.trim()) {
-      return c.json({ error: "目标文件夹不能为空" }, 400);
-    }
-
-    const ids = [...new Set(
-      body.ids
-        .filter((item): item is string => typeof item === "string")
-        .map((item) => item.trim())
-        .filter(Boolean)
-    )];
-    if (ids.length === 0) {
-      return c.json({ error: "待移动对话不能为空" }, 400);
+    let ids: string[];
+    let targetProjectKey: string;
+    try {
+      ids = normalizeStringArrayField(body?.ids, "ids", {
+        maxItems: MAX_BATCH_CONVERSATION_IDS,
+        emptyMessage: "待移动对话不能为空",
+      });
+      targetProjectKey = normalizeBoundedStringField(body?.targetProjectKey, "targetProjectKey", {
+        maxLength: 1_000,
+        emptyMessage: "目标文件夹不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
     }
 
     // 要求所有对话来自同一 provider —— 不同 provider 的 projectKey 语义不一致。
@@ -664,7 +813,6 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
     if (!provider.move) return c.json({ error: `${provider.displayName} 不支持移动对话` }, 400);
 
-    const targetProjectKey = body.targetProjectKey.trim();
     const settled = await Promise.allSettled(ids.map(async (id) => {
       await provider.move!(id, targetProjectKey);
       return id;
@@ -727,27 +875,26 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     if (!codex) return c.json({ error: "Codex provider 不可用" }, 404);
 
     const body = await c.req.json<{ ids?: unknown; modelProvider?: unknown }>();
-    if (!Array.isArray(body?.ids)) {
-      return c.json({ error: "ids 必须是数组" }, 400);
-    }
-
-    const ids = body.ids
-      .filter((item): item is string => typeof item === "string")
-      .map((item) => item.trim())
-      .filter(Boolean);
-    if (ids.length === 0) {
-      return c.json({ error: "待修改对话不能为空" }, 400);
+    let ids: string[];
+    let modelProvider: string;
+    try {
+      ids = normalizeStringArrayField(body?.ids, "ids", {
+        maxItems: MAX_BATCH_CONVERSATION_IDS,
+        emptyMessage: "待修改对话不能为空",
+      });
+      modelProvider = normalizeBoundedStringField(body?.modelProvider, "modelProvider", {
+        maxLength: MAX_MODEL_PROVIDER_LENGTH,
+        emptyMessage: "model provider 不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
     }
     if (ids.some((id) => !id.startsWith("codex:"))) {
       return c.json({ error: "批量切换 model provider 仅支持 Codex 对话" }, 400);
     }
 
-    if (typeof body.modelProvider !== "string" || !body.modelProvider.trim()) {
-      return c.json({ error: "model provider 不能为空" }, 400);
-    }
-
     try {
-      const updated = await codex.changeModelProviders(ids, body.modelProvider.trim());
+      const updated = await codex.changeModelProviders(ids, modelProvider);
       return c.json({ success: true, updated });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
@@ -764,13 +911,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const codex = providers.find((p) => p.name === "codex") as CodexProvider | undefined;
     if (!codex) return c.json({ error: "Codex provider 不可用" }, 404);
 
-    const body = await c.req.json<{ modelProvider: string }>();
-    if (!body.modelProvider?.trim()) {
-      return c.json({ error: "model provider 不能为空" }, 400);
+    const body = await c.req.json<{ modelProvider?: unknown }>();
+    let modelProvider: string;
+    try {
+      modelProvider = normalizeBoundedStringField(body?.modelProvider, "modelProvider", {
+        maxLength: MAX_MODEL_PROVIDER_LENGTH,
+        emptyMessage: "model provider 不能为空",
+      });
+    } catch (error) {
+      return c.json({ error: getErrorMessage(error) }, 400);
     }
 
     try {
-      await codex.changeModelProvider(id, body.modelProvider.trim());
+      await codex.changeModelProvider(id, modelProvider);
       return c.json({ success: true });
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));

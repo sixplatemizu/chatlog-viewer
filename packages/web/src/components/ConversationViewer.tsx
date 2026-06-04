@@ -143,6 +143,8 @@ export function ConversationViewer({
 
   const totalMessages = conversation?.messageCount ?? conversation?.messages.length ?? 0;
   const loadedMessages = conversation?.messages ?? EMPTY_MESSAGES;
+  const sequenceTotal = Math.max(totalMessages, loadedMessages.length);
+  const firstLoadedSequence = Math.max(1, sequenceTotal - loadedMessages.length + 1);
   const hiddenCount = Math.max(0, totalMessages - loadedMessages.length);
   const deletableMessageIds = useMemo(
     () => loadedMessages
@@ -461,7 +463,7 @@ export function ConversationViewer({
                     value={conversation.modelProvider}
                     onChange={(e) => onChangeModelProvider(conversation.id, e.target.value)}
                     className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-50 text-green-600 border border-green-200 dark:bg-green-900/30 dark:text-green-400 dark:border-green-700 cursor-pointer focus:outline-none focus:ring-1 focus:ring-green-400 appearance-none pr-4"
-                    title="切换到其他 Codex provider（会写回 ~/.codex/state_5.sqlite，下次 codex 命令也能看到）"
+                    title="切换到其他 Codex provider（会同步 state db 与 transcript metadata）"
                     style={{ backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 24 24' fill='none' stroke='%2322c55e' stroke-width='3'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
                   >
                     {codexModelProviders.map((name) => (
@@ -625,6 +627,8 @@ export function ConversationViewer({
             <div className="border-b border-gray-100 dark:border-gray-800 last:border-b-0">
               <MessageBubble
                 message={message}
+                sequenceNumber={firstLoadedSequence + index}
+                totalMessages={sequenceTotal}
                 dark={dark}
                 onUpdateMessage={handleUpdateMessage}
                 onDeleteMessage={handleDeleteMessage}

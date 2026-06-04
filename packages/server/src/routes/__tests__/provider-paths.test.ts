@@ -330,6 +330,51 @@ test("更新 provider 配置时可自动迁移 storagePath 目录内容", async 
   }
 });
 
+test("自动迁移会拒绝过于宽泛的源目录", async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-provider-migrate-guard-"));
+  const configPath = join(baseDir, "config.json");
+  const env = {
+    CHATLOG_VIEWER_CONFIG_PATH: configPath,
+  };
+
+  try {
+    await writeFile(
+      configPath,
+      `${JSON.stringify({
+        providers: {
+          "claude-code": {
+            storagePath: baseDir,
+          },
+        },
+      }, null, 2)}\n`,
+      "utf-8"
+    );
+    clearProviderPathCache();
+
+    await assert.rejects(
+      () => updateProviderConfigs(
+        {
+          "claude-code": {
+            storagePath: join(baseDir, "target-projects"),
+          },
+        },
+        env,
+        baseDir,
+        {
+          migrations: {
+            "claude-code": {
+              storagePath: true,
+            },
+          },
+        }
+      ),
+      /源路径过于宽泛或敏感/
+    );
+  } finally {
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
 test("更新 provider 配置时可自动迁移 Codex state db 文件", async () => {
   const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-provider-migrate-statedb-"));
   const configPath = join(baseDir, "config.json");

@@ -133,6 +133,60 @@ test("Claude Code 会从 sessions-index 与 history.jsonl 构建目录型会话�
   }
 });
 
+test("Claude Code 会从带尾部损坏的 sessions-index 中恢复 history-only 会话", async () => {
+  const fixture = await createProviderFixture();
+  const sessionId = "77777777-7777-4777-8777-777777777777";
+  const projectKey = "C--Users-tester-Desktop-code_area-r-bioinfo";
+  const projectDir = join(fixture.storagePath, projectKey);
+  const historyPath = join(fixture.baseDir, "history.jsonl");
+
+  try {
+    await mkdir(projectDir, { recursive: true });
+    const validIndex = JSON.stringify({
+      version: 1,
+      entries: [
+        {
+          sessionId,
+          summary: "可恢复索引标题",
+          firstPrompt: "损坏索引中的首条问题",
+          messageCount: 3,
+          created: "2026-03-01T00:00:00.000Z",
+          modified: "2026-03-02T00:00:00.000Z",
+          projectPath: "C:\\Users\\tester\\Desktop\\code_area\\r-bioinfo",
+          isSidechain: false,
+        },
+      ],
+      originalPath: "C:\\Users\\tester\\Desktop\\code_area\\r-bioinfo",
+    }, null, 2);
+    await writeFile(
+      join(projectDir, "sessions-index.json"),
+      `${validIndex}"isSidechain": false\n    }\n  ]\n}`,
+      "utf-8"
+    );
+    await writeFile(
+      historyPath,
+      [
+        createHistoryLine({
+          display: "history 恢复问题",
+          timestamp: 1_772_000_100_000,
+          project: "C:\\Users\\tester\\Desktop\\code_area\\r-bioinfo",
+          sessionId,
+        }),
+      ].join(""),
+      "utf-8"
+    );
+
+    const conversations = await fixture.provider.list();
+    assert.equal(conversations.length, 1);
+    assert.equal(conversations[0]?.id, `claude-code:${sessionId}`);
+    assert.equal(conversations[0]?.title, "可恢复索引标题");
+    assert.equal(conversations[0]?.contentStatus, "history-only");
+    assert.equal(conversations[0]?.badges?.some((badge) => badge.label === "history 回填"), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("Claude Code 会回填仅存在于 history.jsonl 与 session 目录中的会话", async () => {
   const fixture = await createProviderFixture();
   const sessionId = "33333333-3333-4333-8333-333333333333";

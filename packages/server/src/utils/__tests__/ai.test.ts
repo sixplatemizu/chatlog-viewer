@@ -102,7 +102,7 @@ exec "${process.execPath}" "$SCRIPT_DIR/fake-title-cli.mjs" codex "$@"
   };
 }
 
-async function createFakeOpenCodeEnv(options: { emptyOutput?: boolean } = {}) {
+async function createFakeOpenCodeEnv(options: { emptyOutput?: boolean; invalidProjectDir?: string } = {}) {
   const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-ai-opencode-test-"));
   const binDir = join(baseDir, "bin");
   const configPath = join(baseDir, "config.json");
@@ -126,6 +126,13 @@ if (args.includes("--version")) {
 }
 
 appendFileSync(join(process.cwd(), "opencode.calls.log"), JSON.stringify({ args, cwd: process.cwd() }) + "\\n", "utf8");
+const dirIndex = args.indexOf("--dir");
+const projectDir = dirIndex >= 0 ? args[dirIndex + 1] : undefined;
+const invalidProjectDir = ${JSON.stringify(options.invalidProjectDir ?? null)};
+if (invalidProjectDir && projectDir === invalidProjectDir) {
+  process.stdout.write(JSON.stringify({ type: "step_start", part: { type: "step-start" } }) + "\\n");
+  process.exit(0);
+}
 ${options.emptyOutput ? "process.exit(0);" : "process.stdout.write(JSON.stringify({ type: \"text\", part: { type: \"text\", text: \"OpenCode 标题\" } }) + \"\\n\");\nprocess.exit(0);"}
 `,
     "utf-8"
@@ -259,6 +266,30 @@ test("OpenCode 空输出会返回可诊断错误", async () => {
       }),
       /opencode 未产生输出.*dir=D:\/DownloadFiles\/code_area/
     );
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode 项目目录无有效 text 时会继续尝试无 --dir 模式", async () => {
+  const projectDir = process.cwd();
+  const env = await createFakeOpenCodeEnv({ invalidProjectDir: projectDir });
+
+  try {
+    const result = await generateTitle(SAMPLE_MESSAGES, {
+      priority: ["opencode"],
+      projectDir,
+    });
+
+    assert.equal(result.title, "OpenCode 标题");
+    assert.equal(result.usedCli, "opencode");
+
+    const calls = await readOpenCodeCallLog(env.sessionDir);
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0]?.args.includes("--dir"));
+    assert.equal(calls[0]?.args[calls[0].args.indexOf("--dir") + 1], projectDir);
+    assert.equal(calls[1]?.args.includes("--dir"), false);
   } finally {
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });

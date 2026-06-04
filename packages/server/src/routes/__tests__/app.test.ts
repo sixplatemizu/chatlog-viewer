@@ -43,3 +43,46 @@ test("API 接受本地 Origin 请求", async () => {
   const data = await res.json() as { status: string };
   assert.equal(data.status, "ok");
 });
+
+test("API token 开启后会保护普通接口但放行 health", async () => {
+  const app = createApp([], { apiToken: "secret-token" });
+
+  const healthRes = await app.request("http://localhost/api/health");
+  assert.equal(healthRes.status, 200);
+
+  const blockedRes = await app.request("http://localhost/api/providers");
+  assert.equal(blockedRes.status, 401);
+
+  const allowedRes = await app.request("http://localhost/api/providers", {
+    headers: {
+      "X-Chatlog-Viewer-Token": "secret-token",
+    },
+  });
+  assert.equal(allowedRes.status, 200);
+});
+
+test("API 只接受配置允许的 Origin", async () => {
+  const app = createApp([], { allowedOrigins: ["http://localhost:5173"] });
+
+  const res = await app.request("http://localhost/api/health", {
+    headers: {
+      origin: "http://127.0.0.1:5173",
+    },
+  });
+  assert.equal(res.status, 403);
+});
+
+test("API 对非法 JSON 请求体返回 400", async () => {
+  const app = createApp([]);
+
+  const res = await app.request("http://localhost/api/export", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: "{",
+  });
+
+  assert.equal(res.status, 400);
+  assert.equal((await res.json() as { error: string }).error, "请求 JSON 格式错误");
+});

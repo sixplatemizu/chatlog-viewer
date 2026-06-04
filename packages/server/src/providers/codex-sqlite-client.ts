@@ -1,4 +1,5 @@
 import { createRequire } from "module";
+import { createHash } from "crypto";
 import type BetterSqlite3 from "better-sqlite3";
 import { normalizePath } from "./shared/provider-utils.js";
 
@@ -21,6 +22,7 @@ export interface CodexThreadMetadata {
   modelProvider?: string;
   title?: string;
   firstUserMessage?: string;
+  preview?: string;
 }
 
 export interface ThreadLocationUpdates {
@@ -123,13 +125,30 @@ export class CodexSqliteClient {
     const db = this.getReadDb();
     if (!db) return {};
     try {
+      const columns = this.getTableColumns(db, "threads");
+      if (!columns.has("id")) return {};
+
       const row = db
-        .prepare("SELECT model_provider, title, first_user_message FROM threads WHERE id = ?")
-        .get(sessionId) as { model_provider: string; title: string | null; first_user_message: string | null } | undefined;
+        .prepare(`
+          SELECT
+            ${columns.has("model_provider") ? "model_provider" : "NULL"} AS model_provider,
+            ${columns.has("title") ? "title" : "NULL"} AS title,
+            ${columns.has("first_user_message") ? "first_user_message" : "NULL"} AS first_user_message,
+            ${columns.has("preview") ? "preview" : "NULL"} AS preview
+          FROM threads
+          WHERE id = ?
+        `)
+        .get(sessionId) as {
+          model_provider: string | null;
+          title: string | null;
+          first_user_message: string | null;
+          preview: string | null;
+        } | undefined;
       return {
-        modelProvider: row?.model_provider,
+        modelProvider: row?.model_provider ?? undefined,
         title: row?.title ?? undefined,
         firstUserMessage: row?.first_user_message ?? undefined,
+        preview: row?.preview ?? undefined,
       };
     } catch {
       return {};
@@ -203,6 +222,47 @@ export class CodexSqliteClient {
     return this.listThreads().find((thread) => thread.id === sessionId) ?? null;
   }
 
+  getThreadsSignature(): string | null {
+    const db = this.getReadDb();
+    if (!db) return null;
+
+    try {
+      const columns = this.getTableColumns(db, "threads");
+      if (!columns.has("id")) return null;
+
+      const selectedColumns = [
+        "id",
+        "rollout_path",
+        "created_at",
+        "updated_at",
+        "source",
+        "model_provider",
+        "cwd",
+        "title",
+        "first_user_message",
+        "preview",
+        "archived",
+        "thread_source",
+      ].filter((column) => columns.has(column));
+
+      const rows = db.prepare(`
+        SELECT ${selectedColumns.join(", ")}
+        FROM threads
+        ORDER BY id
+      `).all() as Array<Record<string, unknown>>;
+
+      const hash = createHash("sha1");
+      hash.update(selectedColumns.join("\0"));
+      for (const row of rows) {
+        hash.update("\0");
+        hash.update(JSON.stringify(row));
+      }
+      return hash.digest("hex");
+    } catch {
+      return null;
+    }
+  }
+
   // 级联删除 thread 及其关联表行。仅删除已存在的表/列。
   deleteThread(sessionId: string): boolean {
     let db: BetterSqlite3.Database;
@@ -255,25 +315,48 @@ export class CodexSqliteClient {
   ): void {
     const db = this.getWriteDb({ fileMustExist: true });
     const columns = this.getTableColumns(db, "threads");
+    const shouldUpdateTitle = options?.updateTitleField !== false;
     if (!columns.has("id") || !columns.has("first_user_message")) {
       throw new Error("Codex state db 缺少标题字段，无法写入标题");
     }
-    if (options?.updateTitleField !== false && !columns.has("title")) {
+    if (shouldUpdateTitle && !columns.has("title")) {
       throw new Error("Codex state db 缺少 title 字段，无法写入标题");
     }
 
-    const result = options?.updateTitleField === false
-      ? db.prepare("UPDATE threads SET first_user_message = ? WHERE id = ?").run(title, sessionId)
-      : db.prepare("UPDATE threads SET title = ?, first_user_message = ? WHERE id = ?").run(title, title, sessionId);
+    const assignments: string[] = [];
+    const values: unknown[] = [];
+    if (shouldUpdateTitle) {
+      assignments.push("title = ?");
+      values.push(title);
+    }
+    assignments.push("first_user_message = ?");
+    values.push(title);
+    if (columns.has("preview")) {
+      assignments.push("preview = ?");
+      values.push(title);
+    }
+
+    values.push(sessionId);
+    const result = db.prepare(`UPDATE threads SET ${assignments.join(", ")} WHERE id = ?`).run(...values);
     if (result.changes === 0) {
       throw new Error(`SQLite 中未找到对话: ${sessionId}`);
     }
 
-    const row = options?.updateTitleField === false
-      ? db.prepare("SELECT first_user_message FROM threads WHERE id = ?").get(sessionId) as { title?: string | null; first_user_message: string | null } | undefined
-      : db.prepare("SELECT title, first_user_message FROM threads WHERE id = ?").get(sessionId) as { title?: string | null; first_user_message: string | null } | undefined;
-    const titleMatches = options?.updateTitleField === false || row?.title === title;
-    if (!row || !titleMatches || row.first_user_message !== title) {
+    const row = db.prepare(`
+      SELECT
+        ${columns.has("title") ? "title" : "NULL"} AS title,
+        first_user_message,
+        ${columns.has("preview") ? "preview" : "NULL"} AS preview
+      FROM threads
+      WHERE id = ?
+    `).get(sessionId) as {
+      title?: string | null;
+      first_user_message: string | null;
+      preview?: string | null;
+    } | undefined;
+    const titleMatches = !shouldUpdateTitle || row?.title === title;
+    const previewMatches = !columns.has("preview") || row?.preview === title;
+    if (!row || !titleMatches || row.first_user_message !== title || !previewMatches) {
       throw new Error(`Codex state db 标题写入校验失败: ${sessionId}`);
     }
   }

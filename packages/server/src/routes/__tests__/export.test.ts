@@ -52,6 +52,26 @@ test("export 全部失败时返回 404 和 failures", async () => {
   assert.equal(data.failures.length, 1);
 });
 
+test("export 会拒绝非法请求体字段", async () => {
+  const app = createExportRoutes([]);
+
+  const idsRes = await app.request("http://localhost/export", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: "codex:ok", format: "json" }),
+  });
+  assert.equal(idsRes.status, 400);
+  assert.equal((await idsRes.json() as { error: string }).error, "ids 必须是数组");
+
+  const formatRes = await app.request("http://localhost/export", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: ["codex:ok"], format: "csv" }),
+  });
+  assert.equal(formatRes.status, 400);
+  assert.equal((await formatRes.json() as { error: string }).error, "format 必须是 json 或 markdown");
+});
+
 test("export 部分失败时返回成功内容和 meta 头", async () => {
   const app = createExportRoutes([
     createProvider({

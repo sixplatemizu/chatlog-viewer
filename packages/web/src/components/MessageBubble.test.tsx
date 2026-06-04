@@ -3,6 +3,32 @@ import { describe, expect, it, vi } from "vitest";
 import { MessageBubble } from "./MessageBubble";
 
 describe("MessageBubble", () => {
+  it("用户与助手消息使用不同背景色", () => {
+    const { rerender } = render(
+      <MessageBubble
+        dark={false}
+        message={{
+          role: "user",
+          content: "用户消息",
+        }}
+      />
+    );
+
+    expect(screen.getByText("用户").closest("[data-message-role='user']")).toHaveClass("bg-sky-50/80");
+
+    rerender(
+      <MessageBubble
+        dark={false}
+        message={{
+          role: "assistant",
+          content: "助手消息",
+        }}
+      />
+    );
+
+    expect(screen.getByText("助手").closest("[data-message-role='assistant']")).toHaveClass("bg-emerald-50/70");
+  });
+
   it("超长消息默认折叠，展开后才渲染全文", () => {
     const content = Array.from({ length: 260 }, (_, index) => `line-${index + 1}`).join("\n");
 

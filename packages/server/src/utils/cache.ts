@@ -40,6 +40,7 @@ interface IndexedListCacheEntry {
   searchVersion: number;
   sourceSignature?: string;
   detailedItems?: IndexedCacheItem[];
+  detailedItemsIncludeSearchData?: boolean;
 }
 
 export interface IndexedCacheItem {
@@ -63,6 +64,11 @@ interface IndexedListCacheWriteOptions {
   searchReady?: boolean;
   searchVersion?: number;
   sourceSignature?: string;
+  writeSearchData?: boolean;
+}
+
+interface IndexedCacheSnapshotOptions {
+  includeSearchData?: boolean;
 }
 
 // 基于文件 mtime 的元数据缓存
@@ -113,7 +119,7 @@ const memoryIndexedListCache = new LRUMap<string, IndexedListCacheEntry>(500);
 let db: BetterSqlite3.Database | null = null;
 let dbPath: string | null = null;
 let lastPruneAt = 0;
-let lastVacuumAt = 0;
+let lastVacuumAt = Date.now();
 let supportsConversationFtsSearch = false;
 let supportsChunkFtsSearch = false;
 let storeDirOverride: string | null = null;
@@ -134,7 +140,7 @@ function resetCacheState(): void {
   supportsConversationFtsSearch = false;
   supportsChunkFtsSearch = false;
   lastPruneAt = 0;
-  lastVacuumAt = 0;
+  lastVacuumAt = Date.now();
 
   if (db) {
     try {
@@ -636,7 +642,9 @@ function isUsableIndexedListCache(
   sourceSignature: string | undefined,
   options?: IndexedListCacheReadOptions
 ): boolean {
-  if (now - updatedAt > ttlMs) {
+  const hasSourceSignature = options?.sourceSignature !== undefined;
+
+  if (!hasSourceSignature && now - updatedAt > ttlMs) {
     return false;
   }
 
@@ -648,7 +656,7 @@ function isUsableIndexedListCache(
     return false;
   }
 
-  if (options?.sourceSignature !== undefined && sourceSignature !== options.sourceSignature) {
+  if (hasSourceSignature && sourceSignature !== options.sourceSignature) {
     return false;
   }
 
@@ -756,13 +764,28 @@ export function getIndexedListSnapshot(cacheKey: string): ConversationMeta[] | n
   }
 }
 
-export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | null {
+export function getIndexedCacheSnapshot(
+  cacheKey: string,
+  options: IndexedCacheSnapshotOptions = {}
+): IndexedCacheItem[] | null {
+  const includeSearchData = options.includeSearchData ?? true;
   const memoryEntry = memoryIndexedListCache.get(cacheKey);
-  if (memoryEntry?.detailedItems && memoryEntry.searchVersion === SEARCH_INDEX_VERSION) {
+  if (
+    includeSearchData
+    && memoryEntry?.detailedItems
+    && memoryEntry.detailedItemsIncludeSearchData
+    && memoryEntry.searchVersion === SEARCH_INDEX_VERSION
+  ) {
     return memoryEntry.detailedItems;
+  }
+  if (!includeSearchData && memoryEntry) {
+    return memoryEntry.items.map((meta) => ({ meta }));
   }
 
   const baseItems = getIndexedListSnapshot(cacheKey);
+  if (!includeSearchData && baseItems) {
+    return baseItems.map((meta) => ({ meta }));
+  }
 
   try {
     const database = getDb();
@@ -806,22 +829,24 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
       meta_json: string | null;
       search_version: number;
     }>;
-    const chunkRows = database
-      .prepare(`
-        SELECT
-          conversation_id,
-          chunk_index,
-          content
-        FROM conversation_search_chunk
-        WHERE cache_key = ?
-          AND search_version = ?
-        ORDER BY conversation_id ASC, chunk_index ASC
-      `)
-      .all(cacheKey, SEARCH_INDEX_VERSION) as Array<{
-      conversation_id: string;
-      chunk_index: number;
-      content: string;
-    }>;
+    const chunkRows = includeSearchData
+      ? database
+          .prepare(`
+            SELECT
+              conversation_id,
+              chunk_index,
+              content
+            FROM conversation_search_chunk
+            WHERE cache_key = ?
+              AND search_version = ?
+            ORDER BY conversation_id ASC, chunk_index ASC
+          `)
+          .all(cacheKey, SEARCH_INDEX_VERSION) as Array<{
+          conversation_id: string;
+          chunk_index: number;
+          content: string;
+        }>
+      : [];
 
     if (rows.length === 0) {
       return baseItems?.map((meta) => ({ meta })) ?? null;
@@ -836,15 +861,16 @@ export function getIndexedCacheSnapshot(cacheKey: string): IndexedCacheItem[] | 
 
     const detailedItems = rows.map((row) => ({
       meta: buildConversationMetaFromIndexRow(row),
-      searchText: row.search_text ?? undefined,
-      searchChunks: chunksByConversationId.get(row.id),
+      searchText: includeSearchData ? row.search_text ?? undefined : undefined,
+      searchChunks: includeSearchData ? chunksByConversationId.get(row.id) : undefined,
     }));
 
     const refreshedEntry = memoryIndexedListCache.get(cacheKey);
-    if (refreshedEntry) {
+    if (refreshedEntry && includeSearchData) {
       memoryIndexedListCache.set(cacheKey, {
         ...refreshedEntry,
         detailedItems,
+        detailedItemsIncludeSearchData: true,
       });
     }
 
@@ -911,6 +937,7 @@ export function setIndexedListCache(
   const searchReady = options?.searchReady ?? true;
   const searchVersion = options?.searchVersion ?? SEARCH_INDEX_VERSION;
   const sourceSignature = options?.sourceSignature;
+  const writeSearchData = options?.writeSearchData ?? true;
   const normalizedDetailedItems = items.map((item) => ("meta" in item ? item : { meta: item }));
   const normalizedItems = normalizedDetailedItems.map((item) => item.meta);
   memoryIndexedListCache.set(cacheKey, {
@@ -920,6 +947,7 @@ export function setIndexedListCache(
     searchVersion,
     sourceSignature,
     detailedItems: normalizedDetailedItems,
+    detailedItemsIncludeSearchData: writeSearchData,
   });
 
   try {
@@ -1031,21 +1059,23 @@ export function setIndexedListCache(
         meta_json: string | null;
         search_version: number;
       }>;
-      const existingChunkRows = database.prepare(
-        `SELECT
-           conversation_id,
-           chunk_index,
-           content,
-           search_version
-         FROM conversation_search_chunk
-         WHERE cache_key = ?
-         ORDER BY conversation_id ASC, chunk_index ASC`
-      ).all(cacheKey) as Array<{
-        conversation_id: string;
-        chunk_index: number;
-        content: string;
-        search_version: number;
-      }>;
+      const existingChunkRows = writeSearchData
+        ? database.prepare(
+            `SELECT
+               conversation_id,
+               chunk_index,
+               content,
+               search_version
+             FROM conversation_search_chunk
+             WHERE cache_key = ?
+             ORDER BY conversation_id ASC, chunk_index ASC`
+          ).all(cacheKey) as Array<{
+            conversation_id: string;
+            chunk_index: number;
+            content: string;
+            search_version: number;
+          }>
+        : [];
 
       const existingChunksById = new Map<string, string[]>();
       for (const row of existingChunkRows) {
@@ -1059,8 +1089,8 @@ export function setIndexedListCache(
           row.id,
           createIndexedItemSignature({
             meta: buildConversationMetaFromIndexRow(row),
-            searchText: row.search_text ?? undefined,
-            searchChunks: existingChunksById.get(row.id),
+            searchText: writeSearchData ? row.search_text ?? undefined : undefined,
+            searchChunks: writeSearchData ? existingChunksById.get(row.id) : undefined,
             searchVersion: row.search_version,
           }),
         ])
@@ -1087,7 +1117,9 @@ export function setIndexedListCache(
       for (const item of normalizedDetailedItems) {
         const meta = item.meta;
         const nextSignature = createIndexedItemSignature({
-          ...item,
+          meta,
+          searchText: writeSearchData ? item.searchText : undefined,
+          searchChunks: writeSearchData ? item.searchChunks : undefined,
           searchVersion,
         });
 
@@ -1099,7 +1131,7 @@ export function setIndexedListCache(
           meta.id,
           meta.provider,
           meta.title,
-          item.searchText ?? null,
+          writeSearchData ? item.searchText ?? null : null,
           meta.project,
           meta.projectKey,
           meta.projectId ?? null,
@@ -1116,16 +1148,18 @@ export function setIndexedListCache(
         );
 
         deleteConversationChunks.run(meta.id);
-        item.searchChunks?.forEach((chunk, index) => {
-          upsertSearchChunk.run(
-            meta.id,
-            index,
-            chunk,
-            cacheKey,
-            updatedAt,
-            searchVersion
-          );
-        });
+        if (writeSearchData) {
+          item.searchChunks?.forEach((chunk, index) => {
+            upsertSearchChunk.run(
+              meta.id,
+              index,
+              chunk,
+              cacheKey,
+              updatedAt,
+              searchVersion
+            );
+          });
+        }
       }
     })();
     pruneCacheStorage(database);

@@ -172,8 +172,8 @@ function ProviderCard({
     provider.stateDbSource,
     draft.stateDbPath
   );
-  const migrateStorageChecked = canMigrateStorage && migration.storagePath !== false;
-  const migrateStateDbChecked = canMigrateStateDb && migration.stateDbPath !== false;
+  const migrateStorageChecked = canMigrateStorage && migration.storagePath === true;
+  const migrateStateDbChecked = canMigrateStateDb && migration.stateDbPath === true;
 
   return (
     <div className="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800/70">
@@ -212,7 +212,7 @@ function ProviderCard({
                 onChange={(e) => onToggleMigration(provider.name, "storagePath", e.target.checked)}
                 className="mt-0.5 h-3.5 w-3.5 rounded accent-blue-500"
               />
-              <span>保存时自动迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。</span>
+              <span>勾选后会在保存时迁移当前 Storage 目录内容到新路径，不覆盖目标路径中的同名文件。</span>
             </label>
           )}
         </div>
@@ -246,7 +246,7 @@ function ProviderCard({
                     onChange={(e) => onToggleMigration(provider.name, "stateDbPath", e.target.checked)}
                     className="mt-0.5 h-3.5 w-3.5 rounded accent-blue-500"
                   />
-                  <span>保存时自动迁移当前 State DB 文件到新路径，避免路径切换后元数据丢失。</span>
+                  <span>勾选后会在保存时迁移当前 State DB 文件到新路径，避免路径切换后元数据丢失。</span>
                 </label>
               )}
             </div>
@@ -659,7 +659,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
 
           if (
             shouldOfferMigration(provider.storagePath, provider.storageExists, provider.storageSource, draft.storagePath)
-            && migrationDraft.storagePath !== false
+            && migrationDraft.storagePath === true
           ) {
             nextSelection.storagePath = true;
           }
@@ -667,7 +667,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
           if (
             provider.stateDbPath !== undefined
             && shouldOfferMigration(provider.stateDbPath, provider.stateDbExists, provider.stateDbSource, draft.stateDbPath)
-            && migrationDraft.stateDbPath !== false
+            && migrationDraft.stateDbPath === true
           ) {
             nextSelection.stateDbPath = true;
           }

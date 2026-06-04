@@ -1,5 +1,16 @@
 import { useMemo, useState, useEffect, useRef } from "react";
-import { Search, SlidersHorizontal, Download, Trash2, CheckSquare, Sparkles, ArrowRightLeft, FolderOpen } from "lucide-react";
+import {
+  Search,
+  SlidersHorizontal,
+  Download,
+  Trash2,
+  CheckSquare,
+  Sparkles,
+  ArrowRightLeft,
+  FolderOpen,
+  ChevronDown,
+  Loader2,
+} from "lucide-react";
 import type { ProviderInfo, ConversationMeta } from "../lib/api";
 import { ConversationList } from "./ConversationList";
 
@@ -23,6 +34,9 @@ interface SidebarProps {
   sort: string;
   onSortChange: (value: string) => void;
   loading: boolean;
+  loadingMore?: boolean;
+  listTruncated?: boolean;
+  onLoadMore?: () => void | Promise<unknown>;
   total: number;
   providerCounts: Record<string, number>;
   selectedIds: Set<string>;
@@ -63,6 +77,9 @@ export function Sidebar({
   sort,
   onSortChange,
   loading,
+  loadingMore = false,
+  listTruncated = false,
+  onLoadMore = () => {},
   total,
   providerCounts,
   selectedIds,
@@ -494,9 +511,29 @@ export function Sidebar({
         </div>
       ) : (
         <div className="p-2 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
-          <div className="text-xs text-gray-500 dark:text-gray-400 text-center">
-            {footerText}
-          </div>
+          {listTruncated ? (
+            <div className="flex flex-col items-center gap-2 text-center">
+              <div className="text-xs text-gray-500 dark:text-gray-400">
+                {footerText}，已加载 {conversations.length} 条
+              </div>
+              <button
+                onClick={() => void onLoadMore()}
+                disabled={loadingMore}
+                className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-2.5 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600"
+              >
+                {loadingMore ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                )}
+                {loadingMore ? "加载中" : "加载更多"}
+              </button>
+            </div>
+          ) : (
+            <div className="text-xs text-gray-500 dark:text-gray-400 text-center">
+              {footerText}
+            </div>
+          )}
         </div>
       )}
 

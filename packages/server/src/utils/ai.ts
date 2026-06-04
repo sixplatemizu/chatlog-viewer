@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
-import { access, mkdir, rm, writeFile } from "fs/promises";
-import { dirname, join } from "path";
+import { accessSync, constants } from "fs";
+import { access, mkdir, rm, stat, writeFile } from "fs/promises";
+import { delimiter, dirname, isAbsolute, join } from "path";
 import type { Message } from "../providers/types.js";
 import type { TitleGenerationCli } from "./provider-paths.js";
 import { getProviderConfigPath } from "./provider-paths.js";
@@ -58,6 +59,56 @@ const RESUME_MISS_PATTERNS = [
   /cannot (resume|continue)/i,
   /can't (resume|continue)/i,
 ];
+const executablePathCache = new Map<string, string>();
+
+function resolveExecutablePath(command: string): string {
+  if (process.platform !== "win32" || isAbsolute(command) || command.includes("/") || command.includes("\\")) {
+    return command;
+  }
+
+  const cacheKey = `${command}\0${process.env.PATH ?? ""}\0${process.env.PATHEXT ?? ""}`;
+  const cached = executablePathCache.get(cacheKey);
+  if (cached) return cached;
+
+  const pathDirs = (process.env.PATH || "")
+    .split(delimiter)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const pathExts = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const commandCandidates = /\.[^\\/]+$/.test(command)
+    ? [command]
+    : [...pathExts.map((ext) => `${command}${ext.toLowerCase()}`), ...pathExts.map((ext) => `${command}${ext.toUpperCase()}`), command];
+
+  for (const dir of pathDirs) {
+    for (const candidate of commandCandidates) {
+      const fullPath = join(dir, candidate);
+      try {
+        accessSync(fullPath, constants.F_OK);
+        executablePathCache.set(cacheKey, fullPath);
+        return fullPath;
+      } catch {
+        // 继续查找 PATH
+      }
+    }
+  }
+
+  return command;
+}
+
+function resolveSpawnInvocation(command: string, args: string[]): { command: string; args: string[] } {
+  const executablePath = resolveExecutablePath(command);
+  if (process.platform !== "win32" || !/\.(cmd|bat)$/i.test(executablePath)) {
+    return { command: executablePath, args };
+  }
+
+  return {
+    command: process.env.ComSpec || "cmd.exe",
+    args: ["/d", "/c", executablePath, ...args.map((arg) => arg.replace(/%/g, "%%"))],
+  };
+}
 
 async function detectAvailableCli(): Promise<CliTool[]> {
   const available: CliTool[] = [];
@@ -76,10 +127,11 @@ async function detectAvailableCli(): Promise<CliTool[]> {
 
 async function checkCliHealth(tool: CliTool): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
-    const child = spawn(tool.command, tool.healthcheckArgs, {
+    const invocation = resolveSpawnInvocation(tool.command, tool.healthcheckArgs);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: process.cwd(),
       env: { ...process.env },
-      shell: process.platform === "win32",
+      shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -325,6 +377,18 @@ function addProjectDirArg(tool: CliTool, args: string[], projectDir?: string): s
   return [command, tool.projectDirArg, normalizedProjectDir, ...rest];
 }
 
+async function resolveCliProjectDir(projectDir?: string): Promise<string | undefined> {
+  const normalizedProjectDir = projectDir?.trim();
+  if (!normalizedProjectDir) return undefined;
+
+  try {
+    const projectDirStat = await stat(normalizedProjectDir);
+    return projectDirStat.isDirectory() ? normalizedProjectDir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function executeCli(
   tool: CliTool,
   args: string[],
@@ -333,32 +397,23 @@ async function executeCli(
   options: { projectDir?: string } = {}
 ): Promise<string> {
   const promptViaArgs = tool.promptMode === "args";
-  const isWindowsShell = process.platform === "win32";
   const argsWithProjectDir = addProjectDirArg(tool, args, options.projectDir);
   const resolvedArgs = promptViaArgs
     ? argsWithProjectDir.map((arg) => {
         if (arg !== "__PROMPT__") return arg;
-        const sanitized = prompt.replace(/\n/g, "  ").replace(/[&|<>^%]/g, " ");
-        if (!isWindowsShell) {
-          // Linux/macOS 下 spawn 用 execve，args 已是独立元素，不需要外层引号
-          return sanitized;
-        }
-        // Windows 下 shell: true 经过 cmd.exe，含空格的 arg 需要双引号包裹；内部 " 用 "" 转义
-        return `"${sanitized.replace(/"/g, '""')}"`;
+        return prompt.replace(/\s+/g, " ").trim();
       })
     : argsWithProjectDir;
 
-  // 调试日志：脱敏 prompt，仅打印长度 + 摘要前 80 字符
-  const promptPreview = prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt;
   console.log(`[AI] 执行 ${tool.name} (prompt ${prompt.length} chars, mode=${promptViaArgs ? "args" : "stdin"})`);
-  console.debug(`[AI] ${tool.name} prompt preview: ${promptPreview.replace(/\n/g, " ")}`);
-  console.debug(`[AI] ${tool.name} cmd: ${tool.command} ${resolvedArgs.join(" ")}`);
+  console.debug(`[AI] ${tool.name} argv count=${resolvedArgs.length}`);
 
   return await new Promise<string>((resolve, reject) => {
-    const child = spawn(tool.command, resolvedArgs, {
+    const invocation = resolveSpawnInvocation(tool.command, resolvedArgs);
+    const child = spawn(invocation.command, invocation.args, {
       cwd: workDir,
       env: { ...process.env },
-      shell: isWindowsShell,
+      shell: false,
       stdio: promptViaArgs ? ["ignore", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -419,18 +474,27 @@ async function runCliTool(
   const workDir = await ensureCliSessionDir(tool.name);
   const allowReuseSession = options?.reuseSession ?? false;
   const hasSession = allowReuseSession ? await hasPersistedSession(tool.name) : false;
-  const projectDir = tool.projectDirArg ? options?.projectDir?.trim() || process.cwd() : undefined;
-  const fallbackProjectDir = tool.name === "opencode" && projectDir
-    && normalizeProjectDirForCompare(projectDir) !== normalizeProjectDirForCompare(process.cwd())
-    ? process.cwd()
-    : undefined;
+  const requestedProjectDir = tool.projectDirArg ? options?.projectDir?.trim() || process.cwd() : undefined;
+  const projectDir = await resolveCliProjectDir(requestedProjectDir) ?? (tool.projectDirArg ? process.cwd() : undefined);
+  const opencodeFallbackProjectDirs = tool.name === "opencode"
+    ? [process.cwd(), undefined].filter((candidate, index, candidates) => {
+        if (candidate && projectDir && normalizeProjectDirForCompare(candidate) === normalizeProjectDirForCompare(projectDir)) {
+          return false;
+        }
+        return candidates.findIndex((item) => (
+          item === undefined && candidate === undefined
+            ? true
+            : !!item && !!candidate && normalizeProjectDirForCompare(item) === normalizeProjectDirForCompare(candidate)
+        )) === index;
+      })
+    : [];
 
   const runWithOptionalDirFallback = async (
     args: string[],
     mode: CliRunMode
   ): Promise<{ stdout: string; mode: CliRunMode }> => {
     const stdout = await executeCli(tool, args, prompt, workDir, { projectDir });
-    if (!fallbackProjectDir || tool.name !== "opencode") {
+    if (tool.name !== "opencode") {
       return { stdout, mode };
     }
 
@@ -438,16 +502,21 @@ async function runCliTool(
       return { stdout, mode };
     }
 
-    console.warn(`[AI] ${tool.name} 在 dir=${projectDir} 下未产生有效标题，回退到当前工作目录 ${fallbackProjectDir}`);
-    const fallbackStdout = await executeCli(tool, args, prompt, workDir, { projectDir: fallbackProjectDir });
-    if (extractCleanOutput(fallbackStdout).trim().length === 0) {
-      throw new Error(`${tool.name} 在 dir=${projectDir} 和 dir=${fallbackProjectDir} 下都未产生有效输出`);
+    const failedDirs = [projectDir ? `dir=${projectDir}` : "无 --dir"];
+    for (const fallbackProjectDir of opencodeFallbackProjectDirs) {
+      const fallbackLabel = fallbackProjectDir ? `dir=${fallbackProjectDir}` : "无 --dir";
+      console.warn(`[AI] ${tool.name} 在 ${failedDirs[failedDirs.length - 1]} 下未产生有效标题，回退到 ${fallbackLabel}`);
+      const fallbackStdout = await executeCli(tool, args, prompt, workDir, { projectDir: fallbackProjectDir });
+      if (extractCleanOutput(fallbackStdout).trim().length > 0) {
+        return {
+          stdout: fallbackStdout,
+          mode: mode === "resume" ? "resume-fallback-dir" : "fresh-fallback-dir",
+        };
+      }
+      failedDirs.push(fallbackLabel);
     }
 
-    return {
-      stdout: fallbackStdout,
-      mode: mode === "resume" ? "resume-fallback-dir" : "fresh-fallback-dir",
-    };
+    throw new Error(`${tool.name} 在 ${failedDirs.join("、")} 下都未产生有效输出`);
   };
 
   if (hasSession && tool.resumeArgs) {
@@ -506,7 +575,6 @@ export async function generateTitle(
         projectDir: options?.projectDir,
       });
       console.log(`[AI] 调用 ${tool.name} (${result.mode})`);
-      console.log(`[AI] ${tool.name} 原始输出(${result.stdout.length} 字):`, JSON.stringify(result.stdout.slice(0, 300)));
       const title = extractCleanOutput(result.stdout);
       console.log(`[AI] ${tool.name} 提取标题: "${title}"`);
       if (title && title.length > 0 && title.length < 100) {

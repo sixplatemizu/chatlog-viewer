@@ -9,10 +9,17 @@ import { CodexProvider } from "./providers/codex.js";
 import { IFlowProvider } from "./providers/iflow.js";
 import { OpenCodeProvider } from "./providers/opencode.js";
 import type { ConversationProvider } from "./providers/types.js";
+import { API_TOKEN_HEADER } from "./utils/api-token.js";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const DEFAULT_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
 
 export const DEFAULT_SERVER_HOSTNAME = "127.0.0.1";
+
+export interface CreateAppOptions {
+  apiToken?: string;
+  allowedOrigins?: string[];
+}
 
 function normalizeHostHeader(host: string): string | null {
   const trimmed = host.trim().toLowerCase();
@@ -34,13 +41,44 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 export function isAllowedOrigin(origin: string): boolean {
+  return isAllowedOriginForList(origin, getAllowedOriginsFromEnv());
+}
+
+function normalizeOrigin(origin: string): string | null {
   try {
     const url = new URL(origin);
-    return (url.protocol === "http:" || url.protocol === "https:")
-      && LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url.origin.toLowerCase();
   } catch {
-    return false;
+    return null;
   }
+}
+
+function getAllowedOriginsFromEnv(): string[] {
+  const configured = process.env.CHATLOG_VIEWER_ALLOWED_ORIGINS?.trim();
+  if (!configured) return DEFAULT_ALLOWED_ORIGINS;
+  return configured
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+function buildAllowedOriginSet(origins: string[]): Set<string> {
+  return new Set(
+    origins
+      .map((origin) => normalizeOrigin(origin))
+      .filter((origin): origin is string => !!origin)
+  );
+}
+
+function isAllowedOriginForList(origin: string, allowedOrigins: string[]): boolean {
+  const normalized = normalizeOrigin(origin);
+  return normalized !== null && buildAllowedOriginSet(allowedOrigins).has(normalized);
+}
+
+function isAllowedOriginInSet(origin: string, allowedOriginSet: Set<string>): boolean {
+  const normalized = normalizeOrigin(origin);
+  return normalized !== null && allowedOriginSet.has(normalized);
 }
 
 export function createDefaultProviders(): ConversationProvider[] {
@@ -52,8 +90,22 @@ export function createDefaultProviders(): ConversationProvider[] {
   ];
 }
 
-export function createApp(providers: ConversationProvider[] = createDefaultProviders()) {
+export function createApp(
+  providers: ConversationProvider[] = createDefaultProviders(),
+  options: CreateAppOptions = {}
+) {
   const app = new Hono();
+  const allowedOrigins = options.allowedOrigins ?? getAllowedOriginsFromEnv();
+  const allowedOriginSet = buildAllowedOriginSet(allowedOrigins);
+  const apiToken = options.apiToken?.trim();
+
+  app.onError((error, c) => {
+    if (error instanceof SyntaxError) {
+      return c.json({ error: "请求 JSON 格式错误" }, 400);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message || "服务器内部错误" }, 500);
+  });
 
   app.use("*", logger());
 
@@ -64,17 +116,26 @@ export function createApp(providers: ConversationProvider[] = createDefaultProvi
     }
 
     const origin = c.req.header("origin");
-    if (origin && !isAllowedOrigin(origin)) {
+    if (origin && !isAllowedOriginInSet(origin, allowedOriginSet)) {
       return c.json({ error: "仅允许来自本地页面的请求" }, 403);
+    }
+
+    if (
+      apiToken
+      && c.req.method !== "OPTIONS"
+      && c.req.path !== "/api/health"
+      && c.req.header(API_TOKEN_HEADER) !== apiToken
+    ) {
+      return c.json({ error: "缺少或无效的 API token" }, 401);
     }
 
     await next();
   });
 
   app.use("/api/*", cors({
-    origin: (origin) => (origin && isAllowedOrigin(origin) ? origin : ""),
+    origin: (origin) => (origin && isAllowedOriginInSet(origin, allowedOriginSet) ? origin : ""),
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowHeaders: ["Content-Type"],
+    allowHeaders: ["Content-Type", API_TOKEN_HEADER],
   }));
 
   app.route("/api", createConversationRoutes(providers));

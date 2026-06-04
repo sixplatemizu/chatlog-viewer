@@ -88,7 +88,7 @@ describe("useConversations", () => {
     let fetchCount = 0;
     mockFetchConversations.mockImplementation(async () => {
       fetchCount += 1;
-      return fetchCount >= 3 ? filteredResponse : initialResponse;
+      return fetchCount >= 2 ? filteredResponse : initialResponse;
     });
 
     const { result } = renderHook(() => useConversations());
@@ -110,6 +110,77 @@ describe("useConversations", () => {
     expect([...result.current.selectedIds]).toEqual(["codex:2"]);
     expect(result.current.partialSearch).toBe(true);
     expect(result.current.searchWarnings).toEqual(filteredResponse.warnings);
+  });
+
+  it("初始化时等待 provider 数据后只加载一次列表", async () => {
+    mockFetchConversations.mockResolvedValue({
+      total: 1,
+      conversations: [createConversation("codex:1")],
+      partialSearch: false,
+      warnings: [],
+    } satisfies ConversationListResponse);
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.conversations).toHaveLength(1);
+    });
+
+    expect(mockFetchProviders).toHaveBeenCalledTimes(1);
+    expect(mockFetchCodexProviders).toHaveBeenCalledTimes(1);
+    expect(mockFetchConversations).toHaveBeenCalledTimes(1);
+    expect(mockFetchConversations).toHaveBeenCalledWith(expect.objectContaining({
+      provider: "codex",
+      limit: 5000,
+      offset: 0,
+    }));
+  });
+
+  it("列表被截断时可按 nextOffset 加载下一页", async () => {
+    const firstPage: ConversationListResponse = {
+      total: 3,
+      conversations: [createConversation("codex:1"), createConversation("codex:2")],
+      listTruncated: true,
+      nextOffset: 2,
+      partialSearch: false,
+      warnings: [],
+    };
+    const secondPage: ConversationListResponse = {
+      total: 3,
+      conversations: [createConversation("codex:3")],
+      listTruncated: false,
+      partialSearch: false,
+      warnings: [],
+    };
+
+    mockFetchConversations.mockImplementation(async (params: { offset?: number }) => (
+      params.offset === 2 ? secondPage : firstPage
+    ));
+
+    const { result } = renderHook(() => useConversations());
+
+    await waitFor(() => {
+      expect(result.current.conversations.map((item) => item.id)).toEqual(["codex:1", "codex:2"]);
+    });
+
+    expect(result.current.listTruncated).toBe(true);
+
+    await act(async () => {
+      await result.current.loadMoreConversations();
+    });
+
+    await waitFor(() => {
+      expect(result.current.conversations.map((item) => item.id)).toEqual([
+        "codex:1",
+        "codex:2",
+        "codex:3",
+      ]);
+    });
+    expect(result.current.listTruncated).toBe(false);
+    expect(mockFetchConversations).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 5000,
+      offset: 2,
+    }));
   });
 
   it("标题修改会先本地更新，不再同步阻塞整窗刷新", async () => {

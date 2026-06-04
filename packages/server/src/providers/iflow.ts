@@ -257,17 +257,22 @@ export class IFlowProvider implements ConversationProvider {
       return;
     }
 
-    const task = this.listInternal({
-      eagerSearchIndex: true,
-      allowBackground: false,
-    })
-      .then(() => undefined)
-      .catch((error) => {
-        logProviderError("conversations.index.background", this.name, error);
-      })
-      .finally(() => {
-        this.backgroundRefreshes.delete(cacheKey);
-      });
+    const task = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        this.listInternal({
+          eagerSearchIndex: true,
+          allowBackground: false,
+        })
+          .then(() => undefined)
+          .catch((error) => {
+            logProviderError("conversations.index.background", this.name, error);
+          })
+          .finally(() => {
+            this.backgroundRefreshes.delete(cacheKey);
+            resolve();
+          });
+      }, 250);
+    });
 
     this.backgroundRefreshes.set(cacheKey, task);
   }
@@ -289,7 +294,9 @@ export class IFlowProvider implements ConversationProvider {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    const previousItems = getIndexedCacheSnapshot(cacheKey) ?? [];
+    const previousItems = getIndexedCacheSnapshot(cacheKey, {
+      includeSearchData: options.eagerSearchIndex,
+    }) ?? [];
     const previousByFilePath = new Map(previousItems.map((item) => [item.meta.filePath, item]));
 
     const results: IndexedCacheItem[] = [];
@@ -325,7 +332,11 @@ export class IFlowProvider implements ConversationProvider {
     const normalizedResults = applyProjectDisplayPathHints(results);
 
     const searchReady = options.eagerSearchIndex || filesToRefresh.length === 0;
-    setIndexedListCache(cacheKey, normalizedResults, { searchReady, sourceSignature });
+    setIndexedListCache(cacheKey, normalizedResults, {
+      searchReady,
+      sourceSignature,
+      writeSearchData: options.eagerSearchIndex || searchReady,
+    });
 
     if (!searchReady && options.allowBackground) {
       this.scheduleBackgroundIndexRefresh();
