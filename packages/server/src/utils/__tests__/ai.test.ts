@@ -233,9 +233,11 @@ test("标题提取会拒绝 CLI 状态占位输出", () => {
 
 test("OpenCode 生成标题时会显式传入项目目录", async () => {
   const env = await createFakeOpenCodeEnv();
-  const projectDir = "D:/DownloadFiles/code_area";
+  const projectDir = join(env.baseDir, "project");
 
   try {
+    await mkdir(projectDir);
+
     const result = await generateTitle(SAMPLE_MESSAGES, {
       priority: ["opencode"],
       projectDir,
@@ -256,15 +258,22 @@ test("OpenCode 生成标题时会显式传入项目目录", async () => {
 
 test("OpenCode 空输出会返回可诊断错误", async () => {
   const env = await createFakeOpenCodeEnv({ emptyOutput: true });
-  const projectDir = "D:/DownloadFiles/code_area";
+  const projectDir = join(env.baseDir, "project");
 
   try {
+    await mkdir(projectDir);
+
     await assert.rejects(
       generateTitle(SAMPLE_MESSAGES, {
         priority: ["opencode"],
         projectDir,
       }),
-      /opencode 未产生输出.*dir=D:\/DownloadFiles\/code_area/
+      (error) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /opencode 未产生输出/);
+        assert.ok(error.message.includes(`dir=${projectDir}`));
+        return true;
+      }
     );
   } finally {
     env.restoreEnv();
