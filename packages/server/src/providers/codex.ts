@@ -24,7 +24,7 @@ import {
   type IndexedCacheItem,
 } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderConfigPath, getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderPaths } from "../utils/provider-paths.js";
 import { isNotFoundError } from "../utils/errors.js";
 import {
   collectGlobFileStates,
@@ -64,6 +64,21 @@ import {
   type CodexThreadRow,
 } from "./codex-sqlite-client.js";
 import { upsertCodexSessionIndexThreadName } from "./codex-session-index.js";
+import {
+  buildCodexTitleFallbackBadges,
+  buildCodexTitleGenerationBadges,
+  buildCodexTitleGenerationHint,
+  hasCodexTitleFallbackBadge,
+  hasCodexTitleGenerationBadge,
+  hasUsableCodexTitle,
+  isCodexNativeOriginalWeakTitle,
+  isCodexTitleGenerationProject,
+  isWeakCodexTitle,
+  mergeCodexBadges,
+  normalizeCodexDisplayText,
+  pickCodexConversationTitle,
+  pickUsableCodexTitle,
+} from "./codex-title.js";
 import { normalizePath, canonicalizeProjectPath, canonicalizeProjectPathResolvingSymlinks, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
 
 interface CodexEntry {
@@ -90,9 +105,6 @@ interface CodexMessageIdentityCacheEntry {
 
 const CODEX_STATE_ONLY_PREFIX = "codex-state://";
 const CODEX_LIST_SOURCE_VERSION = "codex-list-v12-fork-explicit-title";
-const CODEX_TITLE_FALLBACK_BADGE_LABEL = "标题回退";
-const CODEX_TITLE_GENERATION_BADGE_LABEL = "标题生成";
-const CODEX_WEAK_TITLE_SET = new Set(["hi", "hello", "hey", "你好", "您好", "嗨", "哈喽"]);
 const codexMessageIdentityCache = new Map<string, CodexMessageIdentityCacheEntry>();
 
 export function clearCodexMessageIdentityCacheForTests(): void {
@@ -120,126 +132,9 @@ function getDisplayableCodexResponseContent(entry: CodexEntry): string | null {
   return content;
 }
 
-function normalizeCodexDisplayText(value?: string | null): string | undefined {
-  const normalized = value?.replace(/<[^>]+>/g, "").trim();
-  return normalized ? normalized : undefined;
-}
-
-function normalizeCodexPathForCompare(value?: string | null): string {
-  return normalizePath(value ?? "").replace(/^\/\/\?\//, "").toLowerCase();
-}
-
-function getCodexTitleSessionProjectPath(): string {
-  return join(dirname(getProviderConfigPath()), "ai-title-sessions", "codex");
-}
-
-function isCodexTitleGenerationProject(value?: string | null): boolean {
-  const normalized = normalizeCodexPathForCompare(value);
-  return !!normalized && normalized === normalizeCodexPathForCompare(getCodexTitleSessionProjectPath());
-}
-
-function isWeakCodexTitle(value?: string | null): boolean {
-  const normalized = normalizeCodexDisplayText(value)
-    ?.toLowerCase()
-    .replace(/[!！.。?？,，~～]+$/g, "");
-  return !!normalized && CODEX_WEAK_TITLE_SET.has(normalized);
-}
-
-function isUsableCodexTitle(value?: string | null): value is string {
-  const normalized = normalizeCodexDisplayText(value);
-  return !!normalized && normalized !== "未知对话" && !isWeakCodexTitle(normalized);
-}
-
-function pickUsableCodexTitle(values: Array<string | null | undefined>): string | null {
-  return values.map((value) => normalizeCodexDisplayText(value)).find(isUsableCodexTitle) ?? null;
-}
-
-function hasUsableCodexTitle(values: Array<string | null | undefined>): boolean {
-  return pickUsableCodexTitle(values) !== null;
-}
-
 function getCodexForkedFromId(entry?: CodexEntry): string {
   const value = entry?.payload?.forked_from_id ?? entry?.payload?.forkedFromId;
   return typeof value === "string" ? value.trim() : "";
-}
-
-function pickCodexConversationTitle(options: {
-  managedTitle?: string;
-  transcriptTitle?: string;
-  nativeTitle?: string;
-  firstUserMessage?: string;
-  preview?: string;
-  fallbackTitle?: string;
-}): { title: string; usedFallback: boolean } {
-  const managedTitle = normalizeCodexDisplayText(options.managedTitle);
-  if (managedTitle) {
-    return { title: managedTitle, usedFallback: false };
-  }
-
-  const transcriptTitle = normalizeCodexDisplayText(options.transcriptTitle);
-  const nativeTitle = normalizeCodexDisplayText(options.nativeTitle);
-  const firstUserMessage = normalizeCodexDisplayText(options.firstUserMessage);
-  const preview = normalizeCodexDisplayText(options.preview);
-  const fallbackTitle = normalizeCodexDisplayText(options.fallbackTitle);
-  const nativeDisplayTitle = pickUsableCodexTitle([nativeTitle, firstUserMessage, preview]);
-  if (nativeDisplayTitle) {
-    return { title: nativeDisplayTitle, usedFallback: false };
-  }
-
-  if (transcriptTitle && !isWeakCodexTitle(transcriptTitle)) {
-    return { title: transcriptTitle, usedFallback: false };
-  }
-
-  const canUseFallback = !!fallbackTitle && !isWeakCodexTitle(fallbackTitle);
-  const nativeTitleIsWeak = !!nativeTitle && isWeakCodexTitle(nativeTitle);
-  const nativeLooksOriginal = !firstUserMessage || firstUserMessage === nativeTitle || isWeakCodexTitle(firstUserMessage);
-
-  if (nativeTitle && (!nativeTitleIsWeak || !nativeLooksOriginal || !canUseFallback)) {
-    return { title: nativeTitle, usedFallback: false };
-  }
-
-  if (canUseFallback) {
-    return { title: fallbackTitle, usedFallback: !!nativeTitle };
-  }
-
-  return { title: nativeTitle || fallbackTitle || "未知对话", usedFallback: false };
-}
-
-function buildCodexTitleFallbackBadges(): ConversationBadge[] {
-  return [{
-    label: CODEX_TITLE_FALLBACK_BADGE_LABEL,
-    tone: "amber",
-    title: "Codex 原生 title 是问候语，ChatLog Viewer 改用 transcript 中后续有效用户问题作为展示标题",
-  }];
-}
-
-function buildCodexTitleGenerationBadges(): ConversationBadge[] {
-  return [{
-    label: CODEX_TITLE_GENERATION_BADGE_LABEL,
-    tone: "cyan",
-    title: "ChatLog Viewer AI 标题生成产生的 Codex session",
-  }];
-}
-
-function mergeCodexBadges(...groups: Array<ConversationBadge[] | undefined>): ConversationBadge[] | undefined {
-  const badges = groups.flatMap((group) => group ?? []);
-  return badges.length > 0 ? badges : undefined;
-}
-
-function hasCodexTitleFallbackBadge(meta?: ConversationMeta): boolean {
-  return meta?.badges?.some((badge) => badge.label === CODEX_TITLE_FALLBACK_BADGE_LABEL) ?? false;
-}
-
-function hasCodexTitleGenerationBadge(meta?: ConversationMeta): boolean {
-  return meta?.badges?.some((badge) => badge.label === CODEX_TITLE_GENERATION_BADGE_LABEL) ?? false;
-}
-
-function isCodexNativeOriginalWeakTitle(metadata: CodexThreadMetadata): boolean {
-  const nativeTitle = normalizeCodexDisplayText(metadata.title);
-  const firstUserMessage = normalizeCodexDisplayText(metadata.firstUserMessage);
-  return !!nativeTitle
-    && isWeakCodexTitle(nativeTitle)
-    && (!firstUserMessage || firstUserMessage === nativeTitle || isWeakCodexTitle(firstUserMessage));
 }
 
 function isReusableCodexMetaHint(
@@ -313,20 +208,6 @@ function buildCodexStateOnlyBadges(): ConversationBadge[] {
       title: "本地未找到 Codex transcript，详情无法展示完整消息",
     },
   ];
-}
-
-function buildCodexTitleGenerationHint(thread: CodexThreadRow): string | undefined {
-  const parts = [
-    normalizeCodexDisplayText(thread.title) ? `现有标题: ${normalizeCodexDisplayText(thread.title)}` : undefined,
-    normalizeCodexDisplayText(thread.firstUserMessage)
-      ? `首条用户消息摘要: ${normalizeCodexDisplayText(thread.firstUserMessage)}`
-      : undefined,
-    normalizePath(thread.cwd || "") ? `项目目录: ${normalizePath(thread.cwd || "")}` : undefined,
-    thread.modelProvider ? `Codex provider: ${thread.modelProvider}` : undefined,
-  ].filter((item): item is string => !!item);
-
-  if (parts.length === 0) return undefined;
-  return `当前对话缺少 transcript，请仅根据以下 metadata 生成标题：\n${parts.join("\n")}`;
 }
 
 function formatCodexTimestampPathParts(timestampMs: number): {
@@ -912,6 +793,10 @@ export class CodexProvider implements ConversationProvider {
     return getListCacheKey(this.name, `${storagePath}::${CODEX_LIST_SOURCE_VERSION}`);
   }
 
+  private getBackgroundRefreshKey(): string {
+    return `${this.getStoragePath()}::${this.getStateDbPath()}::${CODEX_LIST_SOURCE_VERSION}`;
+  }
+
   async detect(): Promise<boolean> {
     try {
       await stat(this.getStoragePath());
@@ -938,13 +823,19 @@ export class CodexProvider implements ConversationProvider {
   }
 
   private scheduleBackgroundIndexRefresh(): void {
-    const cacheKey = this.getListCacheKey();
-    if (this.backgroundRefreshes.has(cacheKey)) {
+    const refreshKey = this.getBackgroundRefreshKey();
+    if (this.backgroundRefreshes.has(refreshKey)) {
       return;
     }
 
     const task = new Promise<void>((resolve) => {
       setTimeout(() => {
+        if (this.getBackgroundRefreshKey() !== refreshKey) {
+          this.backgroundRefreshes.delete(refreshKey);
+          resolve();
+          return;
+        }
+
         this.listInternal({
           eagerSearchIndex: true,
           allowBackground: false,
@@ -954,13 +845,13 @@ export class CodexProvider implements ConversationProvider {
             logProviderError("conversations.index.background", this.name, error);
           })
           .finally(() => {
-            this.backgroundRefreshes.delete(cacheKey);
+            this.backgroundRefreshes.delete(refreshKey);
             resolve();
           });
       }, 250);
     });
 
-    this.backgroundRefreshes.set(cacheKey, task);
+    this.backgroundRefreshes.set(refreshKey, task);
   }
 
   private async listInternal(options: {
