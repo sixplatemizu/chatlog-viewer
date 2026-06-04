@@ -1,37 +1,37 @@
 # ChatLog Viewer
 
-统一浏览、搜索、整理本机 AI CLI 对话记录的桌面本地 Web 工具，当前默认接入 Claude Code、Codex、OpenCode、iFlow CLI。
+统一浏览、搜索、整理本机 AI CLI 对话记录的桌面本地 Web 工具，当前默认接入 Claude Code、Codex、OpenCode、iFlow CLI。项目以本地原始数据为准：尽量忠实呈现真实存在的记录，同时用 badge 标记不完整、非默认可见或由 ChatLog Viewer 内部产生的会话。
 
 ## 亮点
 
 - 统一聚合多个 provider 的本地原始会话记录，按项目目录分组浏览
-- 对工具自身 UI 默认不展示但本地真实存在的记录进行标记区分，例如 OpenCode 子会话、归档、`opencode run` / 标题生成临时会话
+- 对工具自身 UI 默认不展示但本地真实存在的记录进行标记区分，例如 OpenCode 子会话、归档、`opencode run` / 标题生成会话
 - Markdown 消息渲染、代码高亮、tool call 折叠，适合长对话回看
 - 支持 provider 过滤、Codex model provider 过滤、按更新时间 / 创建时间 / provider 排序
 - 搜索基于本地索引，支持长消息 chunk search，降低超长会话中段内容漏检概率
-- 支持手动改标题、调用本地 CLI 生成标题、批量选择、批量删除、项目间移动会话
-- AI 标题生成支持 `codex / claude / opencode` 优先级设置，并为每个 CLI 复用固定会话
+- 支持手动改标题、调用本地 CLI 生成标题、消息编辑 / 删除、批量选择、批量删除、项目间移动会话
+- AI 标题生成支持 `codex / claude / opencode` 优先级设置，可选择固定会话或每次新建，并会标记 / 清理内部标题生成会话
 - 导出支持 `完整导出` 和 `Partial Export` 两种模式，超长对话可优先走 partial
 - Provider 路径支持自动发现、环境变量覆盖、配置文件覆盖，并可直接在 UI 中查看与修改
 - API 默认只允许本机 Host / Origin 访问，减少误暴露风险
 
 ## 当前支持
 
-| Provider | 状态 | 默认路径 |
-| --- | --- | --- |
-| Claude Code | 完整支持 | `~/.claude/projects` |
-| Codex | 完整支持 | `~/.codex/sessions` |
-| Codex state db | 完整支持 | `~/.codex/state_5.sqlite` |
-| OpenCode | 基础支持 | `~/.local/share/opencode/opencode.db` |
-| iFlow CLI | 完整支持 | `~/.iflow/projects` |
+| Provider | 数据来源 | 浏览 / 搜索 / 导出 | 标题同步 | 消息编辑 / 删除 | 移动 / 删除会话 | 默认路径 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | JSONL transcript、`sessions-index.json`、`history.jsonl` | 支持 | 原生写回 index + transcript；UI 标题优先 | 支持 | 支持 | `~/.claude/projects` |
+| Codex | JSONL transcript、`state_5.sqlite` | 支持 | 原生写回 transcript + state db；UI 标题优先 | 支持 | 支持 | `~/.codex/sessions` |
+| Codex state db | `threads` / `conversation_index` | 支持 metadata-only 回填 | 与 Codex 同步 | 不适用于 metadata-only | 支持残留清理 | `~/.codex/state_5.sqlite` |
+| OpenCode | SQLite `session` / `message` / `part` | 支持 | 原生写回 `session.title` | 暂不支持 | 支持 | `~/.local/share/opencode/opencode.db` |
+| iFlow CLI | JSONL transcript | 支持 | 暂禁用，缺少稳定原生标题字段 | 支持 | 支持 | `~/.iflow/projects` |
 
-OpenCode 当前支持从 SQLite 读取列表、详情、搜索索引、导出、删除会话、metadata 级移动会话和标题写回；暂不支持消息级编辑 / 删除。OpenCode 使用单一 SQLite DB 存储，对话路径显示为 DB 内 session 记录，不等同于 Claude Code / Codex 的独立 JSONL 文件路径。
+### 列表语义
 
-ChatLog Viewer 的管理目标是忠于本地原始对话数据，而不是复刻各工具自己的 session picker。OpenCode 会显示 DB 中所有 `session` 记录，包括 TUI `/sessions` 默认不显示的子会话、归档会话、30 天外会话、`opencode run` / 自动化 one-shot session，以及 ChatLog Viewer AI 标题生成产生的临时 session，并通过列表 badge 标记区分。
+ChatLog Viewer 的管理目标是忠于本地原始对话数据，而不是复刻各工具自己的 session picker。它会优先呈现本地 DB / 文件中真实存在的数据，对仅 metadata、仅 history、残留记录、子会话、归档会话等状态做显式标记，而不是静默隐藏。
 
-`opencode session list`、OpenCode TUI `/sessions` 和 ChatLog Viewer 的列表语义不同：前两者是 OpenCode 自身的操作视图，ChatLog Viewer 以本地 DB / 文件中的真实记录为准，用于完整盘点和管理本机对话资产。Claude Code、Codex、iFlow 也遵循同样原则：优先呈现本地实际存在的数据，对仅 metadata、仅 history、残留记录等不完整状态做显式标记，而不是静默隐藏。
+OpenCode 的 `opencode session list`、TUI `/sessions` 和 ChatLog Viewer 的列表语义不同：前两者是 OpenCode 自身的操作视图，ChatLog Viewer 会显示 DB 中所有 `session` 记录，包括 TUI 默认不显示的子会话、归档会话、30 天外会话、`opencode run` / 自动化 one-shot session，以及 ChatLog Viewer AI 标题生成产生的 session。
 
-Claude Code 会对缺少主 transcript 的记录标记 `history 回填`、`索引空壳`、`无 transcript`；Codex 会对仅存在于 `state_5.sqlite` 的记录标记 `state db`、`无 transcript`；OpenCode 会标记 `子会话`、`已归档`、`30天外`、`run/临时`、`标题生成` 等原始状态。
+Claude Code 会对缺少主 transcript 的记录标记 `history 回填`、`索引空壳`、`无 transcript`；Codex 会对仅存在于 `state_5.sqlite` 的记录标记 `state db`、`无 transcript`、`标题回退`；OpenCode 会标记 `子会话`、`已归档`、`30天外`、`run/临时`、`标题生成` 等原始状态。内部 AI 标题生成会话不再过滤隐藏，而是忠实显示并标记 `标题生成`。
 
 ## 技术栈
 
@@ -101,14 +101,26 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 
 ### 4. 标题与整理
 
-- 支持手动改标题
+- 支持手动改标题；对支持原生标题的 provider，UI 修改会写回对应本地记录
+- Codex 标题会同步 transcript `session_meta`、`state_5.sqlite` 的 `title / first_user_message / preview`
+- Claude Code 标题会同步 `sessions-index.json` 和 transcript 中的 `custom-title`
+- OpenCode 标题会同步 SQLite `session.title`
+- UI 手动标题是最高优先级来源，后续列表 / 详情读取会优先使用该来源，避免回退到旧标题
 - 支持调用本地 AI CLI 自动生成标题
 - 标题生成支持 `codex -> claude -> opencode` 等可调 fallback 优先级
-- 每个标题生成 CLI 会复用固定会话，避免每次都新建新对话
+- 每个标题生成 CLI 可选择 `固定模式` 或 `不固定模式`
+- 固定模式会复用最近一次标题生成会话；不固定模式每次新建，并在生成后自动清理内部标题生成会话
 - 设置页支持查看每个 CLI 是否可用、是否已有固定会话，并可单独或全部重置
 - 支持批量选择、批量删除
 - 支持在同 provider 的不同项目目录间移动会话
 - Codex 会话支持修改 `model_provider`
+
+### 5. 消息级操作
+
+- Codex、Claude Code、iFlow 支持消息编辑、单条删除和批量删除
+- 消息 ID 基于原始记录稳定字段或 source key 生成，连续编辑 / 删除后仍可继续定位同一消息
+- OpenCode 暂不开放消息级编辑 / 删除：OpenCode 正文存放在 SQLite `part.data`，一条 UI 消息可能对应多个 `part`，直接改删 `message` 行容易破坏 tool / reasoning / step 结构
+- OpenCode 后续更合适的实现方式是按可见 `part` 级别编辑 / 删除，并尽量对齐 OpenCode 官方 `part.update` / `part.delete` 语义
 
 ## Provider 路径解析
 
@@ -202,6 +214,11 @@ packages/
         ├── hooks/         # 数据获取与交互状态
         └── lib/           # API 封装与类型
 ```
+
+## TODO
+
+- OpenCode 消息编辑 / 删除：先搁置为后续任务。推荐方案是按 SQLite `part` 级别实现可见消息的编辑 / 删除，避免默认删除整条 `message` 时连带影响 tool、reasoning、step-finish 等结构。
+- OpenCode schema 兼容：后续实现消息级操作时，需要同时考虑 legacy `message` / `part` 和新版 `session_message` 投影的长期兼容。
 
 ## 开发说明
 
