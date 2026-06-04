@@ -63,6 +63,7 @@ import {
   type CodexThreadMetadata,
   type CodexThreadRow,
 } from "./codex-sqlite-client.js";
+import { upsertCodexSessionIndexThreadName } from "./codex-session-index.js";
 import { normalizePath, canonicalizeProjectPath, canonicalizeProjectPathResolvingSymlinks, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
 
 interface CodexEntry {
@@ -730,7 +731,7 @@ export class CodexProvider implements ConversationProvider {
       }
     }
 
-    await this.upsertSessionIndexThreadName(sessionId, normalizedTitle);
+    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
 
     if (normalizeCodexDisplayText(transcriptTitle) === normalizedTitle) {
       return false;
@@ -761,7 +762,7 @@ export class CodexProvider implements ConversationProvider {
     if (currentDisplayTitle) {
       if (!normalizedTitle) return false;
 
-      await this.upsertSessionIndexThreadName(sessionId, currentDisplayTitle);
+      await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, currentDisplayTitle);
       if (normalizedTitle === currentDisplayTitle) return false;
 
       return await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
@@ -785,7 +786,7 @@ export class CodexProvider implements ConversationProvider {
       }
     }
 
-    await this.upsertSessionIndexThreadName(sessionId, normalizedTitle);
+    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
     return false;
   }
 
@@ -840,7 +841,7 @@ export class CodexProvider implements ConversationProvider {
       // Codex TUI 可能短暂占用 state db；仍继续同步 transcript 与 session_index。
     }
 
-    await this.upsertSessionIndexThreadName(options.sessionId, parentTitle);
+    await upsertCodexSessionIndexThreadName(this.getStoragePath(), options.sessionId, parentTitle);
     await this.rewriteTranscriptSessionMeta(options.filePath, options.sessionId, (payload) => {
       return {
         ...payload,
@@ -857,61 +858,6 @@ export class CodexProvider implements ConversationProvider {
     return meta?.id.startsWith("codex:")
       ? meta.id.replace("codex:", "")
       : filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
-  }
-
-  private getSessionIndexPath(): string {
-    return join(dirname(this.getStoragePath()), "session_index.jsonl");
-  }
-
-  private async upsertSessionIndexThreadName(sessionId: string, title: string): Promise<boolean> {
-    const indexPath = this.getSessionIndexPath();
-    let originalContent: string;
-    try {
-      originalContent = await readFile(indexPath, "utf-8");
-    } catch {
-      originalContent = "";
-    }
-
-    let matched = false;
-    let changed = false;
-    const now = new Date().toISOString();
-    const rewrittenLines = originalContent
-      .split(/\r?\n/)
-      .filter((line, index, lines) => line.trim() || index < lines.length - 1)
-      .map((line) => {
-        if (!line.trim()) return line;
-        try {
-          const entry = JSON.parse(line) as { id?: string; thread_name?: string; updated_at?: string; [key: string]: unknown };
-          if (entry.id !== sessionId) return line;
-
-          matched = true;
-          const nextEntry = {
-            ...entry,
-            thread_name: title,
-            updated_at: now,
-          };
-          const nextLine = JSON.stringify(nextEntry);
-          if (nextLine !== line) changed = true;
-          return nextLine;
-        } catch {
-          return line;
-        }
-      });
-
-    if (!matched) {
-      rewrittenLines.push(JSON.stringify({
-        id: sessionId,
-        thread_name: title,
-        updated_at: now,
-      }));
-      changed = true;
-    }
-
-    if (!changed) return false;
-    const rewrittenContent = rewrittenLines.join("\n") + "\n";
-    await mkdir(dirname(indexPath), { recursive: true });
-    await writeFile(indexPath, rewrittenContent, "utf-8");
-    return true;
   }
 
   private async rewriteTranscriptSessionMeta(
@@ -1783,7 +1729,7 @@ export class CodexProvider implements ConversationProvider {
     }
 
     await this.writeThreadDisplayTitle(sessionId, normalizedTitle);
-    await this.upsertSessionIndexThreadName(sessionId, normalizedTitle);
+    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
     if (filePath) {
       await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
         return {
