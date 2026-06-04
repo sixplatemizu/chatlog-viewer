@@ -53,6 +53,7 @@ export class CodexSqliteClient {
   private readDbPath: string | null = null;
   private writeDb: BetterSqlite3.Database | null = null;
   private writeDbPath: string | null = null;
+  private tableColumnsByDb = new WeakMap<BetterSqlite3.Database, Map<string, Set<string>>>();
 
   constructor(private readonly dbPathProvider: () => string) {}
 
@@ -63,6 +64,7 @@ export class CodexSqliteClient {
 
   private closeRead(): void {
     if (this.readDb) {
+      this.tableColumnsByDb.delete(this.readDb);
       this.readDb.close();
       this.readDb = null;
     }
@@ -71,6 +73,7 @@ export class CodexSqliteClient {
 
   private closeWrite(): void {
     if (this.writeDb) {
+      this.tableColumnsByDb.delete(this.writeDb);
       this.writeDb.close();
       this.writeDb = null;
     }
@@ -107,9 +110,17 @@ export class CodexSqliteClient {
   }
 
   getTableColumns(db: BetterSqlite3.Database, tableName: string): Set<string> {
+    const cachedTables = this.tableColumnsByDb.get(db);
+    const cachedColumns = cachedTables?.get(tableName);
+    if (cachedColumns) return cachedColumns;
+
     try {
       const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
-      return new Set(rows.map((row) => row.name));
+      const columns = new Set(rows.map((row) => row.name));
+      const nextTables = cachedTables ?? new Map<string, Set<string>>();
+      nextTables.set(tableName, columns);
+      this.tableColumnsByDb.set(db, nextTables);
+      return columns;
     } catch {
       return new Set();
     }
