@@ -631,6 +631,10 @@ export class CodexProvider implements ConversationProvider {
       threadMetadata.firstUserMessage,
       threadMetadata.preview,
     ]);
+    const nativeFieldsAgree = !!nativeDisplayTitle
+      && normalizeCodexDisplayText(threadMetadata.title) === nativeDisplayTitle
+      && normalizeCodexDisplayText(threadMetadata.firstUserMessage) === nativeDisplayTitle
+      && normalizeCodexDisplayText(threadMetadata.preview) === nativeDisplayTitle;
     const syncRecord = await getNativeTitleSyncRecord(id);
     const lastNativeTitle = normalizeCodexDisplayText(syncRecord?.lastNativeTitle);
 
@@ -641,7 +645,12 @@ export class CodexProvider implements ConversationProvider {
       return managedTitle;
     }
 
-    if (nativeDisplayTitle && lastNativeTitle && nativeDisplayTitle !== lastNativeTitle) {
+    if (
+      nativeDisplayTitle
+      && lastNativeTitle
+      && nativeDisplayTitle !== lastNativeTitle
+      && (syncRecord?.source !== "chatlog-viewer" || nativeFieldsAgree)
+    ) {
       await setCodexObservedNativeTitle(id, nativeDisplayTitle);
       return nativeDisplayTitle;
     }
@@ -684,6 +693,30 @@ export class CodexProvider implements ConversationProvider {
         title: normalizedTitle,
       };
     });
+  }
+
+  private async persistKnownThreadTitle(
+    sessionId: string,
+    title: string | null | undefined,
+    filePath?: string | null
+  ): Promise<void> {
+    const normalizedTitle = normalizeCodexDisplayText(title);
+    if (!normalizedTitle) return;
+
+    try {
+      this.writeThreadDisplayTitle(sessionId, normalizedTitle);
+    } catch {
+      // Codex TUI 可能短暂占用 state db；仍继续同步 transcript 与 session_index。
+    }
+
+    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
+
+    if (!filePath) return;
+    await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => ({
+      ...payload,
+      id: payload.id || sessionId,
+      title: normalizedTitle,
+    }));
   }
 
   private async syncThreadDisplayTitleFromTranscript(
@@ -1811,13 +1844,21 @@ export class CodexProvider implements ConversationProvider {
 
     const transcriptTargets = await Promise.all(
       sessionIds.map(async (sessionId) => {
+        const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+        const managedTitle = await this.resolveManagedTitle(sessionId, threadMetadata);
+        const currentTitle = managedTitle ?? pickUsableCodexTitle([
+          threadMetadata.title,
+          threadMetadata.firstUserMessage,
+          threadMetadata.preview,
+        ]);
         try {
           return {
             sessionId,
+            currentTitle,
             filePath: await this.findConversationFilePath(sessionId),
           };
         } catch {
-          return { sessionId, filePath: null };
+          return { sessionId, currentTitle, filePath: null };
         }
       })
     );
@@ -1830,6 +1871,7 @@ export class CodexProvider implements ConversationProvider {
         ...payload,
         model_provider: normalizedProvider,
       }));
+      await this.persistKnownThreadTitle(target.sessionId, target.currentTitle, target.filePath);
       invalidateCache(target.filePath);
     }
     invalidateListCache(this.getListCacheKey());

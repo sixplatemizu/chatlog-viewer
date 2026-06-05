@@ -2272,6 +2272,7 @@ test("Codex 修改有 transcript 的对话 provider 时会同步 session_meta", 
             id: sessionId,
             cwd: "C:/Users/tester/Desktop/code_area/chatlog-viewer",
             model_provider: "v",
+            title: "旧 transcript 标题",
           },
         }),
         JSON.stringify({
@@ -2321,21 +2322,29 @@ test("Codex 修改有 transcript 的对话 provider 时会同步 session_meta", 
     }
 
     provider = new CodexProvider();
+    await setNativeTitle(`codex:${sessionId}`, "UI 管理标题");
     const updated = await provider.changeModelProviders([`codex:${sessionId}`], "octopus");
     assert.equal(updated, 1);
 
     const verifyDb = new Database(stateDbPath, { readonly: true });
     try {
-      const row = verifyDb.prepare("SELECT model_provider FROM threads WHERE id = ?").get(sessionId) as { model_provider: string } | undefined;
+      const row = verifyDb.prepare("SELECT model_provider, title, first_user_message FROM threads WHERE id = ?").get(sessionId) as {
+        model_provider: string;
+        title: string;
+        first_user_message: string;
+      } | undefined;
       assert.equal(row?.model_provider, "octopus");
+      assert.equal(row?.title, "UI 管理标题");
+      assert.equal(row?.first_user_message, "UI 管理标题");
     } finally {
       verifyDb.close();
     }
 
     const firstLine = (await readFile(sourceFile, "utf-8")).split("\n")[0]!;
-    const meta = JSON.parse(firstLine) as { type: string; payload: { model_provider?: string } };
+    const meta = JSON.parse(firstLine) as { type: string; payload: { model_provider?: string; title?: string } };
     assert.equal(meta.type, "session_meta");
     assert.equal(meta.payload.model_provider, "octopus");
+    assert.equal(meta.payload.title, "UI 管理标题");
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
     await fixture.cleanup(() => {
