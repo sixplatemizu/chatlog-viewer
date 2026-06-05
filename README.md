@@ -70,6 +70,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm bench:search-index
+pnpm title -- list --scope all --limit 30
 ```
 
 CI 默认执行 `lint -> typecheck -> test -> build`。
@@ -114,6 +115,28 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 - 支持批量选择、批量删除
 - 支持在同 provider 的不同项目目录间移动会话
 - Codex 会话支持修改 `model_provider`
+
+#### Codex 标题 CLI / Skill
+
+当前 Codex CLI 没有公开的自定义 slash command 注册机制，因此项目提供 `pnpm title` 和 `$chatlog-viewer-title` skill 作为桥接方案，复用 Web UI 的标题写回逻辑。
+
+```bash
+pnpm title
+pnpm title -- list --scope all --search "关键词" --limit 20
+pnpm title -- list --cwd "$PWD" --exact --limit 30
+pnpm title -- rename codex:<session-id> "新标题"
+pnpm title -- generate codex:<session-id> --cli opencode,codex --timeout 90000 --retries 2
+pnpm title -- generate-batch --cwd "$PWD" --exact --dry-run
+pnpm title -- generate-batch --cwd "$PWD" --exact --json --continue-on-error
+pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/codex-title-generate-batch-<timestamp>.json
+```
+
+- `list` 默认查看 Codex provider，可用 `--cwd <path> --exact` 精确匹配项目，或 `--project <path> --recursive` 包含子目录；内部标题生成会话默认排除
+- `rename` 优先调用 Codex app-server 的 `thread/name/set`，与 Codex `/rename` 使用同一类原生命名语义
+- `generate` / `generate-batch` 会调用本地 AI CLI 生成标题，支持 `--cli`、`--timeout`、`--retries`，并按设置清理内部标题生成会话；标题上下文以近期消息为主，辅以少量开头/中段信息
+- `generate-batch` 会在 `~/.backups/chatlog-viewer-title/<date>/` 写入包含 `id / oldTitle / newTitle / filePath / usedCli / attempts / error` 的 JSON 报告，方便审计和回滚
+- `generate-batch --dry-run` 只生成目标列表和报告，不调用 AI CLI、不写回标题；`rollback --report <path>` 会按报告中的 `oldTitle` 回滚成功生成过的记录
+- 仓库内 `skills/chatlog-viewer-title` 可同步安装到 `~/.codex/skills/chatlog-viewer-title`，在 Codex 中用 `$chatlog-viewer-title` 触发同样的 CLI 工作流
 
 ### 5. 消息级操作
 
@@ -204,6 +227,7 @@ CHATLOG_VIEWER_IFLOW_PATH=/path/to/iflow/projects
 packages/
 ├── server/
 │   └── src/
+│       ├── cli/           # 本地维护命令，例如 Codex 标题管理
 │       ├── providers/     # 各 provider 读取 / 删除 / 移动 / 索引逻辑
 │       ├── routes/        # API 路由与设置接口
 │       ├── utils/         # provider path、JSONL、cache、search index 等工具
@@ -213,6 +237,8 @@ packages/
         ├── components/    # 侧边栏、会话详情、导出、路径设置等 UI
         ├── hooks/         # 数据获取与交互状态
         └── lib/           # API 封装与类型
+skills/
+└── chatlog-viewer-title/   # Codex 中调用标题管理 CLI 的 skill
 ```
 
 ## TODO

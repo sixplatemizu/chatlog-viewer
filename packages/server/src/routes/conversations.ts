@@ -2,44 +2,27 @@ import { Hono } from "hono";
 import type {
   ConversationProvider,
   ConversationMeta,
-  ConversationCapabilities,
-  TitleSyncMode,
-  Conversation,
-  Message,
 } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
-import { getAllTitles, getTitle, setTitle, deleteTitle, setNativeTitle, deleteNativeTitle } from "../utils/title-store.js";
-import { generateTitle } from "../utils/ai.js";
+import { getAllTitles, getTitle, deleteTitle, deleteNativeTitle } from "../utils/title-store.js";
 import { getIndexedListSnapshot, hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
 import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {
-  getTitleGenerationCliPriority,
-  getTitleGenerationCliSessionModes,
-  getTitleGenerationCliSessionReuse,
-  type TitleGenerationCli,
-} from "../utils/provider-paths.js";
+  generateAndPersistConversationTitle,
+  getTitleMutationDisabledReason,
+  normalizeTitle,
+  persistConversationTitle,
+  resolveConversationCapabilities,
+  resolveConversationTitle,
+  resolveProviderTitleSyncMode,
+} from "../services/conversation-title.js";
 
 const MAX_BATCH_CONVERSATION_IDS = 500;
 const MAX_BATCH_MESSAGE_IDS = 2_000;
-const MAX_TITLE_LENGTH = 100;
 const MAX_MODEL_PROVIDER_LENGTH = 100;
 const DEFAULT_CONVERSATION_LIST_LIMIT = 5_000;
 const MAX_CONVERSATION_LIST_LIMIT = 5_000;
-const TITLE_GENERATION_BADGE_LABEL = "标题生成";
-const TITLE_GENERATION_CLI_PROVIDER: Record<TitleGenerationCli, string> = {
-  codex: "codex",
-  claude: "claude-code",
-  opencode: "opencode",
-};
-
-function isTitleGenerationCli(value: string): value is TitleGenerationCli {
-  return Object.hasOwn(TITLE_GENERATION_CLI_PROVIDER, value);
-}
-
-function hasTitleGenerationBadge(conversation: ConversationMeta): boolean {
-  return conversation.badges?.some((badge) => badge.label === TITLE_GENERATION_BADGE_LABEL) ?? false;
-}
 
 function normalizeProjectDisplayPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
@@ -142,102 +125,6 @@ function buildProjectInfosFromConversations(
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
-function resolveProviderTitleSyncMode(provider: ConversationProvider | undefined): TitleSyncMode {
-  if (!provider) return "overlay";
-  return provider.capabilities?.titleSyncMode ?? (provider.updateTitle ? "native" : "overlay");
-}
-
-function resolveConversationCapabilities(provider: ConversationProvider | undefined): ConversationCapabilities {
-  if (!provider) {
-    return {
-      canUpdateTitle: true,
-      canGenerateTitle: true,
-    };
-  }
-
-  const canUpdateTitle = provider.capabilities?.canUpdateTitle ?? true;
-  const canGenerateTitle = provider.capabilities?.canGenerateTitle ?? canUpdateTitle;
-
-  return {
-    canUpdateTitle,
-    canGenerateTitle,
-    updateTitleDisabledReason: provider.capabilities?.updateTitleDisabledReason,
-    generateTitleDisabledReason: provider.capabilities?.generateTitleDisabledReason,
-  };
-}
-
-function getTitleMutationDisabledReason(
-  provider: ConversationProvider,
-  operation: "update" | "generate"
-): string | null {
-  const capabilities = resolveConversationCapabilities(provider);
-  if (operation === "update" && !capabilities.canUpdateTitle) {
-    return capabilities.updateTitleDisabledReason ?? `${provider.displayName} 不支持修改标题`;
-  }
-  if (operation === "generate" && !capabilities.canGenerateTitle) {
-    return capabilities.generateTitleDisabledReason ?? `${provider.displayName} 不支持 AI 标题生成`;
-  }
-  return null;
-}
-
-async function persistConversationTitle(
-  provider: ConversationProvider,
-  id: string,
-  title: string
-): Promise<void> {
-  const normalizedTitle = title.trim();
-  if (!normalizedTitle) {
-    throw new Error("标题不能为空");
-  }
-
-  if (provider.updateTitle) {
-    await provider.updateTitle(id, normalizedTitle);
-    await setNativeTitle(id, normalizedTitle);
-    await deleteTitle(id);
-    return;
-  }
-
-  await setTitle(id, normalizedTitle);
-}
-
-async function resolveConversationTitle(
-  provider: ConversationProvider | undefined,
-  currentTitle: string,
-  customTitle: string | null | undefined
-): Promise<string> {
-  if (resolveProviderTitleSyncMode(provider) === "native") {
-    return currentTitle;
-  }
-
-  const normalizedCustomTitle = customTitle?.trim();
-  if (!normalizedCustomTitle) {
-    return currentTitle;
-  }
-
-  return normalizedCustomTitle;
-}
-
-export function buildTitleGenerationMessages(conversation: Conversation): Message[] {
-  const realMessages = conversation.messages.filter((message) => {
-    if (message.role === "tool") return false;
-    if (message.role === "system" && conversation.transcriptMissing) return false;
-    return !!message.content.trim();
-  });
-
-  if (realMessages.length > 0) {
-    return realMessages;
-  }
-
-  if (conversation.titleGenerationHint?.trim()) {
-    return [{
-      role: "user",
-      content: conversation.titleGenerationHint.trim(),
-    }];
-  }
-
-  return conversation.messages.filter((message) => !!message.content.trim());
-}
-
 async function deleteConversationWithCleanup(
   provider: ConversationProvider,
   id: string
@@ -261,33 +148,6 @@ async function deleteConversationWithCleanup(
 export function createConversationRoutes(providers: ConversationProvider[]) {
   const app = new Hono();
   const providerByName = new Map(providers.map((provider) => [provider.name, provider]));
-
-  async function cleanupFreshTitleGenerationSessions(usedCli: string): Promise<number> {
-    if (!isTitleGenerationCli(usedCli)) return 0;
-
-    const modes = getTitleGenerationCliSessionModes();
-    if (modes[usedCli] !== "fresh") return 0;
-
-    const providerName = TITLE_GENERATION_CLI_PROVIDER[usedCli];
-    const cleanupProvider = providerByName.get(providerName);
-    if (!cleanupProvider) return 0;
-
-    const conversations = await cleanupProvider.list({ eagerSearchIndex: false });
-    let deleted = 0;
-
-    for (const conversation of conversations) {
-      if (!hasTitleGenerationBadge(conversation)) continue;
-
-      try {
-        await deleteConversationWithCleanup(cleanupProvider, conversation.id);
-        deleted += 1;
-      } catch (error) {
-        logProviderError("conversations.generate-title.cleanup", cleanupProvider.name, error);
-      }
-    }
-
-    return deleted;
-  }
 
   function getProviderListCacheKey(provider: ConversationProvider): string {
     return `${provider.name}::${provider.getStoragePath()}::indexed`;
@@ -651,10 +511,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const body = await c.req.json<{ title?: unknown }>();
     let title: string;
     try {
-      title = normalizeBoundedStringField(body?.title, "title", {
-        maxLength: MAX_TITLE_LENGTH,
-        emptyMessage: "标题不能为空",
-      });
+      title = normalizeTitle(body?.title);
     } catch (error) {
       return c.json({ error: getErrorMessage(error) }, 400);
     }
@@ -673,20 +530,8 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     if (disabledReason) return c.json({ error: disabledReason }, 400);
 
     try {
-      const conversation = await provider.read(id);
-      const result = await generateTitle(buildTitleGenerationMessages(conversation), {
-        priority: getTitleGenerationCliPriority(),
-        reuseSession: getTitleGenerationCliSessionReuse(),
-        projectDir: conversation.project,
-      });
-      await persistConversationTitle(provider, id, result.title);
-      const cleanedTitleSessions = await cleanupFreshTitleGenerationSessions(result.usedCli);
-      return c.json({
-        success: true,
-        title: result.title,
-        usedCli: result.usedCli,
-        cleanedTitleSessions,
-      });
+      const result = await generateAndPersistConversationTitle(providers, provider, id);
+      return c.json(result);
     } catch (e) {
       return c.json({ error: getErrorMessage(e) }, getErrorStatus(e));
     }
@@ -719,26 +564,13 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         results.push({ id, error: "未知的 provider" });
         continue;
       }
-      const disabledReason = getTitleMutationDisabledReason(provider, "generate");
-      if (disabledReason) {
-        results.push({ id, error: disabledReason });
-        continue;
-      }
-
       try {
-        const conversation = await provider.read(id);
-        const result = await generateTitle(buildTitleGenerationMessages(conversation), {
-          priority: getTitleGenerationCliPriority(),
-          reuseSession: getTitleGenerationCliSessionReuse(),
-          projectDir: conversation.project,
-        });
-        await persistConversationTitle(provider, id, result.title);
-        const cleanedTitleSessions = await cleanupFreshTitleGenerationSessions(result.usedCli);
+        const result = await generateAndPersistConversationTitle(providers, provider, id);
         results.push({
           id,
           title: result.title,
           usedCli: result.usedCli,
-          cleanedTitleSessions,
+          cleanedTitleSessions: result.cleanedTitleSessions,
         });
       } catch (e) {
         results.push({

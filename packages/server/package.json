@@ -7,7 +7,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsx scripts/run-tests.ts",
-    "bench:search-index": "tsx src/bench/search-index.ts"
+    "bench:search-index": "tsx src/bench/search-index.ts",
+    "title": "tsx src/cli/title-manager.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.14",

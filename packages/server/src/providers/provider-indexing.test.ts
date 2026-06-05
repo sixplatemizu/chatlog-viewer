@@ -11,7 +11,7 @@ import { IFlowProvider } from "./iflow.js";
 import { OpenCodeProvider } from "./opencode.js";
 import { clearProviderPathCache } from "../utils/provider-paths.js";
 import { getIndexedCacheSnapshot, getIndexedListCacheKey, queryConversationIndex, setCacheStoreDirForTests } from "../utils/cache.js";
-import { setNativeTitle } from "../utils/title-store.js";
+import { getNativeTitle, setNativeTitle } from "../utils/title-store.js";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
@@ -1554,6 +1554,22 @@ test("Codex 手动标题写入 state db 后会刷新 transcript 列表标题", a
 
     const detailAfterCodexReset = await provider.read(`codex:${sessionId}`);
     assert.equal(detailAfterCodexReset.title, "手动持久化标题");
+
+    const externalTitleDb = new Database(stateDbPath);
+    try {
+      externalTitleDb.prepare("UPDATE threads SET title = ?, first_user_message = ?, preview = ? WHERE id = ?")
+        .run("Codex 本地新标题", "Codex 本地新标题", "Codex 本地新标题", sessionId);
+    } finally {
+      externalTitleDb.close();
+    }
+
+    const afterExternalTitle = await provider.list({ eagerSearchIndex: true });
+    assert.equal(afterExternalTitle[0]?.title, "Codex 本地新标题");
+    assert.equal(await getNativeTitle(`codex:${sessionId}`), "Codex 本地新标题");
+
+    const externalSyncedFirstLine = (await readFile(sourceFile, "utf-8")).split("\n")[0]!;
+    const externalSyncedMeta = JSON.parse(externalSyncedFirstLine) as { type: string; payload: { title?: string } };
+    assert.equal(externalSyncedMeta.payload.title, "Codex 本地新标题");
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
     await fixture.cleanup(() => {
@@ -1928,6 +1944,99 @@ test("Codex 可直接修改仅存在于 state db 的对话标题", async () => {
       } | undefined;
       assert.equal(row?.title, "新的 State DB 标题");
       assert.equal(row?.first_user_message, "新的 State DB 标题");
+    } finally {
+      verifyDb.close();
+    }
+  } finally {
+    (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
+    await fixture.cleanup(() => {
+      if (previousSessionsPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH = previousSessionsPath;
+      }
+
+      if (previousStateDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH = previousStateDbPath;
+      }
+    });
+  }
+});
+
+test("Codex state-only 对话会用 UI 管理标题修复回退标题", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-codex-state-only-managed-title-");
+  const storagePath = join(fixture.baseDir, "sessions");
+  const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
+  const previousSessionsPath = process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH;
+  const previousStateDbPath = process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH;
+  const sessionId = "codex-state-only-managed-title-session";
+  let provider: CodexProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH = stateDbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    await setNativeTitle(`codex:${sessionId}`, "UI 管理标题");
+
+    const db = new Database(stateDbPath);
+    try {
+      db.exec(`
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY,
+          rollout_path TEXT,
+          created_at INTEGER,
+          updated_at INTEGER,
+          source TEXT,
+          model_provider TEXT,
+          cwd TEXT,
+          title TEXT,
+          first_user_message TEXT,
+          preview TEXT
+        )
+      `);
+      db.prepare(
+        `INSERT INTO threads (
+          id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, first_user_message, preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sessionId,
+        "",
+        1774500000,
+        1774500300,
+        "cli",
+        "octopus",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "hi",
+        "hi",
+        "hi"
+      );
+    } finally {
+      db.close();
+    }
+
+    provider = new CodexProvider();
+    const list = await provider.list({ eagerSearchIndex: true });
+    assert.equal(list[0]?.title, "UI 管理标题");
+    assert.equal(list[0]?.contentStatus, "metadata-only");
+
+    const detail = await provider.read(`codex:${sessionId}`);
+    assert.equal(detail.title, "UI 管理标题");
+    assert.match(detail.titleGenerationHint ?? "", /UI 管理标题/);
+
+    const verifyDb = new Database(stateDbPath, { readonly: true });
+    try {
+      const row = verifyDb.prepare("SELECT title, first_user_message, preview FROM threads WHERE id = ?").get(sessionId) as {
+        title: string;
+        first_user_message: string;
+        preview: string;
+      } | undefined;
+      assert.equal(row?.title, "UI 管理标题");
+      assert.equal(row?.first_user_message, "UI 管理标题");
+      assert.equal(row?.preview, "UI 管理标题");
     } finally {
       verifyDb.close();
     }

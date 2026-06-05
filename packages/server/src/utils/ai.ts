@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { accessSync, constants } from "fs";
 import { access, mkdir, rm, stat, writeFile } from "fs/promises";
 import { delimiter, dirname, isAbsolute, join } from "path";
@@ -60,6 +60,47 @@ const RESUME_MISS_PATTERNS = [
   /can't (resume|continue)/i,
 ];
 const executablePathCache = new Map<string, string>();
+
+export interface GenerateTitleOptions {
+  priority?: string[];
+  reuseSession?: boolean | Partial<Record<CliToolName, boolean>>;
+  projectDir?: string;
+  timeoutMs?: number;
+  retries?: number;
+  availableCliNames?: CliToolName[];
+}
+
+export interface GenerateTitleResult {
+  title: string;
+  usedCli: string;
+  attempts: number;
+}
+
+async function terminateProcessTree(child: ChildProcess): Promise<void> {
+  if (process.platform === "win32" && child.pid) {
+    await new Promise<void>((resolve) => {
+      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      const timeout = setTimeout(() => {
+        killer.kill();
+        resolve();
+      }, 5_000);
+      killer.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      killer.once("error", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+    return;
+  }
+
+  child.kill();
+}
 
 function resolveExecutablePath(command: string): string {
   if (process.platform !== "win32" || isAbsolute(command) || command.includes("/") || command.includes("\\")) {
@@ -125,6 +166,17 @@ async function detectAvailableCli(): Promise<CliTool[]> {
   return available;
 }
 
+function getToolsByName(names: readonly CliToolName[]): CliTool[] {
+  const toolsByName = new Map(CLI_TOOLS.map((tool) => [tool.name, tool]));
+  return names
+    .map((name) => toolsByName.get(name))
+    .filter((tool): tool is CliTool => !!tool);
+}
+
+export async function detectAvailableTitleGenerationClis(priority?: readonly string[]): Promise<CliToolName[]> {
+  return orderToolsByPriority(await detectAvailableCli(), priority).map((tool) => tool.name);
+}
+
 async function checkCliHealth(tool: CliTool): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
     const invocation = resolveSpawnInvocation(tool.command, tool.healthcheckArgs);
@@ -145,8 +197,7 @@ async function checkCliHealth(tool: CliTool): Promise<boolean> {
     };
 
     const timeout = setTimeout(() => {
-      child.kill();
-      finish(false);
+      void terminateProcessTree(child).finally(() => finish(false));
     }, 5_000);
 
     child.once("error", () => {
@@ -175,23 +226,57 @@ function orderToolsByPriority(tools: CliTool[], priority?: readonly string[]): C
   });
 }
 
-function buildContext(messages: Message[], maxChars = 2000): string {
-  const lines: string[] = [];
-  let charCount = 0;
+function pickSampledMessages(messages: Message[]): Message[] {
+  const visibleMessages = messages.filter((message) => message.role !== "tool" && message.content.trim());
+  if (visibleMessages.length <= 14) return visibleMessages;
 
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === "tool") continue;
-    const roleLabel = msg.role === "user" ? "用户" : "助手";
-    const text = msg.content.slice(0, 500);
-    const line = `${roleLabel}: ${text}`;
+  const head = visibleMessages.slice(0, 2);
+  const recent = visibleMessages.slice(-10);
+  const middleStart = Math.max(2, Math.floor(visibleMessages.length * 0.65) - 1);
+  const middle = visibleMessages.slice(middleStart, middleStart + 2);
+  const seen = new Set<Message>();
+  const sampled = [...head, ...middle, ...recent].filter((message) => {
+    if (seen.has(message)) return false;
+    seen.add(message);
+    return true;
+  });
+  return sampled.sort((a, b) => visibleMessages.indexOf(a) - visibleMessages.indexOf(b));
+}
 
-    if (charCount + line.length > maxChars) break;
-    lines.unshift(line);
-    charCount += line.length;
+function compactContextLinesForRecentPriority(lines: Array<{ line: string; recent: boolean }>, maxChars: number): string[] {
+  const selected = [...lines];
+  let charCount = selected.reduce((total, item) => total + item.line.length, 0);
+
+  while (charCount > maxChars && selected.length > 0) {
+    const removableIndex = selected.findIndex((item) => !item.recent);
+    const index = removableIndex >= 0 ? removableIndex : 0;
+    const [removed] = selected.splice(index, 1);
+    charCount -= removed?.line.length ?? 0;
   }
 
-  return lines.join("\n");
+  return selected.map((item) => item.line);
+}
+
+function buildContext(messages: Message[], maxChars = 5000): string {
+  const visibleMessages = messages.filter((message) => message.role !== "tool" && message.content.trim());
+  const recentMessages = new Set(visibleMessages.slice(-10));
+  const sampledMessages = pickSampledMessages(messages);
+  const lines: Array<{ line: string; recent: boolean }> = [];
+
+  for (const msg of sampledMessages) {
+    const roleLabel = msg.role === "user" ? "用户" : "助手";
+    const text = msg.content.replace(/\s+/g, " ").trim().slice(0, 700);
+    lines.push({
+      line: `${roleLabel}: ${text}`,
+      recent: recentMessages.has(msg),
+    });
+  }
+
+  return compactContextLinesForRecentPriority(lines, maxChars).join("\n");
+}
+
+export function buildTitlePromptContextForTest(messages: Message[], maxChars?: number): string {
+  return buildContext(messages, maxChars);
 }
 
 function stripTitleQuotes(text: string): string {
@@ -394,7 +479,7 @@ async function executeCli(
   args: string[],
   prompt: string,
   workDir: string,
-  options: { projectDir?: string } = {}
+  options: { projectDir?: string; timeoutMs?: number } = {}
 ): Promise<string> {
   const promptViaArgs = tool.promptMode === "args";
   const argsWithProjectDir = addProjectDirArg(tool, args, options.projectDir);
@@ -420,10 +505,26 @@ async function executeCli(
 
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    const resolveOnce = (value: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(value);
+    };
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    };
     const timeout = setTimeout(() => {
-      child.kill();
-      reject(new Error(`${tool.name} 执行超时`));
-    }, tool.timeoutMs ?? 30_000);
+      timedOut = true;
+      void terminateProcessTree(child).finally(() => {
+        rejectOnce(new Error(`${tool.name} 执行超时`));
+      });
+    }, options.timeoutMs ?? tool.timeoutMs ?? 30_000);
 
     child.stdout!.setEncoding("utf-8");
     child.stderr!.setEncoding("utf-8");
@@ -434,27 +535,26 @@ async function executeCli(
       stderr += chunk;
     });
     child.once("error", (error) => {
-      clearTimeout(timeout);
       console.error(`[AI] ${tool.name} spawn 错误:`, error.message);
-      reject(error);
+      rejectOnce(error);
     });
     child.once("close", (code) => {
-      clearTimeout(timeout);
+      if (timedOut) return;
       console.log(`[AI] ${tool.name} 退出 code=${code} stdout=${stdout.length}B stderr=${stderr.length}B`);
       if (stderr.trim()) {
         console.error(`[AI] ${tool.name} stderr: ${stderr.slice(0, 500)}`);
       }
       if (code !== 0) {
-        reject(new Error(stderr.trim() || `${tool.name} 执行失败 (${code ?? "unknown"})`));
+        rejectOnce(new Error(stderr.trim() || `${tool.name} 执行失败 (${code ?? "unknown"})`));
         return;
       }
       const output = stdout || stderr;
       if (!output.trim()) {
         const projectDirDetail = options.projectDir ? `, dir=${options.projectDir}` : "";
-        reject(new Error(`${tool.name} 未产生输出（cwd=${workDir}${projectDirDetail}）`));
+        rejectOnce(new Error(`${tool.name} 未产生输出（cwd=${workDir}${projectDirDetail}）`));
         return;
       }
-      resolve(output);
+      resolveOnce(output);
     });
 
     if (!promptViaArgs) {
@@ -469,7 +569,7 @@ async function executeCli(
 async function runCliTool(
   tool: CliTool,
   prompt: string,
-  options?: { reuseSession?: boolean; projectDir?: string }
+  options?: { reuseSession?: boolean; projectDir?: string; timeoutMs?: number }
 ): Promise<{ stdout: string; mode: CliRunMode }> {
   const workDir = await ensureCliSessionDir(tool.name);
   const allowReuseSession = options?.reuseSession ?? false;
@@ -493,7 +593,7 @@ async function runCliTool(
     args: string[],
     mode: CliRunMode
   ): Promise<{ stdout: string; mode: CliRunMode }> => {
-    const stdout = await executeCli(tool, args, prompt, workDir, { projectDir });
+    const stdout = await executeCli(tool, args, prompt, workDir, { projectDir, timeoutMs: options?.timeoutMs });
     if (tool.name !== "opencode") {
       return { stdout, mode };
     }
@@ -506,7 +606,10 @@ async function runCliTool(
     for (const fallbackProjectDir of opencodeFallbackProjectDirs) {
       const fallbackLabel = fallbackProjectDir ? `dir=${fallbackProjectDir}` : "无 --dir";
       console.warn(`[AI] ${tool.name} 在 ${failedDirs[failedDirs.length - 1]} 下未产生有效标题，回退到 ${fallbackLabel}`);
-      const fallbackStdout = await executeCli(tool, args, prompt, workDir, { projectDir: fallbackProjectDir });
+      const fallbackStdout = await executeCli(tool, args, prompt, workDir, {
+        projectDir: fallbackProjectDir,
+        timeoutMs: options?.timeoutMs,
+      });
       if (extractCleanOutput(fallbackStdout).trim().length > 0) {
         return {
           stdout: fallbackStdout,
@@ -544,17 +647,13 @@ async function runCliTool(
 
 export async function generateTitle(
   messages: Message[],
-  options?: {
-    priority?: string[];
-    reuseSession?: boolean | Partial<Record<CliToolName, boolean>>;
-    projectDir?: string;
-  }
-): Promise<{
-  title: string;
-  usedCli: string;
-}> {
+  options?: GenerateTitleOptions
+): Promise<GenerateTitleResult> {
+  const availableTools = options?.availableCliNames
+    ? getToolsByName(options.availableCliNames)
+    : await detectAvailableCli();
   const tools = orderToolsByPriority(
-    await detectAvailableCli(),
+    availableTools,
     options?.priority
   );
   if (tools.length === 0) {
@@ -564,29 +663,35 @@ export async function generateTitle(
   const context = buildContext(messages);
   const fullPrompt = INSTRUCTION + context;
   const failures: string[] = [];
+  let attempts = 0;
+  const maxAttemptsPerTool = Math.max(1, (options?.retries ?? 0) + 1);
 
   for (const tool of tools) {
-    try {
-      const reuseSession = typeof options?.reuseSession === "object"
-        ? options.reuseSession[tool.name] ?? false
-        : options?.reuseSession;
-      const result = await runCliTool(tool, fullPrompt, {
-        reuseSession,
-        projectDir: options?.projectDir,
-      });
-      console.log(`[AI] 调用 ${tool.name} (${result.mode})`);
-      const title = extractCleanOutput(result.stdout);
-      console.log(`[AI] ${tool.name} 提取标题: "${title}"`);
-      if (title && title.length > 0 && title.length < 100) {
-        console.log(`[AI] 成功使用 ${tool.name} 生成标题: "${title}"`);
-        return { title, usedCli: tool.name };
+    for (let attempt = 1; attempt <= maxAttemptsPerTool; attempt += 1) {
+      attempts += 1;
+      try {
+        const reuseSession = typeof options?.reuseSession === "object"
+          ? options.reuseSession[tool.name] ?? false
+          : options?.reuseSession;
+        const result = await runCliTool(tool, fullPrompt, {
+          reuseSession,
+          projectDir: options?.projectDir,
+          timeoutMs: options?.timeoutMs,
+        });
+        console.log(`[AI] 调用 ${tool.name} (${result.mode}, attempt=${attempt})`);
+        const title = extractCleanOutput(result.stdout);
+        console.log(`[AI] ${tool.name} 提取标题: "${title}"`);
+        if (title && title.length > 0 && title.length < 100) {
+          console.log(`[AI] 成功使用 ${tool.name} 生成标题: "${title}"`);
+          return { title, usedCli: tool.name, attempts };
+        }
+        console.log(`[AI] ${tool.name} 失败: 输出为空或格式无效`);
+        failures.push(`${tool.name}#${attempt}: 输出为空或格式无效`);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.error(`[AI] ${tool.name} 生成标题失败:`, message);
+        failures.push(`${tool.name}#${attempt}: ${message}`);
       }
-      console.log(`[AI] ${tool.name} 失败: 输出为空或格式无效`);
-      failures.push(`${tool.name}: 输出为空或格式无效`);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      console.error(`[AI] ${tool.name} 生成标题失败:`, message);
-      failures.push(`${tool.name}: ${message}`);
     }
   }
 

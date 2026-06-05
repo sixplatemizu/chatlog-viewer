@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { Message } from "../../providers/types.js";
-import { extractCleanOutput, generateTitle, getAvailableClis, resetSession } from "../ai.js";
+import { buildTitlePromptContextForTest, extractCleanOutput, generateTitle, getAvailableClis, resetSession } from "../ai.js";
 
 const SAMPLE_MESSAGES: Message[] = [
   {
@@ -229,6 +229,19 @@ test("标题提取会拒绝 OpenCode JSON default 占位输出", () => {
 test("标题提取会拒绝 CLI 状态占位输出", () => {
   assert.equal(extractCleanOutput("default"), "");
   assert.equal(extractCleanOutput("> default · deepseek-v4-flash"), "");
+});
+
+test("标题上下文会优先保留近期对话", () => {
+  const messages = Array.from({ length: 24 }, (_, index): Message => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `第${index + 1}轮 ${index < 6 ? "早期背景" : "普通内容"} ${index >= 18 ? "近期核心主题" : ""}`.trim(),
+  }));
+
+  const context = buildTitlePromptContextForTest(messages, 260);
+
+  assert.match(context, /近期核心主题/);
+  assert.match(context, /第24轮/);
+  assert.doesNotMatch(context, /第3轮/);
 });
 
 test("OpenCode 生成标题时会显式传入项目目录", async () => {

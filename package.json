@@ -8,7 +8,8 @@
     "build": "pnpm --filter web build && pnpm --filter server build",
     "typecheck": "pnpm --filter web typecheck && pnpm --filter server typecheck",
     "test": "pnpm --filter server test && pnpm --filter web test",
-    "bench:search-index": "pnpm --filter server bench:search-index"
+    "bench:search-index": "pnpm --filter server bench:search-index",
+    "title": "pnpm --filter server title"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
