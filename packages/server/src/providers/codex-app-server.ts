@@ -18,7 +18,7 @@ type PendingRequest = {
 const APP_SERVER_START_TIMEOUT_MS = 8000;
 const APP_SERVER_REQUEST_TIMEOUT_MS = 8000;
 
-function buildCodexAppServerSpawn(port: number): {
+function buildCodexAppServerSpawn(port: number, codexHome?: string): {
   command: string;
   args: string[];
   options: SpawnOptions;
@@ -32,6 +32,7 @@ function buildCodexAppServerSpawn(port: number): {
         shell: true,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
+        env: codexHome ? { ...process.env, CODEX_HOME: codexHome } : process.env,
       },
     };
   }
@@ -42,6 +43,7 @@ function buildCodexAppServerSpawn(port: number): {
     options: {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
+      env: codexHome ? { ...process.env, CODEX_HOME: codexHome } : process.env,
     },
   };
 }
@@ -217,17 +219,16 @@ class CodexAppServerClient {
 export function shouldUseCodexAppServerRename(): boolean {
   if (process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME === "0") return false;
   if (process.env.NODE_ENV === "test") return false;
-  if (process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH) return false;
-  if (process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH) return false;
   return true;
 }
 
 export async function setCodexThreadNameViaAppServer(
   threadId: string,
-  name: string
+  name: string,
+  codexHome?: string
 ): Promise<void> {
   const port = await getFreePort();
-  const appServer = buildCodexAppServerSpawn(port);
+  const appServer = buildCodexAppServerSpawn(port, codexHome);
   const child = spawn(appServer.command, appServer.args, appServer.options);
 
   try {
@@ -242,16 +243,20 @@ export async function setCodexThreadNameViaAppServer(
     }
   } finally {
     if (child.exitCode === null) {
-      terminateAppServer(child);
+      await terminateAppServer(child);
     }
   }
 }
 
-function terminateAppServer(child: ChildProcess): void {
+async function terminateAppServer(child: ChildProcess): Promise<void> {
   if (process.platform === "win32" && child.pid) {
-    spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
       windowsHide: true,
       stdio: "ignore",
+    });
+    await new Promise<void>((resolve) => {
+      killer.once("error", () => resolve());
+      killer.once("close", () => resolve());
     });
     return;
   }

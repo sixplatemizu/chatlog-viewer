@@ -11,7 +11,7 @@ import { IFlowProvider } from "./iflow.js";
 import { OpenCodeProvider } from "./opencode.js";
 import { clearProviderPathCache } from "../utils/provider-paths.js";
 import { getIndexedCacheSnapshot, getIndexedListCacheKey, queryConversationIndex, setCacheStoreDirForTests } from "../utils/cache.js";
-import { getNativeTitle, setNativeTitle } from "../utils/title-store.js";
+import { getNativeTitleSnapshot, setNativeTitleSnapshot } from "../utils/title-store.js";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
@@ -20,7 +20,9 @@ async function createBaseFixture(prefix: string) {
   const baseDir = await mkdtemp(join(tmpdir(), prefix));
   const storeDir = join(baseDir, ".chatlog-viewer");
   const previousStoreDir = process.env.CHATLOG_VIEWER_STORE_DIR;
+  const previousAppServerRename = process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME;
   process.env.CHATLOG_VIEWER_STORE_DIR = storeDir;
+  process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME = "0";
   clearProviderPathCache();
   setCacheStoreDirForTests(storeDir);
 
@@ -34,6 +36,12 @@ async function createBaseFixture(prefix: string) {
         delete process.env.CHATLOG_VIEWER_STORE_DIR;
       } else {
         process.env.CHATLOG_VIEWER_STORE_DIR = previousStoreDir;
+      }
+
+      if (previousAppServerRename === undefined) {
+        delete process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME;
+      } else {
+        process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME = previousAppServerRename;
       }
 
       clearProviderPathCache();
@@ -439,6 +447,42 @@ function createOpenCodeSchema(db: BetterSqlite3.Database): void {
     );
   `);
 }
+
+test("OpenCode schema 不兼容时不会伪装成空列表", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-schema-error-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+
+  try {
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    db.exec("CREATE TABLE unrelated (id TEXT PRIMARY KEY)");
+    db.close();
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    const provider = new OpenCodeProvider();
+    await assert.rejects(
+      provider.list(),
+      (error: unknown) => {
+        assert.equal((error as { status?: number }).status, 503);
+        assert.match((error as Error).message, /no such table: session/i);
+        return true;
+      }
+    );
+    provider.closeDb();
+  } finally {
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      else process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      if (previousDbPath === undefined) delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      else process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
+    });
+  }
+});
 
 test("OpenCode 会从 SQLite 构建列表、详情和搜索索引", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-opencode-indexing-");
@@ -1345,7 +1389,7 @@ test("Codex 删除仅存在于 state db 的对话后不会再次回填", async (
   }
 });
 
-test("Codex 手动标题写入 state db 后会刷新 transcript 列表标题", async () => {
+test("Codex app-server 改名后会立即同步 session index，读取不会反向修复其它字段", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-codex-native-title-refresh-");
   const storagePath = join(fixture.baseDir, "sessions");
   const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
@@ -1438,13 +1482,26 @@ test("Codex 手动标题写入 state db 后会刷新 transcript 列表标题", a
       db.close();
     }
 
-    provider = new CodexProvider();
+    provider = new CodexProvider({
+      shouldUseAppServerRename: () => true,
+      setThreadNameViaAppServer: async (threadId, title, codexHome) => {
+        assert.equal(codexHome, fixture.baseDir.replace(/\\/g, "/"));
+        const appServerDb = new Database(stateDbPath);
+        try {
+          const result = appServerDb.prepare("UPDATE threads SET title = ? WHERE id = ?")
+            .run(title, threadId);
+          assert.equal(result.changes, 1);
+        } finally {
+          appServerDb.close();
+        }
+      },
+    });
     const before = await provider.list({ eagerSearchIndex: true });
-    assert.equal(before[0]?.title, "请分析肝母细胞瘤机制相关研究进展");
-    assert.equal(before[0]?.badges?.some((badge) => badge.label === "标题回退"), true);
+    assert.equal(before[0]?.title, "hi");
+    assert.equal(before[0]?.badges?.some((badge) => badge.label === "标题回退") ?? false, false);
+    const originalTranscript = await readFile(sourceFile, "utf-8");
 
     await provider.updateTitle(`codex:${sessionId}`, "手动持久化标题");
-    await setNativeTitle(`codex:${sessionId}`, "手动持久化标题");
 
     const after = await provider.list({ eagerSearchIndex: true });
     assert.equal(after[0]?.title, "手动持久化标题");
@@ -1461,115 +1518,61 @@ test("Codex 手动标题写入 state db 后会刷新 transcript 列表标题", a
         preview: string;
       } | undefined;
       assert.equal(row?.title, "手动持久化标题");
-      assert.equal(row?.first_user_message, "手动持久化标题");
-      assert.equal(row?.preview, "手动持久化标题");
+      assert.equal(row?.first_user_message, "hi");
+      assert.equal(row?.preview, "hi");
     } finally {
       verifyDb.close();
     }
 
-    const firstLine = (await readFile(sourceFile, "utf-8")).split("\n")[0]!;
-    const meta = JSON.parse(firstLine) as { type: string; payload: { title?: string; id?: string } };
-    assert.equal(meta.type, "session_meta");
-    assert.equal(meta.payload.id, sessionId);
-    assert.equal(meta.payload.title, "手动持久化标题");
+    assert.equal(await readFile(sourceFile, "utf-8"), originalTranscript);
 
     const sessionIndexLine = (await readFile(sessionIndexFile, "utf-8")).trim();
     const sessionIndex = JSON.parse(sessionIndexLine) as { id: string; thread_name: string };
     assert.equal(sessionIndex.id, sessionId);
     assert.equal(sessionIndex.thread_name, "手动持久化标题");
 
-    const transcriptLines = (await readFile(sourceFile, "utf-8")).split("\n");
-    const weakenedMeta = JSON.parse(transcriptLines[0]!) as { type: string; payload: { title?: string } };
-    weakenedMeta.payload.title = "hi";
-    transcriptLines[0] = JSON.stringify(weakenedMeta);
-    await writeFile(sourceFile, transcriptLines.join("\n"), "utf-8");
-    const pollutedDb = new Database(stateDbPath);
+    await Promise.all([
+      provider.updateTitle(`codex:${sessionId}`, "并发标题一"),
+      provider.updateTitle(`codex:${sessionId}`, "并发标题二"),
+    ]);
+    const concurrentDb = new Database(stateDbPath, { readonly: true });
     try {
-      pollutedDb.prepare("UPDATE threads SET title = ?, first_user_message = ?, preview = ? WHERE id = ?")
-        .run("hi", "hi", "hi", sessionId);
-    } finally {
-      pollutedDb.close();
-    }
-    await writeFile(
-      sessionIndexFile,
-      `${JSON.stringify({ id: sessionId, thread_name: "hi", updated_at: "2026-03-01T00:00:09.000Z" })}\n`,
-      "utf-8"
-    );
-
-    const afterTranscriptReset = await provider.list({ eagerSearchIndex: true });
-    assert.equal(afterTranscriptReset[0]?.title, "手动持久化标题");
-    assert.equal(afterTranscriptReset[0]?.badges?.some((badge) => badge.label === "标题回退") ?? false, false);
-
-    const healedFirstLine = (await readFile(sourceFile, "utf-8")).split("\n")[0]!;
-    const healedMeta = JSON.parse(healedFirstLine) as { type: string; payload: { title?: string } };
-    assert.equal(healedMeta.payload.title, "手动持久化标题");
-
-    const healedDb = new Database(stateDbPath, { readonly: true });
-    try {
-      const row = healedDb.prepare("SELECT title, first_user_message, preview FROM threads WHERE id = ?").get(sessionId) as {
+      const row = concurrentDb.prepare("SELECT title FROM threads WHERE id = ?").get(sessionId) as {
         title: string;
-        first_user_message: string;
-        preview: string;
       } | undefined;
-      assert.equal(row?.title, "手动持久化标题");
-      assert.equal(row?.first_user_message, "手动持久化标题");
-      assert.equal(row?.preview, "手动持久化标题");
+      assert.equal(row?.title, "并发标题二");
     } finally {
-      healedDb.close();
+      concurrentDb.close();
     }
+    const concurrentIndex = JSON.parse(
+      (await readFile(sessionIndexFile, "utf-8")).trim()
+    ) as { thread_name: string };
+    assert.equal(concurrentIndex.thread_name, "并发标题二");
+    assert.equal((await provider.read(`codex:${sessionId}`)).title, "并发标题二");
+    assert.equal(await readFile(sourceFile, "utf-8"), originalTranscript);
 
-    const healedIndexLine = (await readFile(sessionIndexFile, "utf-8")).trim();
-    const healedIndex = JSON.parse(healedIndexLine) as { id: string; thread_name: string };
-    assert.equal(healedIndex.thread_name, "手动持久化标题");
-
-    (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
-    provider = null;
-
-    const resetDb = new Database(stateDbPath);
-    try {
-      resetDb.prepare("UPDATE threads SET title = ?, first_user_message = ?, preview = ? WHERE id = ?")
-        .run("hi", "hi", "hi", sessionId);
-    } finally {
-      resetDb.close();
-    }
-
-    provider = new CodexProvider();
-    const afterCodexReset = await provider.list({ eagerSearchIndex: true });
-    assert.equal(afterCodexReset[0]?.title, "手动持久化标题");
-    assert.equal(afterCodexReset[0]?.badges?.some((badge) => badge.label === "标题回退") ?? false, false);
-
-    const restoredDb = new Database(stateDbPath, { readonly: true });
-    try {
-      const row = restoredDb.prepare("SELECT title, first_user_message, preview FROM threads WHERE id = ?").get(sessionId) as {
-        title: string;
-        first_user_message: string;
-        preview: string;
-      } | undefined;
-      assert.equal(row?.title, "手动持久化标题");
-      assert.equal(row?.first_user_message, "手动持久化标题");
-      assert.equal(row?.preview, "手动持久化标题");
-    } finally {
-      restoredDb.close();
-    }
-
-    const detailAfterCodexReset = await provider.read(`codex:${sessionId}`);
-    assert.equal(detailAfterCodexReset.title, "手动持久化标题");
-
+    await setNativeTitleSnapshot(`codex:${sessionId}`, "过期审计快照");
     const externalTitleDb = new Database(stateDbPath);
     try {
-      externalTitleDb.prepare("UPDATE threads SET title = ?, first_user_message = ?, preview = ? WHERE id = ?")
-        .run("Codex 本地新标题", "Codex 本地新标题", "Codex 本地新标题", sessionId);
+      externalTitleDb.prepare("UPDATE threads SET title = ? WHERE id = ?")
+        .run("Codex 本地新标题", sessionId);
     } finally {
       externalTitleDb.close();
     }
+    await writeFile(
+      sessionIndexFile,
+      `${JSON.stringify({
+        id: sessionId,
+        thread_name: "Codex 本地新标题",
+        updated_at: "2026-03-01T00:00:09.000Z",
+      })}\n`,
+      "utf-8"
+    );
 
     const afterExternalTitle = await provider.list({ eagerSearchIndex: true });
     assert.equal(afterExternalTitle[0]?.title, "Codex 本地新标题");
-    assert.equal(await getNativeTitle(`codex:${sessionId}`), "Codex 本地新标题");
-
-    const externalSyncedFirstLine = (await readFile(sourceFile, "utf-8")).split("\n")[0]!;
-    const externalSyncedMeta = JSON.parse(externalSyncedFirstLine) as { type: string; payload: { title?: string } };
-    assert.equal(externalSyncedMeta.payload.title, "Codex 本地新标题");
+    assert.equal(await getNativeTitleSnapshot(`codex:${sessionId}`), "过期审计快照");
+    assert.equal(await readFile(sourceFile, "utf-8"), originalTranscript);
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
     await fixture.cleanup(() => {
@@ -1689,7 +1692,7 @@ test("Codex 手动标题会在缺少 session_index 记录时新增本地 resume 
   }
 });
 
-test("Codex fork 子对话弱标题会继承父对话标题并同步本地 resume", async () => {
+test("Codex fork 子对话保留自身原生标题，列表扫描不会自动写回父标题", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-codex-fork-title-inheritance-");
   const storagePath = join(fixture.baseDir, "sessions");
   const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
@@ -1830,7 +1833,7 @@ test("Codex fork 子对话弱标题会继承父对话标题并同步本地 resum
     provider = new CodexProvider();
     const items = await provider.list({ eagerSearchIndex: true });
     const child = items.find((item) => item.id === `codex:${childId}`);
-    assert.equal(child?.title, "父会话正式标题");
+    assert.equal(child?.title, "hi");
 
     const verifyDb = new Database(stateDbPath, { readonly: true });
     try {
@@ -1839,9 +1842,9 @@ test("Codex fork 子对话弱标题会继承父对话标题并同步本地 resum
         first_user_message: string;
         preview: string;
       } | undefined;
-      assert.equal(row?.title, "父会话正式标题");
-      assert.equal(row?.first_user_message, "父会话正式标题");
-      assert.equal(row?.preview, "父会话正式标题");
+      assert.equal(row?.title, "hi");
+      assert.equal(row?.first_user_message, "hi");
+      assert.equal(row?.preview, "hi");
     } finally {
       verifyDb.close();
     }
@@ -1854,13 +1857,13 @@ test("Codex fork 子对话弱标题会继承父对话标题并同步本地 resum
     assert.equal(childMeta.type, "session_meta");
     assert.equal(childMeta.payload.id, childId);
     assert.equal(childMeta.payload.forked_from_id, parentId);
-    assert.equal(childMeta.payload.title, "父会话正式标题");
+    assert.equal(childMeta.payload.title, undefined);
 
     const sessionIndexLines = (await readFile(sessionIndexFile, "utf-8")).trim().split(/\r?\n/);
     const childIndex = sessionIndexLines
       .map((line) => JSON.parse(line) as { id: string; thread_name: string })
       .find((entry) => entry.id === childId);
-    assert.equal(childIndex?.thread_name, "父会话正式标题");
+    assert.equal(childIndex?.thread_name, "hi");
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
     await fixture.cleanup(() => {
@@ -1943,7 +1946,7 @@ test("Codex 可直接修改仅存在于 state db 的对话标题", async () => {
         first_user_message: string;
       } | undefined;
       assert.equal(row?.title, "新的 State DB 标题");
-      assert.equal(row?.first_user_message, "新的 State DB 标题");
+      assert.equal(row?.first_user_message, "原始 State DB 首条消息");
     } finally {
       verifyDb.close();
     }
@@ -1965,7 +1968,7 @@ test("Codex 可直接修改仅存在于 state db 的对话标题", async () => {
   }
 });
 
-test("Codex state-only 对话会用 UI 管理标题修复回退标题", async () => {
+test("Codex state-only 对话不会用旧审计快照覆盖原生标题", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-codex-state-only-managed-title-");
   const storagePath = join(fixture.baseDir, "sessions");
   const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
@@ -1980,7 +1983,7 @@ test("Codex state-only 对话会用 UI 管理标题修复回退标题", async ()
     clearProviderPathCache();
 
     await mkdir(storagePath, { recursive: true });
-    await setNativeTitle(`codex:${sessionId}`, "UI 管理标题");
+    await setNativeTitleSnapshot(`codex:${sessionId}`, "过期审计快照");
 
     const db = new Database(stateDbPath);
     try {
@@ -2020,12 +2023,12 @@ test("Codex state-only 对话会用 UI 管理标题修复回退标题", async ()
 
     provider = new CodexProvider();
     const list = await provider.list({ eagerSearchIndex: true });
-    assert.equal(list[0]?.title, "UI 管理标题");
+    assert.equal(list[0]?.title, "hi");
     assert.equal(list[0]?.contentStatus, "metadata-only");
 
     const detail = await provider.read(`codex:${sessionId}`);
-    assert.equal(detail.title, "UI 管理标题");
-    assert.match(detail.titleGenerationHint ?? "", /UI 管理标题/);
+    assert.equal(detail.title, "hi");
+    assert.match(detail.titleGenerationHint ?? "", /现有标题: hi/);
 
     const verifyDb = new Database(stateDbPath, { readonly: true });
     try {
@@ -2034,9 +2037,9 @@ test("Codex state-only 对话会用 UI 管理标题修复回退标题", async ()
         first_user_message: string;
         preview: string;
       } | undefined;
-      assert.equal(row?.title, "UI 管理标题");
-      assert.equal(row?.first_user_message, "UI 管理标题");
-      assert.equal(row?.preview, "UI 管理标题");
+      assert.equal(row?.title, "hi");
+      assert.equal(row?.first_user_message, "hi");
+      assert.equal(row?.preview, "hi");
     } finally {
       verifyDb.close();
     }
@@ -2245,7 +2248,7 @@ test("Codex 列表会标记 ChatLog Viewer 内部 AI 标题生成会话", async 
   }
 });
 
-test("Codex 修改有 transcript 的对话 provider 时会同步 session_meta", async () => {
+test("Codex 修改有 transcript 的对话 provider 时不会改写任何标题字段", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-codex-provider-session-meta-");
   const storagePath = join(fixture.baseDir, "sessions");
   const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
@@ -2322,7 +2325,7 @@ test("Codex 修改有 transcript 的对话 provider 时会同步 session_meta", 
     }
 
     provider = new CodexProvider();
-    await setNativeTitle(`codex:${sessionId}`, "UI 管理标题");
+    await setNativeTitleSnapshot(`codex:${sessionId}`, "UI 管理标题");
     const updated = await provider.changeModelProviders([`codex:${sessionId}`], "octopus");
     assert.equal(updated, 1);
 
@@ -2334,8 +2337,8 @@ test("Codex 修改有 transcript 的对话 provider 时会同步 session_meta", 
         first_user_message: string;
       } | undefined;
       assert.equal(row?.model_provider, "octopus");
-      assert.equal(row?.title, "UI 管理标题");
-      assert.equal(row?.first_user_message, "UI 管理标题");
+      assert.equal(row?.title, "provider 同步测试");
+      assert.equal(row?.first_user_message, "provider 同步测试");
     } finally {
       verifyDb.close();
     }
@@ -2344,7 +2347,7 @@ test("Codex 修改有 transcript 的对话 provider 时会同步 session_meta", 
     const meta = JSON.parse(firstLine) as { type: string; payload: { model_provider?: string; title?: string } };
     assert.equal(meta.type, "session_meta");
     assert.equal(meta.payload.model_provider, "octopus");
-    assert.equal(meta.payload.title, "UI 管理标题");
+    assert.equal(meta.payload.title, "旧 transcript 标题");
   } finally {
     (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
     await fixture.cleanup(() => {

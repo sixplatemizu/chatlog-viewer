@@ -3,9 +3,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationViewer } from "./ConversationViewer";
 import type { Conversation } from "../lib/api";
 
-const { mockDeleteConversationMessages, mockGenerateAiTitle } = vi.hoisted(() => ({
+const { mockDeleteConversationMessages, mockGenerateAiTitle, mockUpdateTitle } = vi.hoisted(() => ({
   mockDeleteConversationMessages: vi.fn(),
   mockGenerateAiTitle: vi.fn(),
+  mockUpdateTitle: vi.fn(),
 }));
 
 vi.mock("../lib/api", async () => {
@@ -14,6 +15,7 @@ vi.mock("../lib/api", async () => {
     ...actual,
     deleteConversationMessages: mockDeleteConversationMessages,
     generateAiTitle: mockGenerateAiTitle,
+    updateTitle: mockUpdateTitle,
   };
 });
 
@@ -63,6 +65,7 @@ describe("ConversationViewer", () => {
   beforeEach(() => {
     mockDeleteConversationMessages.mockReset();
     mockGenerateAiTitle.mockReset();
+    mockUpdateTitle.mockReset();
   });
 
   it("批量删除模式会选择已加载消息并触发批量删除", async () => {
@@ -145,6 +148,48 @@ describe("ConversationViewer", () => {
       expect(onTitleChanged).toHaveBeenCalledWith("codex:test-1", "新的 AI 标题");
     });
     await waitFor(() => {
+      expect(onRefreshConversation).toHaveBeenCalledWith("codex:test-1");
+    });
+  });
+
+  it("手动修改标题成功后会回读原生标题", async () => {
+    const onTitleChanged = vi.fn().mockResolvedValue(undefined);
+    const onRefreshConversation = vi.fn().mockResolvedValue(undefined);
+    mockUpdateTitle.mockResolvedValue({
+      success: true,
+      title: "手动新标题",
+    });
+
+    render(
+      <ConversationViewer
+        conversation={baseConversation}
+        dark={false}
+        loading={false}
+        loadingEarlier={false}
+        onLoadEarlier={() => {}}
+        onExport={() => {}}
+        onDelete={() => {}}
+        onTitleChanged={onTitleChanged}
+        onRefreshConversation={onRefreshConversation}
+        onMessageUpdated={() => {}}
+        onMessagesDeleted={() => {}}
+        onNotify={() => {}}
+        codexModelProviders={["openai"]}
+        onChangeModelProvider={() => {}}
+        folderOptions={[]}
+        onChangeFolder={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByTitle("编辑标题"));
+    fireEvent.change(screen.getByDisplayValue("测试对话"), {
+      target: { value: "手动新标题" },
+    });
+    fireEvent.click(screen.getByTitle("保存标题"));
+
+    await waitFor(() => {
+      expect(mockUpdateTitle).toHaveBeenCalledWith("codex:test-1", "手动新标题");
+      expect(onTitleChanged).toHaveBeenCalledWith("codex:test-1", "手动新标题");
       expect(onRefreshConversation).toHaveBeenCalledWith("codex:test-1");
     });
   });

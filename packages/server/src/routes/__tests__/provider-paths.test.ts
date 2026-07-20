@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import type BetterSqlite3 from "better-sqlite3";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +16,9 @@ import {
   resolveProviderPaths,
   updateProviderConfigs,
 } from "../../utils/provider-paths.js";
+
+const require = createRequire(import.meta.url);
+const Database = require("better-sqlite3") as typeof BetterSqlite3;
 
 test.afterEach(() => {
   clearProviderPathCache();
@@ -330,6 +335,121 @@ test("更新 provider 配置时可自动迁移 storagePath 目录内容", async 
   }
 });
 
+test("OpenCode storage 迁移会安全复制内嵌 DB 和其他数据", async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-opencode-migrate-"));
+  const configPath = join(baseDir, "config.json");
+  const sourcePath = join(baseDir, "opencode-source");
+  const targetPath = join(baseDir, "opencode-target");
+  const sourceDbPath = join(sourcePath, "opencode.db");
+  const targetDbPath = join(targetPath, "opencode.db");
+  const env = { CHATLOG_VIEWER_CONFIG_PATH: configPath };
+
+  try {
+    await mkdir(join(sourcePath, "storage", "session"), { recursive: true });
+    await writeFile(join(sourcePath, "storage", "session", "session-1.json"), "{}\n", "utf-8");
+    const sourceDb = new Database(sourceDbPath);
+    sourceDb.pragma("journal_mode = WAL");
+    sourceDb.exec("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT)");
+    sourceDb.prepare("INSERT INTO session (id, title) VALUES (?, ?)").run("session-1", "OpenCode 标题");
+    sourceDb.close();
+    await writeFile(configPath, `${JSON.stringify({
+      providers: {
+        opencode: {
+          storagePath: sourcePath,
+          stateDbPath: sourceDbPath,
+        },
+      },
+    }, null, 2)}\n`, "utf-8");
+    clearProviderPathCache();
+
+    const updated = await updateProviderConfigs(
+      {
+        opencode: {
+          storagePath: targetPath,
+          stateDbPath: targetDbPath,
+        },
+      },
+      env,
+      baseDir,
+      { migrations: { opencode: { storagePath: true, stateDbPath: true } } }
+    );
+
+    await assert.rejects(() => access(sourcePath));
+    await access(join(targetPath, "storage", "session", "session-1.json"));
+    const targetDb = new Database(targetDbPath, { readonly: true });
+    try {
+      const row = targetDb.prepare("SELECT title FROM session WHERE id = ?").get("session-1") as {
+        title: string;
+      } | undefined;
+      assert.equal(row?.title, "OpenCode 标题");
+    } finally {
+      targetDb.close();
+    }
+    assert.deepEqual(
+      updated.migrationResults.map((item) => item.pathType),
+      ["stateDbPath", "storagePath"]
+    );
+  } finally {
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode 组合迁移发生目标冲突时恢复源数据和旧配置", async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-opencode-rollback-"));
+  const configPath = join(baseDir, "config.json");
+  const sourcePath = join(baseDir, "opencode-source");
+  const targetPath = join(baseDir, "opencode-target");
+  const sourceDbPath = join(sourcePath, "opencode.db");
+  const targetDbPath = join(targetPath, "opencode.db");
+  const env = { CHATLOG_VIEWER_CONFIG_PATH: configPath };
+
+  try {
+    await mkdir(join(sourcePath, "storage"), { recursive: true });
+    await mkdir(targetPath, { recursive: true });
+    await writeFile(join(sourcePath, "storage", "session.json"), "source\n", "utf-8");
+    await writeFile(join(targetPath, "storage"), "conflict\n", "utf-8");
+    const sourceDb = new Database(sourceDbPath);
+    sourceDb.exec("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT)");
+    sourceDb.prepare("INSERT INTO session (id, title) VALUES (?, ?)").run("session-1", "原始标题");
+    sourceDb.close();
+    await writeFile(configPath, `${JSON.stringify({
+      providers: {
+        opencode: {
+          storagePath: sourcePath,
+          stateDbPath: sourceDbPath,
+        },
+      },
+    }, null, 2)}\n`, "utf-8");
+    clearProviderPathCache();
+
+    await assert.rejects(
+      updateProviderConfigs(
+        {
+          opencode: {
+            storagePath: targetPath,
+            stateDbPath: targetDbPath,
+          },
+        },
+        env,
+        baseDir,
+        { migrations: { opencode: { storagePath: true, stateDbPath: true } } }
+      ),
+      /目标路径已存在同名内容/
+    );
+
+    await access(sourceDbPath);
+    await access(join(sourcePath, "storage", "session.json"));
+    await assert.rejects(() => access(targetDbPath));
+    const persisted = JSON.parse(await readFile(configPath, "utf-8")) as {
+      providers?: { opencode?: { storagePath?: string; stateDbPath?: string } };
+    };
+    assert.equal(persisted.providers?.opencode?.storagePath, sourcePath);
+    assert.equal(persisted.providers?.opencode?.stateDbPath, sourceDbPath);
+  } finally {
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
 test("自动迁移会拒绝过于宽泛的源目录", async () => {
   const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-provider-migrate-guard-"));
   const configPath = join(baseDir, "config.json");
@@ -387,7 +507,11 @@ test("更新 provider 配置时可自动迁移 Codex state db 文件", async () 
 
   try {
     await mkdir(sessionsPath, { recursive: true });
-    await writeFile(sourceStateDbPath, "sqlite", "utf-8");
+    const sourceDb = new Database(sourceStateDbPath);
+    sourceDb.pragma("journal_mode = WAL");
+    sourceDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)");
+    sourceDb.prepare("INSERT INTO threads (id, title) VALUES (?, ?)").run("thread-1", "WAL 中的标题");
+    sourceDb.close();
     await writeFile(
       configPath,
       `${JSON.stringify({
@@ -419,12 +543,74 @@ test("更新 provider 配置时可自动迁移 Codex state db 文件", async () 
         },
       }
     );
-
     await access(targetStateDbPath);
     await assert.rejects(() => access(sourceStateDbPath));
+    const targetDb = new Database(targetStateDbPath, { readonly: true });
+    try {
+      const row = targetDb.prepare("SELECT title FROM threads WHERE id = ?").get("thread-1") as {
+        title: string;
+      } | undefined;
+      assert.equal(row?.title, "WAL 中的标题");
+    } finally {
+      targetDb.close();
+    }
     assert.equal(updated.migrationResults.length, 1);
     assert.equal(updated.migrationResults[0]?.providerName, "codex");
     assert.equal(updated.migrationResults[0]?.pathType, "stateDbPath");
+  } finally {
+    await rm(baseDir, { recursive: true, force: true });
+  }
+});
+
+test("活动 SQLite 被占用时拒绝迁移并保持旧配置和源数据", async () => {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-provider-migrate-active-db-"));
+  const configPath = join(baseDir, "config.json");
+  const sessionsPath = join(baseDir, "sessions");
+  const sourceStateDbPath = join(baseDir, "state_5.sqlite");
+  const targetStateDbPath = join(baseDir, "migrated", "state_5.sqlite");
+  const env = { CHATLOG_VIEWER_CONFIG_PATH: configPath };
+
+  try {
+    await mkdir(sessionsPath, { recursive: true });
+    const sourceDb = new Database(sourceStateDbPath);
+    sourceDb.pragma("journal_mode = WAL");
+    sourceDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)");
+    sourceDb.prepare("INSERT INTO threads (id, title) VALUES (?, ?)").run("thread-active", "活动标题");
+    await writeFile(configPath, `${JSON.stringify({
+      providers: {
+        codex: {
+          storagePath: sessionsPath,
+          stateDbPath: sourceStateDbPath,
+        },
+      },
+    }, null, 2)}\n`, "utf-8");
+    clearProviderPathCache();
+
+    try {
+      await assert.rejects(
+        updateProviderConfigs(
+          {
+            codex: {
+              storagePath: sessionsPath,
+              stateDbPath: targetStateDbPath,
+            },
+          },
+          env,
+          baseDir,
+          { migrations: { codex: { stateDbPath: true } } }
+        ),
+        /busy|locked|占用|EPERM|EBUSY/i
+      );
+    } finally {
+      sourceDb.close();
+    }
+
+    await access(sourceStateDbPath);
+    await assert.rejects(() => access(targetStateDbPath));
+    const persistedConfig = JSON.parse(await readFile(configPath, "utf-8")) as {
+      providers?: { codex?: { stateDbPath?: string } };
+    };
+    assert.equal(persistedConfig.providers?.codex?.stateDbPath, sourceStateDbPath);
   } finally {
     await rm(baseDir, { recursive: true, force: true });
   }

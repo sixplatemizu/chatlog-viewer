@@ -247,6 +247,14 @@ export default function App() {
       // 检查是否是同一个文件夹
       const conv = conversations.find((c) => c.id === convId);
       if (!conv || isSameProjectPath(conv.projectKey, targetProjectKey)) return;
+      if (conv.capabilities?.canMoveConversation === false) {
+        pushToast({
+          variant: "warning",
+          title: "当前对话不支持移动",
+          description: conv.capabilities.moveConversationDisabledReason,
+        });
+        return;
+      }
 
       try {
         const res = await moveConversation(convId, targetProjectKey);
@@ -283,6 +291,7 @@ export default function App() {
   // 详情页文件夹下拉候选：同 provider 下去重后的所有文件夹（排除当前文件夹）。
   const folderOptionsForViewer = useMemo(() => {
     if (!conversation) return [];
+    if (conversation.capabilities?.canMoveConversation === false) return [];
     const seen = new Map<string, string>();
     for (const item of conversations) {
       if (item.provider !== conversation.provider) continue;

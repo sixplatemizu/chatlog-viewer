@@ -365,7 +365,7 @@ export function Sidebar({
 
         {partialSearch && searchWarnings.length > 0 && (
           <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-            <div className="font-medium">当前搜索结果可能不完整</div>
+            <div className="font-medium">当前结果可能不完整</div>
             <div className="mt-1 space-y-0.5">
               {searchWarnings.map((warning) => (
                 <div key={warning}>{warning}</div>

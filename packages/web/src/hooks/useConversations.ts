@@ -260,7 +260,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
       setProviderCounts(
         data.providerCounts ?? buildConversationProviderCountMap(currentProviders, data.conversations)
       );
-      setPartialSearch(!!data.partialSearch);
+      setPartialSearch(!!data.partialSearch || !!data.partialResults);
       setSearchWarnings(data.warnings ?? []);
       setCodexModelProviderCounts(data.codexModelProviderCounts ?? {});
       setListTruncated(!!data.listTruncated && typeof data.nextOffset === "number");
@@ -312,7 +312,7 @@ export function useConversations(options: UseConversationsOptions = {}) {
       setProviderCounts(
         data.providerCounts ?? buildConversationProviderCountMap(providers, mergedConversations)
       );
-      setPartialSearch(!!data.partialSearch);
+      setPartialSearch(!!data.partialSearch || !!data.partialResults);
       setSearchWarnings(data.warnings ?? []);
       setCodexModelProviderCounts(data.codexModelProviderCounts ?? {});
       setListTruncated(!!data.listTruncated && typeof data.nextOffset === "number");

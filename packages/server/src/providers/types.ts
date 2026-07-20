@@ -15,15 +15,33 @@ export interface ConversationProviderCapabilities {
   titleSyncMode?: TitleSyncMode;
   canUpdateTitle?: boolean;
   canGenerateTitle?: boolean;
+  canEditMessage?: boolean;
+  canDeleteMessage?: boolean;
+  canMoveConversation?: boolean;
+  canDeleteConversation?: boolean;
+  supportsMetadataOnly?: boolean;
   updateTitleDisabledReason?: string;
   generateTitleDisabledReason?: string;
+  editMessageDisabledReason?: string;
+  deleteMessageDisabledReason?: string;
+  moveConversationDisabledReason?: string;
+  deleteConversationDisabledReason?: string;
 }
 
 export interface ConversationCapabilities {
   canUpdateTitle: boolean;
   canGenerateTitle: boolean;
+  canEditMessage: boolean;
+  canDeleteMessage: boolean;
+  canMoveConversation: boolean;
+  canDeleteConversation: boolean;
+  supportsMetadataOnly: boolean;
   updateTitleDisabledReason?: string;
   generateTitleDisabledReason?: string;
+  editMessageDisabledReason?: string;
+  deleteMessageDisabledReason?: string;
+  moveConversationDisabledReason?: string;
+  deleteConversationDisabledReason?: string;
 }
 
 export interface ConversationProvider {

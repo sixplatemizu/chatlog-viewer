@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { copyFile, mkdir, open, rm } from "node:fs/promises";
+import { chmod, mkdir, open, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Message } from "../providers/types.js";
+import { MutationConflictError } from "./errors.js";
+import { runKeyedMutation } from "./mutation-queue.js";
 
 export interface MessageRecord<TEntry> {
   entry: TEntry;
@@ -18,6 +20,11 @@ interface MessageActionIndexEntry {
 }
 
 type JsonlFileChange = string | null | ((line: string) => string | null);
+
+export interface JsonlSourceRevision {
+  mtimeMs: number;
+  size: number;
+}
 
 const messageActionIndexCache = new Map<string, MessageActionIndexEntry>();
 
@@ -225,7 +232,8 @@ async function inspectJsonlFile(filePath: string): Promise<{ newline: string; tr
 
 async function replaceJsonlFile(
   filePath: string,
-  changes: Map<number, JsonlFileChange>
+  changes: Map<number, JsonlFileChange>,
+  expectedRevision?: JsonlSourceRevision
 ): Promise<void> {
   const normalizedChanges = new Map<number, JsonlFileChange>();
   for (const [lineNumber, nextLine] of changes) {
@@ -236,6 +244,17 @@ async function replaceJsonlFile(
   }
   if (normalizedChanges.size === 0) {
     return;
+  }
+
+  const sourceStat = await stat(filePath);
+  if (
+    expectedRevision
+    && (
+      sourceStat.mtimeMs !== expectedRevision.mtimeMs
+      || sourceStat.size !== expectedRevision.size
+    )
+  ) {
+    throw new MutationConflictError(`对话文件已被其他进程修改，请刷新后重试: ${filePath}`);
   }
 
   const { newline, trailingNewline } = await inspectJsonlFile(filePath);
@@ -307,7 +326,20 @@ async function replaceJsonlFile(
       });
     }
 
-    await copyFile(tempFile, filePath);
+    const tempHandle = await open(tempFile, "r+");
+    try {
+      await tempHandle.sync();
+    } finally {
+      await tempHandle.close();
+    }
+    await chmod(tempFile, sourceStat.mode);
+
+    const currentStat = await stat(filePath);
+    if (currentStat.mtimeMs !== sourceStat.mtimeMs || currentStat.size !== sourceStat.size) {
+      throw new MutationConflictError(`对话文件写入期间发生外部修改，请刷新后重试: ${filePath}`);
+    }
+
+    await rename(tempFile, filePath);
   } catch (error) {
     reader.close();
     writer.destroy();
@@ -321,17 +353,24 @@ async function replaceJsonlFile(
 export async function rewriteJsonlFileLine(
   filePath: string,
   lineNumber: number,
-  nextLine: JsonlFileChange
+  nextLine: JsonlFileChange,
+  expectedRevision?: JsonlSourceRevision
 ): Promise<void> {
-  await replaceJsonlFile(filePath, new Map([[lineNumber, nextLine]]));
+  await runKeyedMutation(`jsonl:${filePath}`, async () => {
+    await replaceJsonlFile(filePath, new Map([[lineNumber, nextLine]]), expectedRevision);
+  });
 }
 
 export async function rewriteJsonlFileLines(
   filePath: string,
-  lineNumbers: number[]
+  lineNumbers: number[],
+  expectedRevision?: JsonlSourceRevision
 ): Promise<void> {
-  await replaceJsonlFile(
-    filePath,
-    new Map([...new Set(lineNumbers)].map((lineNumber) => [lineNumber, null]))
-  );
+  await runKeyedMutation(`jsonl:${filePath}`, async () => {
+    await replaceJsonlFile(
+      filePath,
+      new Map([...new Set(lineNumbers)].map((lineNumber) => [lineNumber, null])),
+      expectedRevision
+    );
+  });
 }

@@ -7,15 +7,23 @@ import type {
   TitleSyncMode,
 } from "../providers/types.js";
 import { generateTitle } from "../utils/ai.js";
-import { getErrorMessage, isNotFoundError } from "../utils/errors.js";
+import { getErrorMessage, isNotFoundError, MutationConflictError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {
   getTitleGenerationCliPriority,
-  getTitleGenerationCliSessionModes,
   getTitleGenerationCliSessionReuse,
   type TitleGenerationCli,
 } from "../utils/provider-paths.js";
-import { deleteNativeTitle, deleteTitle, setNativeTitle, setTitle } from "../utils/title-store.js";
+import {
+  deleteNativeTitleSnapshot,
+  deleteTitle,
+  getTitle,
+  recordTitleHistory,
+  setNativeTitleSnapshot,
+  setTitle,
+  type TitleHistorySource,
+} from "../utils/title-store.js";
+import { runKeyedMutation } from "../utils/mutation-queue.js";
 
 export const MAX_TITLE_LENGTH = 100;
 
@@ -28,6 +36,7 @@ const TITLE_GENERATION_CLI_PROVIDER: Record<TitleGenerationCli, string> = {
 
 export interface GeneratedConversationTitle {
   success: true;
+  oldTitle: string;
   title: string;
   usedCli: string;
   attempts: number;
@@ -41,6 +50,12 @@ export interface GenerateConversationTitleOptions {
   timeoutMs?: number;
   retries?: number;
   availableCliNames?: TitleGenerationCli[];
+}
+
+export interface PersistConversationTitleOptions {
+  historySource?: TitleHistorySource;
+  expectedTitle?: string;
+  force?: boolean;
 }
 
 function isTitleGenerationCli(value: string): value is TitleGenerationCli {
@@ -73,17 +88,36 @@ export function resolveConversationCapabilities(provider: ConversationProvider |
     return {
       canUpdateTitle: true,
       canGenerateTitle: true,
+      canEditMessage: false,
+      canDeleteMessage: false,
+      canMoveConversation: false,
+      canDeleteConversation: false,
+      supportsMetadataOnly: false,
     };
   }
 
   const canUpdateTitle = provider.capabilities?.canUpdateTitle ?? true;
   const canGenerateTitle = provider.capabilities?.canGenerateTitle ?? canUpdateTitle;
+  const canEditMessage = provider.capabilities?.canEditMessage ?? !!provider.updateMessage;
+  const canDeleteMessage = provider.capabilities?.canDeleteMessage
+    ?? !!(provider.deleteMessage || provider.deleteMessages);
+  const canMoveConversation = provider.capabilities?.canMoveConversation ?? !!provider.move;
+  const canDeleteConversation = provider.capabilities?.canDeleteConversation ?? true;
 
   return {
     canUpdateTitle,
     canGenerateTitle,
+    canEditMessage,
+    canDeleteMessage,
+    canMoveConversation,
+    canDeleteConversation,
+    supportsMetadataOnly: provider.capabilities?.supportsMetadataOnly ?? false,
     updateTitleDisabledReason: provider.capabilities?.updateTitleDisabledReason,
     generateTitleDisabledReason: provider.capabilities?.generateTitleDisabledReason,
+    editMessageDisabledReason: provider.capabilities?.editMessageDisabledReason,
+    deleteMessageDisabledReason: provider.capabilities?.deleteMessageDisabledReason,
+    moveConversationDisabledReason: provider.capabilities?.moveConversationDisabledReason,
+    deleteConversationDisabledReason: provider.capabilities?.deleteConversationDisabledReason,
   };
 }
 
@@ -104,18 +138,60 @@ export function getTitleMutationDisabledReason(
 export async function persistConversationTitle(
   provider: ConversationProvider,
   id: string,
-  title: string
+  title: string,
+  options: PersistConversationTitleOptions = {}
 ): Promise<void> {
   const normalizedTitle = normalizeTitle(title);
+  const historySource = options.historySource ?? "chatlog-viewer";
 
   if (provider.updateTitle) {
-    await provider.updateTitle(id, normalizedTitle);
-    await setNativeTitle(id, normalizedTitle);
-    await deleteTitle(id);
+    await runKeyedMutation(`conversation-title:${id}`, async () => {
+      const previousTitle = (await provider.read(id, { limit: 1 })).title.trim() || null;
+      const expectedTitle = options.expectedTitle?.trim();
+      if (!options.force && expectedTitle !== undefined && previousTitle !== expectedTitle) {
+        throw new MutationConflictError(
+          `标题已被其他操作修改，已保留当前标题“${previousTitle || "空"}”，未覆盖为“${normalizedTitle}”`
+        );
+      }
+      await provider.updateTitle!(id, normalizedTitle);
+      const persistedTitle = (await provider.read(id, { limit: 1 })).title.trim();
+      if (persistedTitle !== normalizedTitle) {
+        throw new Error(
+          `${provider.displayName} 原生标题写入校验失败：期望“${normalizedTitle}”，实际“${persistedTitle || "空"}”`
+        );
+      }
+
+      try {
+        await setNativeTitleSnapshot(id, persistedTitle, {
+          historySource,
+          recordHistory: false,
+        });
+        await deleteTitle(id, { recordHistory: false });
+        await recordTitleHistory({
+          id,
+          action: "set-native-title",
+          source: historySource,
+          oldTitle: previousTitle,
+          newTitle: persistedTitle,
+        });
+      } catch (error) {
+        logProviderError("conversations.title.audit", provider.name, error);
+      }
+    });
     return;
   }
 
-  await setTitle(id, normalizedTitle);
+  await runKeyedMutation(`conversation-title:${id}`, async () => {
+    const providerTitle = (await provider.read(id, { limit: 1 })).title.trim() || null;
+    const currentOverlayTitle = (await getTitle(id))?.trim() || providerTitle;
+    const expectedTitle = options.expectedTitle?.trim();
+    if (!options.force && expectedTitle !== undefined && currentOverlayTitle !== expectedTitle) {
+      throw new MutationConflictError(
+        `标题已被其他操作修改，已保留当前标题“${currentOverlayTitle || "空"}”，未覆盖为“${normalizedTitle}”`
+      );
+    }
+    await setTitle(id, normalizedTitle, { historySource });
+  });
 }
 
 export function resolveConversationTitle(
@@ -166,7 +242,7 @@ async function deleteConversationWithCleanup(
   try {
     await provider.delete(id);
     await deleteTitle(id);
-    await deleteNativeTitle(id);
+    await deleteNativeTitleSnapshot(id);
     return { cleanedStale: false };
   } catch (error) {
     if (!isNotFoundError(error)) {
@@ -174,39 +250,53 @@ async function deleteConversationWithCleanup(
     }
 
     await deleteTitle(id);
-    await deleteNativeTitle(id);
+    await deleteNativeTitleSnapshot(id);
     return { cleanedStale: true };
   }
 }
 
 export async function cleanupFreshTitleGenerationSessions(
   providers: ConversationProvider[],
-  usedCli: string
+  usedCli: string,
+  sessionRetained: boolean,
+  sessionPersisted: boolean,
+  generatedSessionId?: string,
+  preexistingSessionIds: ReadonlySet<string> = new Set()
 ): Promise<number> {
-  if (!isTitleGenerationCli(usedCli)) return 0;
+  if (!isTitleGenerationCli(usedCli) || sessionRetained || !sessionPersisted) return 0;
 
-  const modes = getTitleGenerationCliSessionModes();
+  const providerName = TITLE_GENERATION_CLI_PROVIDER[usedCli];
+  const cleanupProvider = providers.find((provider) => provider.name === providerName);
+  if (!cleanupProvider) return 0;
+
+  if (generatedSessionId) {
+    const generatedId = `${providerName}:${generatedSessionId}`;
+    try {
+      await deleteConversationWithCleanup(cleanupProvider, generatedId);
+      return 1;
+    } catch (error) {
+      logProviderError("conversations.generate-title.cleanup", cleanupProvider.name, error);
+      return 0;
+    }
+  }
+
   let deleted = 0;
-  const cleanupProviderNames = new Set(
-    Object.entries(modes)
-      .filter(([, mode]) => mode === "fresh")
-      .map(([cli]) => TITLE_GENERATION_CLI_PROVIDER[cli as TitleGenerationCli])
-  );
+  let conversations: ConversationMeta[];
+  try {
+    conversations = await cleanupProvider.list({ eagerSearchIndex: false });
+  } catch (error) {
+    logProviderError("conversations.generate-title.cleanup-list", cleanupProvider.name, error);
+    return deleted;
+  }
+  for (const conversation of conversations) {
+    if (!hasTitleGenerationBadge(conversation)) continue;
+    if (preexistingSessionIds.has(conversation.id)) continue;
 
-  for (const providerName of cleanupProviderNames) {
-    const cleanupProvider = providers.find((provider) => provider.name === providerName);
-    if (!cleanupProvider) continue;
-
-    const conversations = await cleanupProvider.list({ eagerSearchIndex: false });
-    for (const conversation of conversations) {
-      if (!hasTitleGenerationBadge(conversation)) continue;
-
-      try {
-        await deleteConversationWithCleanup(cleanupProvider, conversation.id);
-        deleted += 1;
-      } catch (error) {
-        logProviderError("conversations.generate-title.cleanup", cleanupProvider.name, error);
-      }
+    try {
+      await deleteConversationWithCleanup(cleanupProvider, conversation.id);
+      deleted += 1;
+    } catch (error) {
+      logProviderError("conversations.generate-title.cleanup", cleanupProvider.name, error);
     }
   }
 
@@ -225,19 +315,94 @@ export async function generateAndPersistConversationTitle(
   }
 
   const conversation = await provider.read(id);
+  const reuseSession = options.reuseSession ?? getTitleGenerationCliSessionReuse();
+  const preexistingTitleSessions = new Map<TitleGenerationCli, Set<string>>();
+  const titleSessionSnapshotsReady = new Set<TitleGenerationCli>();
+  const generatedTitleSessionIds = new Map<TitleGenerationCli, Set<string>>();
   const startedAt = Date.now();
-  const result = await generateTitle(buildTitleGenerationMessages(conversation), {
-    priority: options.priority ?? getTitleGenerationCliPriority(),
-    reuseSession: options.reuseSession ?? getTitleGenerationCliSessionReuse(),
-    projectDir: conversation.project,
-    timeoutMs: options.timeoutMs,
-    retries: options.retries,
-    availableCliNames: options.availableCliNames,
-  });
-  await persistConversationTitle(provider, id, result.title);
-  const cleanedTitleSessions = await cleanupFreshTitleGenerationSessions(providers, result.usedCli);
+  let cleanedTitleSessions = 0;
+  let result: Awaited<ReturnType<typeof generateTitle>>;
+
+  try {
+    result = await generateTitle(buildTitleGenerationMessages(conversation), {
+      priority: options.priority ?? getTitleGenerationCliPriority(),
+      reuseSession,
+      projectDir: conversation.project,
+      timeoutMs: options.timeoutMs,
+      retries: options.retries,
+      availableCliNames: options.availableCliNames,
+      beforeToolRun: async (toolName, run) => {
+        const toolReusesSession = typeof reuseSession === "object"
+          ? reuseSession[toolName] ?? false
+          : reuseSession;
+        if (!run.sessionWillPersist || (toolReusesSession && toolName !== "opencode")) return;
+        if (preexistingTitleSessions.has(toolName)) return;
+        const providerName = TITLE_GENERATION_CLI_PROVIDER[toolName];
+        const titleProvider = providers.find((item) => item.name === providerName);
+        if (!titleProvider) {
+          preexistingTitleSessions.set(toolName, new Set());
+          return;
+        }
+
+        try {
+          const conversations = await titleProvider.list({ eagerSearchIndex: false });
+          preexistingTitleSessions.set(
+            toolName,
+            new Set(conversations.filter(hasTitleGenerationBadge).map((entry) => entry.id))
+          );
+          titleSessionSnapshotsReady.add(toolName);
+        } catch (error) {
+          logProviderError("conversations.generate-title.snapshot", titleProvider.name, error);
+        }
+      },
+      afterToolRun: (toolName, run) => {
+        if (!run.sessionPersisted || !run.generatedSessionId) return;
+        if (run.sessionRetained) {
+          const providerName = TITLE_GENERATION_CLI_PROVIDER[toolName];
+          preexistingTitleSessions.get(toolName)?.add(`${providerName}:${run.generatedSessionId}`);
+          return;
+        }
+        const sessionIds = generatedTitleSessionIds.get(toolName) ?? new Set<string>();
+        sessionIds.add(run.generatedSessionId);
+        generatedTitleSessionIds.set(toolName, sessionIds);
+      },
+    });
+    await persistConversationTitle(provider, id, result.title, {
+      historySource: "ai",
+      expectedTitle: conversation.title,
+    });
+  } finally {
+    const cleanupToolNames = new Set<TitleGenerationCli>([
+      ...preexistingTitleSessions.keys(),
+      ...generatedTitleSessionIds.keys(),
+    ]);
+    for (const toolName of cleanupToolNames) {
+      const preexistingSessionIds = preexistingTitleSessions.get(toolName) ?? new Set<string>();
+      for (const sessionId of generatedTitleSessionIds.get(toolName) ?? []) {
+        cleanedTitleSessions += await cleanupFreshTitleGenerationSessions(
+          providers,
+          toolName,
+          false,
+          true,
+          sessionId,
+          preexistingSessionIds
+        );
+      }
+      if (!titleSessionSnapshotsReady.has(toolName)) continue;
+      cleanedTitleSessions += await cleanupFreshTitleGenerationSessions(
+        providers,
+        toolName,
+        false,
+        true,
+        undefined,
+        preexistingSessionIds
+      );
+    }
+  }
+
   return {
     success: true,
+    oldTitle: conversation.title,
     title: result.title,
     usedCli: result.usedCli,
     attempts: result.attempts,

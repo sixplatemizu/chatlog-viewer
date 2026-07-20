@@ -40,7 +40,7 @@ importers:
     dependencies:
       '@hono/node-server':
         specifier: ^1.19.14
-        version: 1.19.14(hono@4.12.19)
+        version: 1.19.14(hono@4.12.31)
       better-sqlite3:
         specifier: ^11.8.1
         version: 11.10.0
@@ -48,8 +48,8 @@ importers:
         specifier: ^11.0.1
         version: 11.1.0
       hono:
-        specifier: ^4.12.19
-        version: 4.12.19
+        specifier: ^4.12.31
+        version: 4.12.31
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^7.6.13
@@ -1539,8 +1539,8 @@ packages:
   highlightjs-vue@1.0.0:
     resolution: {integrity: sha512-PDEfEF102G23vHmPhLyPboFCD+BkMGu+GuJe2d9/eH4FsCwvgBpnc9n0pGE+ffKdph38s6foEZiEjdgHdzp+IA==}
 
-  hono@4.12.19:
-    resolution: {integrity: sha512-xa3eYXYXx68XTT4hZ7dRzsXBhaq85ToSrlUJNoR0gwz/1Ap/CNwX47wfvV7pc/xWhjKVVkLT7zBJy8chhNguqQ==}
+  hono@4.12.31:
+    resolution: {integrity: sha512-zJIHFrl6bq3RDd2YusFNCDlM8qUprxKswyi/OPzPyzKDdyBXDqWx8bZlZ7R+saTdSTatUmb3O7K4SspGPaEOQg==}
     engines: {node: '>=16.9.0'}
 
   html-encoding-sniffer@6.0.0:
@@ -2917,9 +2917,9 @@ snapshots:
 
   '@exodus/bytes@1.15.0': {}
 
-  '@hono/node-server@1.19.14(hono@4.12.19)':
+  '@hono/node-server@1.19.14(hono@4.12.31)':
     dependencies:
-      hono: 4.12.19
+      hono: 4.12.31
 
   '@humanfs/core@0.19.1': {}
 
@@ -3856,7 +3856,7 @@ snapshots:
 
   highlightjs-vue@1.0.0: {}
 
-  hono@4.12.19: {}
+  hono@4.12.31: {}
 
   html-encoding-sniffer@6.0.0:
     dependencies:

@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { logger } from "hono/logger";
 import { createConversationRoutes } from "./routes/conversations.js";
 import { createSettingsRoutes } from "./routes/settings.js";
@@ -13,6 +14,7 @@ import { API_TOKEN_HEADER } from "./utils/api-token.js";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const DEFAULT_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"];
+const MAX_API_BODY_SIZE = 2 * 1024 * 1024;
 
 export const DEFAULT_SERVER_HOSTNAME = "127.0.0.1";
 
@@ -136,6 +138,11 @@ export function createApp(
     origin: (origin) => (origin && isAllowedOriginInSet(origin, allowedOriginSet) ? origin : ""),
     allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowHeaders: ["Content-Type", API_TOKEN_HEADER],
+  }));
+
+  app.use("/api/*", bodyLimit({
+    maxSize: MAX_API_BODY_SIZE,
+    onError: (c) => c.json({ error: "请求体不能超过 2 MiB" }, 413),
   }));
 
   app.route("/api", createConversationRoutes(providers));

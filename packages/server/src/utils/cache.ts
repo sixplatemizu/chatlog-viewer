@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
 
 const INDEX_TTL_MS = 30_000;
+const SIGNATURE_CACHE_MAX_AGE_MS = 5 * 60_000;
 const CACHE_PRUNE_INTERVAL_MS = 5 * 60_000;
 const VACUUM_INTERVAL_MS = 24 * 60 * 60_000;
 const META_CACHE_MAX_AGE_MS = 90 * 24 * 60 * 60_000;
@@ -644,6 +645,9 @@ function isUsableIndexedListCache(
 ): boolean {
   const hasSourceSignature = options?.sourceSignature !== undefined;
 
+  if (hasSourceSignature && now - updatedAt > SIGNATURE_CACHE_MAX_AGE_MS) {
+    return false;
+  }
   if (!hasSourceSignature && now - updatedAt > ttlMs) {
     return false;
   }

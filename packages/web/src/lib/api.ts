@@ -104,6 +104,7 @@ export interface ProviderPathMigrationResult {
   toPath: string;
   mode: "moved" | "merged";
   message: string;
+  cleanupWarning?: string;
 }
 
 export type TitleGenerationCli = "codex" | "claude" | "opencode";
@@ -121,8 +122,17 @@ export interface ConversationBadge {
 export interface ConversationCapabilities {
   canUpdateTitle: boolean;
   canGenerateTitle: boolean;
+  canEditMessage?: boolean;
+  canDeleteMessage?: boolean;
+  canMoveConversation?: boolean;
+  canDeleteConversation?: boolean;
+  supportsMetadataOnly?: boolean;
   updateTitleDisabledReason?: string;
   generateTitleDisabledReason?: string;
+  editMessageDisabledReason?: string;
+  deleteMessageDisabledReason?: string;
+  moveConversationDisabledReason?: string;
+  deleteConversationDisabledReason?: string;
 }
 
 export interface ConversationMeta {
@@ -172,6 +182,7 @@ export interface ConversationListResponse {
   listTruncated?: boolean;
   nextOffset?: number;
   partialSearch?: boolean;
+  partialResults?: boolean;
   warnings?: string[];
 }
 

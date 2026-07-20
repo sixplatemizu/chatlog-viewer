@@ -21,6 +21,16 @@ import {
 export type Scope = "all" | "cwd";
 export type OutputFormat = "table" | "json";
 export type ProjectMode = "exact" | "recursive";
+export type ManagedProviderName = "codex" | "claude-code" | "opencode";
+export type ProviderSelection = ManagedProviderName | "all";
+export type TitleCliCommand = "list" | "rename" | "generate" | "generate-batch" | "rollback";
+
+export interface TitleCliSummary {
+  total: number;
+  success: number;
+  failed: number;
+  skipped: number;
+}
 
 export interface CliOptions {
   scope: Scope;
@@ -29,6 +39,7 @@ export interface CliOptions {
   format: OutputFormat;
   projectPath: string;
   projectMode: ProjectMode;
+  provider: ProviderSelection;
   includeTitleSessions: boolean;
   continueOnError: boolean;
   dryRun: boolean;
@@ -37,42 +48,73 @@ export interface CliOptions {
   retries?: number;
   cliPriority?: TitleGenerationCli[];
   reuseSession?: boolean;
+  force: boolean;
 }
 
 interface CliContext {
   providers: ConversationProvider[];
-  provider: ConversationProvider;
+  managedProviders: Map<ManagedProviderName, ConversationProvider>;
+  availableProviderNames: Set<ManagedProviderName>;
 }
 
 const DEFAULT_LIMIT = 20;
+export const TITLE_CLI_SCHEMA_VERSION = 1;
 const TITLE_GENERATION_BADGE_LABEL = "标题生成";
 const TITLE_GENERATION_CLI_SET = new Set<TitleGenerationCli>(["codex", "claude", "opencode"]);
+const MANAGED_PROVIDER_NAMES: ManagedProviderName[] = ["codex", "claude-code", "opencode"];
+const MANAGED_PROVIDER_SET = new Set<ManagedProviderName>(MANAGED_PROVIDER_NAMES);
+const TITLE_SUCCESS_STATUSES = new Set(["success", "rolled-back"]);
 
 function printHelp(): void {
-  console.log(`ChatLog Viewer Codex title manager
+  console.log(`ChatLog Viewer title manager
 
 Usage:
-  clv-title [interactive] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
-  clv-title list [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
-  clv-title rename <sessionId|codex:sessionId> <title>
-  clv-title generate <sessionId|codex:sessionId> [--cli codex,opencode] [--timeout ms] [--retries n]
-  clv-title generate-batch [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
-  clv-title rollback --report path [--json] [--continue-on-error] [--dry-run]
+  clv-title [interactive] [--provider codex|claude-code|opencode|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
+  clv-title list [--provider codex|claude-code|opencode|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
+  clv-title rename <sessionId|provider:sessionId> <title> [--provider codex|claude-code|opencode] [--json]
+  clv-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode] [--cli opencode,codex,claude] [--timeout ms] [--retries n] [--json]
+  clv-title generate-batch [--provider codex|claude-code|opencode|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
+  clv-title rollback --report path [--json] [--continue-on-error] [--dry-run] [--force]
 
 Examples:
   pnpm title
-  pnpm title -- list --scope all --limit 30
+  pnpm title -- list --provider all --scope all --limit 30
   pnpm title -- list --project C:/Users/mortis097 --exact
   pnpm title -- rename codex:<sessionId> "新的标题"
-  pnpm title -- generate codex:<sessionId>
-  pnpm title -- generate-batch --project C:/Users/mortis097 --exact --json --continue-on-error
-  pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/2026-06-05/codex-title-generate-batch-2026-06-05-120000.json
+  pnpm title -- rename claude-code:<sessionId> "新的标题"
+  pnpm title -- generate opencode:<sessionId> --cli opencode,codex
+  pnpm title -- generate-batch --provider all --project C:/Users/mortis097 --exact --json --continue-on-error
+  pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/2026-06-05/conversation-title-generate-batch-2026-06-05-120000.json
 `);
 }
 
-function normalizeId(value: string): string {
+function parseProviderSelection(value: string | undefined): ProviderSelection | null {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "claude") return "claude-code";
+  if (normalized === "open-code") return "opencode";
+  if (normalized === "all" || MANAGED_PROVIDER_SET.has(normalized as ManagedProviderName)) {
+    return normalized as ProviderSelection;
+  }
+  return null;
+}
+
+export function normalizeConversationId(value: string, defaultProvider: ProviderSelection = "codex"): string {
   const trimmed = value.trim();
-  return trimmed.includes(":") ? trimmed : `codex:${trimmed}`;
+  if (!trimmed) throw new Error("对话 ID 不能为空");
+  if (!trimmed.includes(":")) {
+    if (defaultProvider === "all") {
+      throw new Error("--provider all 时必须使用带 provider 前缀的完整对话 ID");
+    }
+    return `${defaultProvider}:${trimmed}`;
+  }
+
+  const separatorIndex = trimmed.indexOf(":");
+  const providerName = parseProviderSelection(trimmed.slice(0, separatorIndex));
+  const sessionId = trimmed.slice(separatorIndex + 1).trim();
+  if (!providerName || providerName === "all" || !sessionId) {
+    throw new Error(`不支持的对话 ID：${trimmed}`);
+  }
+  return `${providerName}:${sessionId}`;
 }
 
 function normalizePathForCompare(value: string | undefined): string {
@@ -112,10 +154,12 @@ export function parseArgs(args: string[]): { command: string; commandArgs: strin
     format: "table",
     projectPath: "",
     projectMode: "exact",
+    provider: "codex",
     includeTitleSessions: false,
     continueOnError: false,
     dryRun: false,
     reportPath: "",
+    force: false,
   };
   const commandArgs: string[] = [];
   let help = false;
@@ -134,6 +178,15 @@ export function parseArgs(args: string[]): { command: string; commandArgs: strin
       if (value === "all" || value === "cwd") {
         options.scope = value;
       }
+      index += 1;
+      continue;
+    }
+    if (arg === "--provider") {
+      const provider = parseProviderSelection(args[index + 1]);
+      if (!provider) {
+        throw new Error("provider 只能是 codex、claude-code、opencode 或 all");
+      }
+      options.provider = provider;
       index += 1;
       continue;
     }
@@ -190,6 +243,10 @@ export function parseArgs(args: string[]): { command: string; commandArgs: strin
       options.dryRun = true;
       continue;
     }
+    if (arg === "--force") {
+      options.force = true;
+      continue;
+    }
     if (arg === "--report") {
       options.reportPath = args[index + 1]?.trim() ?? "";
       index += 1;
@@ -228,6 +285,67 @@ export function parseArgs(args: string[]): { command: string; commandArgs: strin
 function formatDate(timestamp: number): string {
   if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
   return new Date(timestamp).toLocaleString();
+}
+
+export function formatCliJson(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function writeCliJson(value: unknown): void {
+  process.stdout.write(formatCliJson(value));
+}
+
+function writeCliJsonError(command: string, error: unknown): void {
+  process.stderr.write(formatCliJson({
+    schemaVersion: TITLE_CLI_SCHEMA_VERSION,
+    command,
+    ok: false,
+    summary: {
+      total: 1,
+      success: 0,
+      failed: 1,
+      skipped: 0,
+    } satisfies TitleCliSummary,
+    error: formatTitleActionError(error),
+  }));
+}
+
+export function summarizeTitleEntries(
+  entries: ReadonlyArray<{ status: string }>,
+  successStatuses: ReadonlySet<string> = TITLE_SUCCESS_STATUSES
+): TitleCliSummary {
+  return entries.reduce<TitleCliSummary>((summary, entry) => {
+    summary.total += 1;
+    if (successStatuses.has(entry.status)) {
+      summary.success += 1;
+    } else if (entry.status === "failed") {
+      summary.failed += 1;
+    } else {
+      summary.skipped += 1;
+    }
+    return summary;
+  }, {
+    total: 0,
+    success: 0,
+    failed: 0,
+    skipped: 0,
+  });
+}
+
+export function buildTitleCliJsonResult<T extends { status: string }>(
+  command: Exclude<TitleCliCommand, "list">,
+  entries: readonly T[],
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const summary = summarizeTitleEntries(entries);
+  return {
+    ...extra,
+    schemaVersion: TITLE_CLI_SCHEMA_VERSION,
+    command,
+    ok: summary.failed === 0 && !entries.some((entry) => entry.status === "pending"),
+    summary,
+    entries,
+  };
 }
 
 function truncate(value: string, maxLength: number): string {
@@ -289,29 +407,83 @@ function matchesSearch(conversation: ConversationMeta, search: string): boolean 
   return [
     conversation.title,
     conversation.id,
+    conversation.provider,
     conversation.project,
     conversation.modelProvider ?? "",
     ...(conversation.badges ?? []).map((badge) => badge.label),
   ].some((value) => value.toLowerCase().includes(normalizedSearch));
 }
 
-async function createContext(): Promise<CliContext> {
+async function createContext(selection: ProviderSelection): Promise<CliContext> {
   const providers = createDefaultProviders();
-  const provider = providers.find((item) => item.name === "codex");
-  if (!provider) {
-    throw new Error("Codex provider 不可用");
+  const managedProviders = new Map<ManagedProviderName, ConversationProvider>();
+  for (const providerName of MANAGED_PROVIDER_NAMES) {
+    const provider = providers.find((item) => item.name === providerName);
+    if (provider) managedProviders.set(providerName, provider);
   }
-  if (!(await provider.detect())) {
-    throw new Error(`Codex provider 不可用，存储路径: ${provider.getStoragePath()}`);
-  }
-  return { providers, provider };
+
+  const namesToDetect = selection === "all" ? MANAGED_PROVIDER_NAMES : [selection];
+  const detectionResults = await Promise.all(namesToDetect.map(async (providerName) => {
+    const provider = managedProviders.get(providerName);
+    if (!provider) return { providerName, available: false };
+    try {
+      return { providerName, available: await provider.detect() };
+    } catch {
+      return { providerName, available: false };
+    }
+  }));
+  const availableProviderNames = new Set(
+    detectionResults
+      .filter((item) => item.available)
+      .map((item) => item.providerName)
+  );
+  return { providers, managedProviders, availableProviderNames };
 }
 
-async function listConversations(
-  provider: ConversationProvider,
+function getProviderForId(context: CliContext, id: string): ConversationProvider {
+  const providerName = id.slice(0, id.indexOf(":")) as ManagedProviderName;
+  const provider = context.managedProviders.get(providerName);
+  if (!provider || !context.availableProviderNames.has(providerName)) {
+    const storagePath = provider?.getStoragePath();
+    throw new Error(
+      `${provider?.displayName ?? providerName} provider 不可用${storagePath ? `，存储路径: ${storagePath}` : ""}`
+    );
+  }
+  return provider;
+}
+
+function getSelectedProviders(context: CliContext, selection: ProviderSelection): ConversationProvider[] {
+  const names = selection === "all" ? MANAGED_PROVIDER_NAMES : [selection];
+  const selected = names.flatMap((providerName) => {
+    const provider = context.managedProviders.get(providerName);
+    return provider && context.availableProviderNames.has(providerName) ? [provider] : [];
+  });
+  if (selected.length === 0) {
+    throw new Error(`没有可用的目标 provider：${selection}`);
+  }
+  return selected;
+}
+
+function resolveContextSelection(
+  command: string,
+  commandArgs: string[],
   options: CliOptions
-): Promise<ConversationMeta[]> {
-  const conversations = await provider.list({ eagerSearchIndex: false });
+): ProviderSelection {
+  if (command === "list" || command === "generate-batch") {
+    return options.provider;
+  }
+  if ((command === "rename" || command === "generate") && commandArgs[0]) {
+    const id = normalizeConversationId(commandArgs[0], options.provider);
+    return id.slice(0, id.indexOf(":")) as ManagedProviderName;
+  }
+  return "all";
+}
+
+async function listConversations(context: CliContext, options: CliOptions): Promise<ConversationMeta[]> {
+  const selectedProviders = getSelectedProviders(context, options.provider);
+  const conversations = (
+    await Promise.all(selectedProviders.map((provider) => provider.list({ eagerSearchIndex: false })))
+  ).flat();
   return filterConversations(conversations, options);
 }
 
@@ -330,37 +502,85 @@ export function filterConversations(
 
 function printConversations(conversations: ConversationMeta[], options: CliOptions): void {
   if (options.format === "json") {
-    console.log(JSON.stringify(conversations, null, 2));
+    writeCliJson(conversations);
     return;
   }
 
   if (conversations.length === 0) {
-    console.log("没有匹配的 Codex 对话记录");
+    console.log("没有匹配的对话记录");
     return;
   }
 
-  console.log(`\n${"No.".padEnd(4)} ${"Updated".padEnd(20)} ${"Provider".padEnd(12)} ${"Title".padEnd(42)} Project`);
-  console.log("-".repeat(100));
+  console.log(`\n${"No.".padEnd(4)} ${"Updated".padEnd(20)} ${"Source".padEnd(13)} ${"Model".padEnd(12)} ${"Title".padEnd(42)} Project`);
+  console.log("-".repeat(114));
   conversations.forEach((conversation, index) => {
-    const provider = conversation.modelProvider ?? "-";
+    const source = conversation.provider;
+    const modelProvider = conversation.modelProvider ?? "-";
     const title = truncate(conversation.title || "(无标题)", 40);
     const project = truncate(conversation.project || "-", 48);
     console.log(
-      `${String(index + 1).padEnd(4)} ${formatDate(conversation.updatedAt).padEnd(20)} ${provider.padEnd(12)} ${title.padEnd(42)} ${project}`
+      `${String(index + 1).padEnd(4)} ${formatDate(conversation.updatedAt).padEnd(20)} ${source.padEnd(13)} ${modelProvider.padEnd(12)} ${title.padEnd(42)} ${project}`
     );
   });
   console.log("\n提示：交互模式下输入序号选择对话；脚本模式可使用完整 id。");
 }
 
+function printSingleTitleResult(
+  command: "rename" | "generate",
+  entry: {
+    id: string;
+    oldTitle: string;
+    newTitle: string;
+    status: "success";
+    usedCli?: string;
+    attempts?: number;
+    cleanedTitleSessions?: number;
+    durationMs?: number;
+  },
+  options: CliOptions
+): void {
+  const result = buildTitleCliJsonResult(command, [entry]);
+  if (options.format === "json") {
+    writeCliJson(result);
+    return;
+  }
+
+  if (command === "rename") {
+    console.log(`已修改标题：${entry.newTitle}`);
+    return;
+  }
+
+  const cleanupSuffix = entry.cleanedTitleSessions
+    ? `，已清理 ${entry.cleanedTitleSessions} 条内部标题会话`
+    : "";
+  console.log(
+    `已通过 ${entry.usedCli} 生成标题（attempts=${entry.attempts}，耗时 ${entry.durationMs}ms）${cleanupSuffix}`
+  );
+  console.log(`已写回标题：${entry.newTitle}`);
+}
+
 async function renameConversation(
-  provider: ConversationProvider,
+  context: CliContext,
   id: string,
-  title: string
-): Promise<string> {
-  const normalizedId = normalizeId(id);
+  title: string,
+  defaultProvider: ProviderSelection
+): Promise<{
+  id: string;
+  oldTitle: string;
+  newTitle: string;
+  status: "success";
+}> {
+  const normalizedId = normalizeConversationId(id, defaultProvider);
+  const provider = getProviderForId(context, normalizedId);
+  const oldTitle = (await provider.read(normalizedId, { limit: 1 })).title;
   const normalizedTitle = normalizeTitle(title);
   await persistConversationTitle(provider, normalizedId, normalizedTitle);
-  return normalizedTitle;
+  return {
+    id: normalizedId,
+    oldTitle,
+    newTitle: normalizedTitle,
+    status: "success",
+  };
 }
 
 function buildGenerateOptions(
@@ -376,20 +596,41 @@ function buildGenerateOptions(
   };
 }
 
-async function generateConversationTitle(context: CliContext, id: string, options: CliOptions): Promise<string> {
-  const normalizedId = normalizeId(id);
+async function generateConversationTitle(
+  context: CliContext,
+  id: string,
+  options: CliOptions
+): Promise<{
+  id: string;
+  oldTitle: string;
+  newTitle: string;
+  usedCli: string;
+  attempts: number;
+  cleanedTitleSessions: number;
+  durationMs: number;
+  status: "success";
+}> {
+  const normalizedId = normalizeConversationId(id, options.provider);
+  const provider = getProviderForId(context, normalizedId);
   const result = await generateAndPersistConversationTitle(
     context.providers,
-    context.provider,
+    provider,
     normalizedId,
     buildGenerateOptions(options)
   );
-  const cleanupSuffix = result.cleanedTitleSessions > 0 ? `，已清理 ${result.cleanedTitleSessions} 条内部标题会话` : "";
-  console.log(`已通过 ${result.usedCli} 生成标题（attempts=${result.attempts}）${cleanupSuffix}`);
-  return result.title;
+  return {
+    id: normalizedId,
+    oldTitle: result.oldTitle,
+    newTitle: result.title,
+    usedCli: result.usedCli,
+    attempts: result.attempts,
+    cleanedTitleSessions: result.cleanedTitleSessions,
+    durationMs: result.durationMs,
+    status: "success",
+  };
 }
 
-interface BatchReportEntry {
+export interface BatchReportEntry {
   id: string;
   oldTitle: string;
   newTitle?: string;
@@ -398,11 +639,15 @@ interface BatchReportEntry {
   attempts?: number;
   cleanedTitleSessions?: number;
   durationMs?: number;
-  status: "pending" | "success" | "failed" | "dry-run";
+  status: "pending" | "success" | "failed" | "skipped" | "dry-run";
   error?: string;
 }
 
-interface BatchReport {
+export interface BatchReport {
+  schemaVersion?: number;
+  command?: "generate-batch";
+  ok?: boolean;
+  summary?: TitleCliSummary;
   kind: "generate-batch";
   dryRun: boolean;
   startedAt: string;
@@ -410,22 +655,51 @@ interface BatchReport {
   durationMs?: number;
   projectPath?: string;
   projectMode: ProjectMode;
+  provider?: ProviderSelection;
   detectedCliNames?: TitleGenerationCli[];
   total: number;
   success: number;
   failed: number;
+  skipped?: number;
   entries: BatchReportEntry[];
 }
 
-interface RollbackReportEntry {
+export interface RollbackReportEntry {
   id: string;
   oldTitle: string;
   generatedTitle?: string;
-  status: "pending" | "rolled-back" | "failed" | "dry-run" | "skipped";
+  status: "pending" | "rolled-back" | "failed" | "dry-run" | "skipped" | "skipped-conflict";
   error?: string;
 }
 
-interface RollbackReport {
+export async function applyRollbackEntry(
+  provider: ConversationProvider,
+  entry: RollbackReportEntry,
+  force = false
+): Promise<void> {
+  try {
+    await persistConversationTitle(provider, entry.id, entry.oldTitle, {
+      expectedTitle: entry.generatedTitle,
+      force,
+    });
+    entry.status = "rolled-back";
+    delete entry.error;
+  } catch (error) {
+    if (error && typeof error === "object" && "status" in error && error.status === 409) {
+      entry.status = "skipped-conflict";
+      entry.error = formatTitleActionError(error);
+      return;
+    }
+    entry.status = "failed";
+    entry.error = formatTitleActionError(error);
+  }
+}
+
+export interface RollbackReport {
+  schemaVersion?: number;
+  command?: "rollback";
+  ok?: boolean;
+  summary?: TitleCliSummary;
   kind: "rollback";
   dryRun: boolean;
   sourceReportPath: string;
@@ -451,26 +725,55 @@ async function createTitleReportPath(prefix: string): Promise<string> {
   const { day, stamp } = formatBackupDate(now);
   const dir = join(homedir(), ".backups", "chatlog-viewer-title", day);
   await mkdir(dir, { recursive: true });
-  return join(dir, `codex-title-${prefix}-${stamp}.json`);
+  return join(dir, `conversation-title-${prefix}-${stamp}.json`);
+}
+
+function synchronizeBatchReport(report: BatchReport): void {
+  const summary = summarizeTitleEntries(report.entries);
+  report.schemaVersion = TITLE_CLI_SCHEMA_VERSION;
+  report.command = "generate-batch";
+  report.summary = summary;
+  report.total = summary.total;
+  report.success = summary.success;
+  report.failed = summary.failed;
+  report.skipped = summary.skipped;
+  report.ok = summary.failed === 0 && !report.entries.some((entry) => entry.status === "pending");
+}
+
+function synchronizeRollbackReport(report: RollbackReport): void {
+  const summary = summarizeTitleEntries(report.entries);
+  report.schemaVersion = TITLE_CLI_SCHEMA_VERSION;
+  report.command = "rollback";
+  report.summary = summary;
+  report.total = summary.total;
+  report.success = summary.success;
+  report.failed = summary.failed;
+  report.skipped = summary.skipped;
+  report.ok = summary.failed === 0 && !report.entries.some((entry) => entry.status === "pending");
 }
 
 async function writeBatchReport(filePath: string, report: BatchReport): Promise<void> {
-  await writeFile(filePath, `${JSON.stringify(report, null, 2)}\n`, "utf-8");
+  synchronizeBatchReport(report);
+  await writeFile(filePath, formatCliJson(report), "utf-8");
 }
 
 async function writeRollbackReport(filePath: string, report: RollbackReport): Promise<void> {
-  await writeFile(filePath, `${JSON.stringify(report, null, 2)}\n`, "utf-8");
+  synchronizeRollbackReport(report);
+  await writeFile(filePath, formatCliJson(report), "utf-8");
 }
 
 function printBatchReport(report: BatchReport, reportPath: string, options: CliOptions): void {
+  synchronizeBatchReport(report);
   if (options.format === "json") {
-    console.log(JSON.stringify({ ...report, reportPath }, null, 2));
+    writeCliJson({ ...report, reportPath });
     return;
   }
 
   const mode = report.dryRun ? "批量生成 dry-run 完成" : "批量生成完成";
   const duration = report.durationMs === undefined ? "" : `，耗时 ${report.durationMs}ms`;
-  console.log(`${mode}：成功 ${report.success}，失败 ${report.failed}，总数 ${report.total}${duration}`);
+  console.log(
+    `${mode}：成功 ${report.success}，失败 ${report.failed}，跳过 ${report.skipped ?? 0}，总数 ${report.total}${duration}`
+  );
   if (report.detectedCliNames?.length) {
     console.log(`可用 AI CLI：${report.detectedCliNames.join(", ")}`);
   }
@@ -483,12 +786,22 @@ function printBatchReport(report: BatchReport, reportPath: string, options: CliO
       console.log(`DRY ${entry.id} ${entry.oldTitle}`);
     } else if (entry.status === "failed") {
       console.log(`FAIL ${entry.id} ${entry.oldTitle}: ${entry.error}`);
+    } else if (entry.status === "skipped") {
+      console.log(`SKIP ${entry.id} ${entry.oldTitle}: ${entry.error ?? "未处理"}`);
     }
   }
 }
 
-async function generateBatch(context: CliContext, options: CliOptions): Promise<void> {
-  const conversations = await listConversations(context.provider, options);
+function markPendingBatchEntriesSkipped(report: BatchReport, reason: string): void {
+  for (const entry of report.entries) {
+    if (entry.status !== "pending") continue;
+    entry.status = "skipped";
+    entry.error = reason;
+  }
+}
+
+async function generateBatch(context: CliContext, options: CliOptions): Promise<BatchReport> {
+  const conversations = await listConversations(context, options);
   const reportPath = await createTitleReportPath("generate-batch");
   const startedAtMs = Date.now();
   const detectedCliNames = options.dryRun
@@ -500,6 +813,7 @@ async function generateBatch(context: CliContext, options: CliOptions): Promise<
     startedAt: new Date().toISOString(),
     projectPath: options.scope === "cwd" || options.projectPath ? resolveProjectPath(options) : undefined,
     projectMode: options.projectMode,
+    provider: options.provider,
     detectedCliNames,
     total: conversations.length,
     success: 0,
@@ -518,7 +832,7 @@ async function generateBatch(context: CliContext, options: CliOptions): Promise<
     report.durationMs = Date.now() - startedAtMs;
     await writeBatchReport(reportPath, report);
     printBatchReport(report, reportPath, options);
-    return;
+    return report;
   }
 
   for (const entry of report.entries) {
@@ -526,7 +840,7 @@ async function generateBatch(context: CliContext, options: CliOptions): Promise<
     try {
       const result = await generateAndPersistConversationTitle(
         context.providers,
-        context.provider,
+        getProviderForId(context, entry.id),
         entry.id,
         buildGenerateOptions(options, { batch: true, availableCliNames: detectedCliNames })
       );
@@ -536,18 +850,17 @@ async function generateBatch(context: CliContext, options: CliOptions): Promise<
       entry.cleanedTitleSessions = result.cleanedTitleSessions;
       entry.durationMs = result.durationMs;
       entry.status = "success";
-      report.success += 1;
     } catch (error) {
       entry.status = "failed";
       entry.error = formatTitleActionError(error);
       entry.durationMs = Date.now() - entryStartedAtMs;
-      report.failed += 1;
       await writeBatchReport(reportPath, report);
       if (!options.continueOnError) {
-        report.finishedAt = new Date().toISOString();
-        report.durationMs = Date.now() - startedAtMs;
-        await writeBatchReport(reportPath, report);
-        throw new Error(`批量生成在 ${entry.id} 失败：${entry.error}；报告：${reportPath}`);
+        markPendingBatchEntriesSkipped(
+          report,
+          `前序条目 ${entry.id} 失败，且未启用 --continue-on-error`
+        );
+        break;
       }
     }
     await writeBatchReport(reportPath, report);
@@ -557,6 +870,7 @@ async function generateBatch(context: CliContext, options: CliOptions): Promise<
   report.durationMs = Date.now() - startedAtMs;
   await writeBatchReport(reportPath, report);
   printBatchReport(report, reportPath, options);
+  return report;
 }
 
 function isRollbackCandidate(entry: BatchReportEntry): boolean {
@@ -593,8 +907,9 @@ async function readBatchReport(filePath: string): Promise<BatchReport> {
 }
 
 function printRollbackReport(report: RollbackReport, reportPath: string, options: CliOptions): void {
+  synchronizeRollbackReport(report);
   if (options.format === "json") {
-    console.log(JSON.stringify({ ...report, reportPath }, null, 2));
+    writeCliJson({ ...report, reportPath });
     return;
   }
 
@@ -609,11 +924,21 @@ function printRollbackReport(report: RollbackReport, reportPath: string, options
       console.log(`DRY ${entry.id} ${entry.generatedTitle ?? "-"} -> ${entry.oldTitle}`);
     } else if (entry.status === "failed") {
       console.log(`FAIL ${entry.id}: ${entry.error}`);
+    } else if (entry.status === "skipped-conflict") {
+      console.log(`SKIP ${entry.id}: ${entry.error}`);
     }
   }
 }
 
-async function rollbackFromReport(context: CliContext, options: CliOptions): Promise<void> {
+function markPendingRollbackEntriesSkipped(report: RollbackReport, reason: string): void {
+  for (const entry of report.entries) {
+    if (entry.status !== "pending") continue;
+    entry.status = "skipped";
+    entry.error = reason;
+  }
+}
+
+async function rollbackFromReport(context: CliContext, options: CliOptions): Promise<RollbackReport> {
   if (!options.reportPath.trim()) {
     throw new Error("用法：clv-title rollback --report <generate-batch-report.json>");
   }
@@ -637,7 +962,6 @@ async function rollbackFromReport(context: CliContext, options: CliOptions): Pro
 
   for (const entry of report.entries) {
     if (entry.status === "skipped") {
-      report.skipped += 1;
       continue;
     }
 
@@ -647,19 +971,28 @@ async function rollbackFromReport(context: CliContext, options: CliOptions): Pro
     }
 
     try {
-      await persistConversationTitle(context.provider, entry.id, entry.oldTitle);
-      entry.status = "rolled-back";
-      report.success += 1;
+      const normalizedId = normalizeConversationId(entry.id, "all");
+      const appliedEntry = { ...entry, id: normalizedId };
+      await applyRollbackEntry(getProviderForId(context, normalizedId), appliedEntry, options.force);
+      entry.status = appliedEntry.status;
+      entry.error = appliedEntry.error;
     } catch (error) {
       entry.status = "failed";
       entry.error = formatTitleActionError(error);
-      report.failed += 1;
+    }
+
+    if (entry.status === "skipped-conflict") {
+      await writeRollbackReport(reportPath, report);
+      continue;
+    }
+    if (entry.status === "failed") {
       await writeRollbackReport(reportPath, report);
       if (!options.continueOnError) {
-        report.finishedAt = new Date().toISOString();
-        report.durationMs = Date.now() - startedAtMs;
-        await writeRollbackReport(reportPath, report);
-        throw new Error(`回滚在 ${entry.id} 失败：${entry.error}；报告：${reportPath}`);
+        markPendingRollbackEntriesSkipped(
+          report,
+          `前序条目 ${entry.id} 失败，且未启用 --continue-on-error`
+        );
+        break;
       }
     }
 
@@ -670,13 +1003,15 @@ async function rollbackFromReport(context: CliContext, options: CliOptions): Pro
   report.durationMs = Date.now() - startedAtMs;
   await writeRollbackReport(reportPath, report);
   printRollbackReport(report, reportPath, options);
+  return report;
 }
 
 function printConversationDetail(conversation: ConversationMeta): void {
   console.log(`\nID: ${conversation.id}`);
   console.log(`标题: ${conversation.title}`);
   console.log(`项目: ${conversation.project}`);
-  console.log(`provider: ${conversation.modelProvider ?? "-"}`);
+  console.log(`来源: ${conversation.provider}`);
+  console.log(`model provider: ${conversation.modelProvider ?? "-"}`);
   console.log(`消息数: ${conversation.messageCount}`);
   console.log(`更新时间: ${formatDate(conversation.updatedAt)}`);
   console.log(`状态: ${conversation.contentStatus ?? "full"}`);
@@ -695,24 +1030,30 @@ async function runActionMenu(
   const action = (await rl.question("\n操作：[r]修改标题 [g]AI生成标题 [v]重新显示详情 [b]返回 > ")).trim().toLowerCase();
   if (action === "r" || action === "rename") {
     const nextTitle = await rl.question("新标题 > ");
-    const updatedTitle = await renameConversation(context.provider, conversation.id, nextTitle);
-    console.log(`已修改标题：${updatedTitle}`);
+    const result = await renameConversation(context, conversation.id, nextTitle, conversation.provider as ManagedProviderName);
+    console.log(`已修改标题：${result.newTitle}`);
     return;
   }
   if (action === "g" || action === "generate") {
-    const generatedTitle = await generateConversationTitle(context, conversation.id, {
+    const result = await generateConversationTitle(context, conversation.id, {
       scope: "all",
       search: "",
       limit: DEFAULT_LIMIT,
       format: "table",
       projectPath: "",
       projectMode: "exact",
+      provider: conversation.provider as ManagedProviderName,
       includeTitleSessions: false,
       continueOnError: false,
       dryRun: false,
       reportPath: "",
+      force: false,
     });
-    console.log(`已写回标题：${generatedTitle}`);
+    const cleanupSuffix = result.cleanedTitleSessions > 0
+      ? `，已清理 ${result.cleanedTitleSessions} 条内部标题会话`
+      : "";
+    console.log(`已通过 ${result.usedCli} 生成标题（attempts=${result.attempts}）${cleanupSuffix}`);
+    console.log(`已写回标题：${result.newTitle}`);
     return;
   }
   if (action === "v" || action === "view") {
@@ -726,9 +1067,9 @@ async function runInteractive(context: CliContext, options: CliOptions): Promise
     let currentOptions = { ...options };
 
     while (true) {
-      const conversations = await listConversations(context.provider, currentOptions);
+      const conversations = await listConversations(context, currentOptions);
       printConversations(conversations, currentOptions);
-      const answer = (await rl.question("\n选择序号/id，或 /search 关键词、/scope all|cwd、q 退出 > ")).trim();
+      const answer = (await rl.question("\n选择序号/id，或 /search 关键词、/scope all|cwd、/provider codex|claude-code|opencode|all、q 退出 > ")).trim();
       if (!answer || answer === "q" || answer === "quit" || answer === "exit") break;
       if (answer.startsWith("/search")) {
         currentOptions = { ...currentOptions, search: answer.slice("/search".length).trim() };
@@ -743,11 +1084,26 @@ async function runInteractive(context: CliContext, options: CliOptions): Promise
         }
         continue;
       }
+      if (answer.startsWith("/provider")) {
+        const nextProvider = parseProviderSelection(answer.slice("/provider".length).trim());
+        if (nextProvider) {
+          currentOptions = { ...currentOptions, provider: nextProvider };
+        } else {
+          console.log("provider 只能是 codex、claude-code、opencode 或 all");
+        }
+        continue;
+      }
 
       const selectedIndex = Number.parseInt(answer, 10);
       const conversation = Number.isFinite(selectedIndex)
         ? conversations[selectedIndex - 1]
-        : conversations.find((item) => item.id === normalizeId(answer));
+        : conversations.find((item) => {
+            try {
+              return item.id === normalizeConversationId(answer, currentOptions.provider);
+            } catch {
+              return false;
+            }
+          });
       if (!conversation) {
         console.log("未找到对应对话");
         continue;
@@ -766,39 +1122,41 @@ async function main(): Promise<void> {
     return;
   }
 
-  const context = await createContext();
+  const context = await createContext(resolveContextSelection(command, commandArgs, options));
   if (command === "interactive") {
     await runInteractive(context, options);
     return;
   }
   if (command === "list") {
-    printConversations(await listConversations(context.provider, options), options);
+    printConversations(await listConversations(context, options), options);
     return;
   }
   if (command === "rename") {
     const [id, ...titleParts] = commandArgs;
     if (!id || titleParts.length === 0) {
-      throw new Error("用法：clv-title rename <sessionId|codex:sessionId> <title>");
+      throw new Error("用法：clv-title rename <sessionId|provider:sessionId> <title>");
     }
-    const title = await renameConversation(context.provider, id, titleParts.join(" "));
-    console.log(`已修改标题：${title}`);
+    const result = await renameConversation(context, id, titleParts.join(" "), options.provider);
+    printSingleTitleResult("rename", result, options);
     return;
   }
   if (command === "generate") {
     const [id] = commandArgs;
     if (!id) {
-      throw new Error("用法：clv-title generate <sessionId|codex:sessionId>");
+      throw new Error("用法：clv-title generate <sessionId|provider:sessionId>");
     }
-    const title = await generateConversationTitle(context, id, options);
-    console.log(`已写回标题：${title}`);
+    const result = await generateConversationTitle(context, id, options);
+    printSingleTitleResult("generate", result, options);
     return;
   }
   if (command === "generate-batch") {
-    await generateBatch(context, options);
+    const report = await generateBatch(context, options);
+    if (report.ok === false) process.exitCode = 1;
     return;
   }
   if (command === "rollback") {
-    await rollbackFromReport(context, options);
+    const report = await rollbackFromReport(context, options);
+    if (report.ok === false) process.exitCode = 1;
     return;
   }
 
@@ -811,9 +1169,32 @@ function isMainModule(): boolean {
   return resolve(entrypoint) === fileURLToPath(import.meta.url);
 }
 
+function redirectConsoleDiagnosticsToStderr(): () => void {
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  const originalDebug = console.debug;
+  console.log = (...args: unknown[]) => console.error(...args);
+  console.warn = (...args: unknown[]) => console.error(...args);
+  console.debug = (...args: unknown[]) => console.error(...args);
+  return () => {
+    console.log = originalLog;
+    console.warn = originalWarn;
+    console.debug = originalDebug;
+  };
+}
+
 if (isMainModule()) {
+  const restoreConsole = process.argv.includes("--json")
+    ? redirectConsoleDiagnosticsToStderr()
+    : () => {};
   main().catch((error: unknown) => {
-    console.error(formatTitleActionError(error));
+    const args = process.argv.slice(2);
+    const command = args.find((arg) => arg !== "--") ?? "interactive";
+    if (args.includes("--json")) {
+      writeCliJsonError(command.startsWith("-") ? "interactive" : command, error);
+    } else {
+      console.error(formatTitleActionError(error));
+    }
     process.exitCode = 1;
-  });
+  }).finally(restoreConsole);
 }

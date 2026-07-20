@@ -1,4 +1,4 @@
 interface:
   display_name: "ChatLog Viewer Title"
-  short_description: "管理 ChatLog Viewer 的 Codex 对话标题"
-  default_prompt: "Use $chatlog-viewer-title to list Codex conversations and update their titles."
+  short_description: "管理 Codex、Claude Code 与 OpenCode 对话标题"
+  default_prompt: "Use $chatlog-viewer-title to list conversations across Codex, Claude Code, and OpenCode and update their titles."

@@ -48,52 +48,31 @@ export function hasUsableCodexTitle(values: Array<string | null | undefined>): b
 }
 
 export function pickCodexConversationTitle(options: {
-  managedTitle?: string;
   transcriptTitle?: string;
   nativeTitle?: string;
   firstUserMessage?: string;
   preview?: string;
   fallbackTitle?: string;
 }): { title: string; usedFallback: boolean } {
-  const managedTitle = normalizeCodexDisplayText(options.managedTitle);
-  if (managedTitle) {
-    return { title: managedTitle, usedFallback: false };
-  }
-
   const transcriptTitle = normalizeCodexDisplayText(options.transcriptTitle);
   const nativeTitle = normalizeCodexDisplayText(options.nativeTitle);
   const firstUserMessage = normalizeCodexDisplayText(options.firstUserMessage);
   const preview = normalizeCodexDisplayText(options.preview);
   const fallbackTitle = normalizeCodexDisplayText(options.fallbackTitle);
-  const nativeDisplayTitle = pickUsableCodexTitle([nativeTitle, firstUserMessage, preview]);
-  if (nativeDisplayTitle) {
-    return { title: nativeDisplayTitle, usedFallback: false };
-  }
 
-  if (transcriptTitle && !isWeakCodexTitle(transcriptTitle)) {
-    return { title: transcriptTitle, usedFallback: false };
-  }
-
-  const canUseFallback = !!fallbackTitle && !isWeakCodexTitle(fallbackTitle);
-  const nativeTitleIsWeak = !!nativeTitle && isWeakCodexTitle(nativeTitle);
-  const nativeLooksOriginal = !firstUserMessage || firstUserMessage === nativeTitle || isWeakCodexTitle(firstUserMessage);
-
-  if (nativeTitle && (!nativeTitleIsWeak || !nativeLooksOriginal || !canUseFallback)) {
-    return { title: nativeTitle, usedFallback: false };
-  }
-
-  if (canUseFallback) {
-    return { title: fallbackTitle, usedFallback: !!nativeTitle };
-  }
-
-  return { title: nativeTitle || fallbackTitle || "未知对话", usedFallback: false };
+  if (nativeTitle) return { title: nativeTitle, usedFallback: false };
+  if (firstUserMessage) return { title: firstUserMessage, usedFallback: false };
+  if (preview) return { title: preview, usedFallback: false };
+  if (transcriptTitle) return { title: transcriptTitle, usedFallback: false };
+  if (fallbackTitle) return { title: fallbackTitle, usedFallback: true };
+  return { title: "未知对话", usedFallback: true };
 }
 
 export function buildCodexTitleFallbackBadges(): ConversationBadge[] {
   return [{
     label: CODEX_TITLE_FALLBACK_BADGE_LABEL,
     tone: "amber",
-    title: "Codex 原生 title 是问候语，ChatLog Viewer 改用 transcript 中后续有效用户问题作为展示标题",
+    title: "Codex 原生 title、消息摘要和 transcript 标题均为空，当前使用消息内容生成展示 fallback",
   }];
 }
 

@@ -55,9 +55,9 @@ const TITLE_GENERATION_CLI_LABELS: Record<TitleGenerationCli, string> = {
 };
 
 const DEFAULT_TITLE_GENERATION_SESSION_MODES: Record<TitleGenerationCli, TitleGenerationCliSessionMode> = {
-  codex: "fixed",
-  claude: "fixed",
-  opencode: "fixed",
+  codex: "fresh",
+  claude: "fresh",
+  opencode: "fresh",
 };
 
 function buildCliStateMap(clis: AvailableCliInfo[]): Partial<Record<TitleGenerationCli, AvailableCliInfo>> {
@@ -292,7 +292,7 @@ function TitleGenerationPriorityCard({
           <div>
             <div className="text-sm font-semibold text-gray-900 dark:text-gray-100">AI 标题生成优先级</div>
             <div className="text-[11px] text-gray-500 dark:text-gray-400">
-              生成标题时会按以下顺序依次尝试；固定模式会复用最近一次标题生成会话，不固定模式每次新建但仍记录最近会话。
+              生成标题时会按以下顺序依次尝试；默认 Fresh 模式每次使用独立会话并在完成后自动清理，固定模式才会复用会话。
             </div>
           </div>
         </div>
@@ -313,7 +313,7 @@ function TitleGenerationPriorityCard({
           const discoverable = cliState?.discoverable ?? false;
           const healthy = cliState?.healthy ?? false;
           const hasSession = cliState?.hasSession ?? false;
-          const sessionMode = sessionModes[cli] ?? "fixed";
+          const sessionMode = sessionModes[cli] ?? "fresh";
           const fixedMode = sessionMode === "fixed";
           const isDisabled = disabled.includes(cli);
 
@@ -366,7 +366,7 @@ function TitleGenerationPriorityCard({
                         : "border-gray-200 bg-gray-100 text-gray-500 dark:border-gray-600 dark:bg-gray-700/60 dark:text-gray-300"
                     }`}
                   >
-                    {fixedMode ? "固定模式" : "不固定模式"}
+                    {fixedMode ? "固定模式" : "Fresh 模式"}
                   </span>
                   <span
                     className={`rounded-full border px-2 py-0.5 text-[10px] ${
@@ -399,9 +399,9 @@ function TitleGenerationPriorityCard({
                     onClick={() => onToggleSessionMode(cli)}
                     disabled={saving || resettingCli !== null}
                     className="inline-flex items-center gap-1 rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-600 transition hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-                    aria-label={`${fixedMode ? "切换为不固定模式" : "切换为固定模式"} ${TITLE_GENERATION_CLI_LABELS[cli]}`}
+                    aria-label={`${fixedMode ? "切换为 Fresh 模式" : "切换为固定模式"} ${TITLE_GENERATION_CLI_LABELS[cli]}`}
                   >
-                    {fixedMode ? "改为不固定" : "改为固定"}
+                    {fixedMode ? "改为 Fresh" : "改为固定"}
                   </button>
                   <button
                     type="button"
@@ -554,7 +554,7 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
   const handleToggleTitleGenerationSessionMode = useCallback((cli: TitleGenerationCli) => {
     setTitleGenerationCliSessionModes((prev) => ({
       ...prev,
-      [cli]: (prev[cli] ?? "fixed") === "fixed" ? "fresh" : "fixed",
+      [cli]: (prev[cli] ?? "fresh") === "fixed" ? "fresh" : "fixed",
     }));
   }, []);
 
@@ -708,11 +708,17 @@ export function ProviderPathsDialog({ open, onClose, onSaved, onNotify }: Props)
       await onSaved?.();
 
       const migrationMessages = nextSettings.migrationResults?.map((item) => item.message) ?? [];
+      const cleanupWarnings = nextSettings.migrationResults
+        ?.map((item) => item.cleanupWarning)
+        .filter((item): item is string => !!item) ?? [];
       onNotify({
-        variant: "success",
+        variant: cleanupWarnings.length > 0 ? "warning" : "success",
         title: migrationMessages.length > 0 ? "设置已保存并迁移" : "设置已保存",
         description: migrationMessages.length > 0
-          ? `已写入配置文件并刷新设置。\n${migrationMessages.join("\n")}`
+          ? `已写入配置文件并刷新设置。\n${[
+              ...migrationMessages,
+              ...cleanupWarnings,
+            ].join("\n")}`
           : "已写入配置文件并刷新设置。",
       });
     } catch (error) {

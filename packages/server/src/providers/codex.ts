@@ -37,12 +37,6 @@ import {
   type ConversationSearchIndexBuilder,
 } from "../utils/search-index.js";
 import {
-  getNativeTitle,
-  getNativeTitleSyncRecord,
-  markNativeTitleSynced,
-  setCodexObservedNativeTitle,
-} from "../utils/title-store.js";
-import {
   assignStableMessageIds,
   createMessageSourceKey,
   createStableMessageSourceKey,
@@ -54,6 +48,7 @@ import {
   rewriteJsonlFileLines,
   type MessageRecord,
 } from "../utils/message-actions.js";
+import { runKeyedMutation, runKeyedMutations } from "../utils/mutation-queue.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -68,7 +63,10 @@ import {
   type CodexThreadMetadata,
   type CodexThreadRow,
 } from "./codex-sqlite-client.js";
-import { upsertCodexSessionIndexThreadName } from "./codex-session-index.js";
+import {
+  getCodexSessionIndexThreadName,
+  upsertCodexSessionIndexThreadName,
+} from "./codex-session-index.js";
 import {
   setCodexThreadNameViaAppServer,
   shouldUseCodexAppServerRename,
@@ -77,16 +75,12 @@ import {
   buildCodexTitleFallbackBadges,
   buildCodexTitleGenerationBadges,
   buildCodexTitleGenerationHint,
-  hasCodexTitleFallbackBadge,
   hasCodexTitleGenerationBadge,
-  hasUsableCodexTitle,
-  isCodexNativeOriginalWeakTitle,
   isCodexTitleGenerationProject,
   isWeakCodexTitle,
   mergeCodexBadges,
   normalizeCodexDisplayText,
   pickCodexConversationTitle,
-  pickUsableCodexTitle,
 } from "./codex-title.js";
 import { normalizePath, canonicalizeProjectPath, canonicalizeProjectPathResolvingSymlinks, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
 
@@ -113,8 +107,13 @@ interface CodexMessageIdentityCacheEntry {
 }
 
 const CODEX_STATE_ONLY_PREFIX = "codex-state://";
-const CODEX_LIST_SOURCE_VERSION = "codex-list-v12-fork-explicit-title";
+const CODEX_LIST_SOURCE_VERSION = "codex-list-v13-native-title-read-only";
 const codexMessageIdentityCache = new Map<string, CodexMessageIdentityCacheEntry>();
+
+interface CodexProviderOptions {
+  setThreadNameViaAppServer?: typeof setCodexThreadNameViaAppServer;
+  shouldUseAppServerRename?: typeof shouldUseCodexAppServerRename;
+}
 
 export function clearCodexMessageIdentityCacheForTests(): void {
   codexMessageIdentityCache.clear();
@@ -141,11 +140,6 @@ function getDisplayableCodexResponseContent(entry: CodexEntry): string | null {
   return content;
 }
 
-function getCodexForkedFromId(entry?: CodexEntry): string {
-  const value = entry?.payload?.forked_from_id ?? entry?.payload?.forkedFromId;
-  return typeof value === "string" ? value.trim() : "";
-}
-
 function isReusableCodexMetaHint(
   metaHint: ConversationMeta | undefined,
   fileStat: { mtimeMs: number; size: number },
@@ -156,16 +150,10 @@ function isReusableCodexMetaHint(
   if (metaHint.updatedAt !== fileStat.mtimeMs || metaHint.fileSize !== fileStat.size) return false;
   if (metaHint.modelProvider !== threadMetadata.modelProvider) return false;
 
-  const nativeTitle = normalizeCodexDisplayText(threadMetadata.title);
-  if (!nativeTitle) {
-    return !hasCodexTitleFallbackBadge(metaHint);
-  }
-
-  if (isCodexNativeOriginalWeakTitle(threadMetadata)) {
-    return hasCodexTitleFallbackBadge(metaHint);
-  }
-
-  return metaHint.title === nativeTitle;
+  const nativeDisplayTitle = normalizeCodexDisplayText(threadMetadata.title)
+    || normalizeCodexDisplayText(threadMetadata.firstUserMessage)
+    || normalizeCodexDisplayText(threadMetadata.preview);
+  return nativeDisplayTitle ? metaHint.title === nativeDisplayTitle : true;
 }
 
 function getCodexUserTitleCandidate(entry?: CodexEntry): string {
@@ -185,18 +173,6 @@ function getCodexUserTitleCandidate(entry?: CodexEntry): string {
   }
 
   return "";
-}
-
-async function findCodexFallbackTitle(filePath: string): Promise<string> {
-  let fallbackTitle = "";
-  await visitJsonl<CodexEntry>(filePath, (entry) => {
-    if (fallbackTitle) return;
-    const candidateTitle = getCodexUserTitleCandidate(entry);
-    if (candidateTitle && !isWeakCodexTitle(candidateTitle)) {
-      fallbackTitle = candidateTitle;
-    }
-  });
-  return fallbackTitle;
 }
 
 function buildCodexStateOnlyFilePath(sessionId: string, rolloutPath?: string): string {
@@ -495,10 +471,22 @@ export class CodexProvider implements ConversationProvider {
     titleSyncMode: "native",
     canUpdateTitle: true,
     canGenerateTitle: true,
+    canEditMessage: true,
+    canDeleteMessage: true,
+    canMoveConversation: true,
+    canDeleteConversation: true,
+    supportsMetadataOnly: true,
   } as const;
 
   private readonly sqliteClient = new CodexSqliteClient(() => this.getStateDbPath());
   private backgroundRefreshes = new Map<string, Promise<void>>();
+  private readonly setThreadNameViaAppServer: typeof setCodexThreadNameViaAppServer;
+  private readonly shouldUseAppServerRename: typeof shouldUseCodexAppServerRename;
+
+  constructor(options: CodexProviderOptions = {}) {
+    this.setThreadNameViaAppServer = options.setThreadNameViaAppServer ?? setCodexThreadNameViaAppServer;
+    this.shouldUseAppServerRename = options.shouldUseAppServerRename ?? shouldUseCodexAppServerRename;
+  }
 
   private getStateDbPath(): string {
     return getProviderPaths("codex").stateDbPath || join(this.getStoragePath(), "..", "state_5.sqlite");
@@ -552,14 +540,6 @@ export class CodexProvider implements ConversationProvider {
     const isTitleGenerationSession = isCodexTitleGenerationProject(thread.cwd);
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(thread.cwd);
     const threadMetadata = this.sqliteClient.getThreadMetadata(thread.id);
-    const managedTitle = await this.resolveManagedTitle(thread.id, threadMetadata);
-    if (managedTitle) {
-      try {
-        this.writeThreadDisplayTitle(thread.id, managedTitle);
-      } catch {
-        // Codex TUI 可能短暂占用 state db；列表仍优先使用 UI 管理标题。
-      }
-    }
 
     const normalizedTitle = normalizeCodexDisplayText(threadMetadata.title ?? thread.title);
     const normalizedFirstUserMessage = normalizeCodexDisplayText(
@@ -567,20 +547,16 @@ export class CodexProvider implements ConversationProvider {
     );
     const fallbackTitle = normalizedTitle || normalizedFirstUserMessage;
 
-    if (!managedTitle && !fallbackTitle && !normalizedCwd) {
+    if (!fallbackTitle && !normalizedCwd) {
       return null;
     }
 
     const titleChoice = pickCodexConversationTitle({
-      managedTitle: managedTitle ?? undefined,
       nativeTitle: normalizedTitle,
       firstUserMessage: normalizedFirstUserMessage,
       preview: threadMetadata.preview,
       fallbackTitle,
     });
-    const titleHintThread = managedTitle
-      ? { ...thread, title: managedTitle, firstUserMessage: managedTitle }
-      : thread;
 
     const filePath = buildCodexStateOnlyFilePath(thread.id, thread.rolloutPath);
     return {
@@ -598,7 +574,7 @@ export class CodexProvider implements ConversationProvider {
       modelProvider: thread.modelProvider,
       transcriptMissing: true,
       contentStatus: "metadata-only",
-      titleGenerationHint: buildCodexTitleGenerationHint(titleHintThread),
+      titleGenerationHint: buildCodexTitleGenerationHint(thread),
       badges: mergeCodexBadges(
         buildCodexStateOnlyBadges(),
         isTitleGenerationSession ? buildCodexTitleGenerationBadges() : undefined
@@ -608,223 +584,90 @@ export class CodexProvider implements ConversationProvider {
 
   private writeThreadDisplayTitle(
     sessionId: string,
-    title: string,
-    options?: { updateTitleField?: boolean }
+    title: string
   ): void {
     const normalizedTitle = title.trim();
     if (!normalizedTitle) {
       throw new Error("标题不能为空");
     }
-    this.sqliteClient.writeDisplayTitle(sessionId, normalizedTitle, options);
+    this.sqliteClient.writeDisplayTitle(sessionId, normalizedTitle);
   }
 
-  private async resolveManagedTitle(
+  private async writeCodexStateDisplayTitle(
     sessionId: string,
-    threadMetadata: CodexThreadMetadata
-  ): Promise<string | null> {
-    const id = `codex:${sessionId}`;
-    const managedTitle = normalizeCodexDisplayText(await getNativeTitle(id));
-    if (!managedTitle) return null;
-
-    const nativeDisplayTitle = pickUsableCodexTitle([
-      threadMetadata.title,
-      threadMetadata.firstUserMessage,
-      threadMetadata.preview,
-    ]);
-    const nativeFieldsAgree = !!nativeDisplayTitle
-      && normalizeCodexDisplayText(threadMetadata.title) === nativeDisplayTitle
-      && normalizeCodexDisplayText(threadMetadata.firstUserMessage) === nativeDisplayTitle
-      && normalizeCodexDisplayText(threadMetadata.preview) === nativeDisplayTitle;
-    const syncRecord = await getNativeTitleSyncRecord(id);
-    const lastNativeTitle = normalizeCodexDisplayText(syncRecord?.lastNativeTitle);
-
-    if (nativeDisplayTitle === managedTitle) {
-      if (lastNativeTitle !== nativeDisplayTitle) {
-        await markNativeTitleSynced(id, nativeDisplayTitle);
-      }
-      return managedTitle;
-    }
-
-    if (
-      nativeDisplayTitle
-      && lastNativeTitle
-      && nativeDisplayTitle !== lastNativeTitle
-      && (syncRecord?.source !== "chatlog-viewer" || nativeFieldsAgree)
-    ) {
-      await setCodexObservedNativeTitle(id, nativeDisplayTitle);
-      return nativeDisplayTitle;
-    }
-
-    return managedTitle;
-  }
-
-  private async syncThreadDisplayTitleFromManagedTitle(
-    sessionId: string,
-    managedTitle: string,
-    transcriptTitle: string | undefined,
-    threadMetadata: CodexThreadMetadata,
-    filePath: string
-  ): Promise<boolean> {
-    const normalizedTitle = managedTitle.trim();
-    if (!normalizedTitle) return false;
-
-    if (
-      normalizeCodexDisplayText(threadMetadata.title) !== normalizedTitle
-      || normalizeCodexDisplayText(threadMetadata.firstUserMessage) !== normalizedTitle
-      || normalizeCodexDisplayText(threadMetadata.preview) !== normalizedTitle
-    ) {
-      try {
-        this.writeThreadDisplayTitle(sessionId, normalizedTitle);
-      } catch {
-        // Codex TUI 可能短暂占用 state db；下一次扫描会继续按 UI 来源修复。
-      }
-    }
-
-    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
-
-    if (normalizeCodexDisplayText(transcriptTitle) === normalizedTitle) {
-      return false;
-    }
-
-    return await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
-      return {
-        ...payload,
-        id: payload.id || sessionId,
-        title: normalizedTitle,
-      };
-    });
-  }
-
-  private async persistKnownThreadTitle(
-    sessionId: string,
-    title: string | null | undefined,
-    filePath?: string | null
+    title: string,
+    options: { useAppServer?: boolean } = {}
   ): Promise<void> {
-    const normalizedTitle = normalizeCodexDisplayText(title);
-    if (!normalizedTitle) return;
-
-    try {
-      this.writeThreadDisplayTitle(sessionId, normalizedTitle);
-    } catch {
-      // Codex TUI 可能短暂占用 state db；仍继续同步 transcript 与 session_index。
+    if (options.useAppServer && this.shouldUseAppServerRename()) {
+      await this.setThreadNameViaAppServer(sessionId, title, this.getCodexHomePath());
+      await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, title);
+      await this.verifyCodexDisplayTitle(sessionId, title);
+      return;
     }
 
-    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
-
-    if (!filePath) return;
-    await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => ({
-      ...payload,
-      id: payload.id || sessionId,
-      title: normalizedTitle,
-    }));
+    this.writeThreadDisplayTitle(sessionId, title);
+    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, title);
+    await this.verifyCodexDisplayTitle(sessionId, title);
   }
 
-  private async syncThreadDisplayTitleFromTranscript(
-    sessionId: string,
-    transcriptTitle: string | undefined,
-    threadMetadata: CodexThreadMetadata,
-    filePath: string
-  ): Promise<boolean> {
-    const normalizedTitle = normalizeCodexDisplayText(transcriptTitle);
-    const currentDisplayTitle = pickUsableCodexTitle([
-      threadMetadata.title,
-      threadMetadata.firstUserMessage,
-      threadMetadata.preview,
-    ]);
-
-    if (currentDisplayTitle) {
-      if (!normalizedTitle) return false;
-
-      await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, currentDisplayTitle);
-      if (normalizedTitle === currentDisplayTitle) return false;
-
-      return await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
-        return {
-          ...payload,
-          id: payload.id || sessionId,
-          title: currentDisplayTitle,
-        };
-      });
+  private getCodexHomePath(): string {
+    const stateHome = normalizePath(dirname(this.getStateDbPath()));
+    const sessionsHome = normalizePath(dirname(this.getStoragePath()));
+    if (stateHome.toLowerCase() !== sessionsHome.toLowerCase()) {
+      throw new Error(
+        `Codex sessions 与 State DB 不属于同一个 CODEX_HOME：${sessionsHome}；${stateHome}`
+      );
     }
+    return stateHome;
+  }
 
-    if (!normalizedTitle || isWeakCodexTitle(normalizedTitle)) return false;
+  private async verifyCodexDisplayTitle(
+    sessionId: string,
+    expectedTitle: string
+  ): Promise<void> {
+    let persistedTitle: string | undefined;
+    let indexedTitle: string | undefined;
 
-    const currentTitle = normalizeCodexDisplayText(threadMetadata.title);
-    const currentFirstUserMessage = normalizeCodexDisplayText(threadMetadata.firstUserMessage);
-    if (currentTitle !== normalizedTitle || currentFirstUserMessage !== normalizedTitle) {
-      try {
-        this.writeThreadDisplayTitle(sessionId, normalizedTitle);
-      } catch {
-        // Codex TUI 可能短暂占用 state db；ChatLog Viewer 仍以 transcript 标题为准。
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const metadata = this.sqliteClient.getThreadMetadata(sessionId);
+      const titleField = this.sqliteClient.getThreadColumns().has("title")
+        ? metadata.title
+        : metadata.firstUserMessage;
+      persistedTitle = normalizeCodexDisplayText(titleField);
+      indexedTitle = normalizeCodexDisplayText(
+        await getCodexSessionIndexThreadName(this.getStoragePath(), sessionId)
+      );
+
+      if (persistedTitle === expectedTitle && indexedTitle === expectedTitle) {
+        return;
+      }
+      if (attempt < 9) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
       }
     }
 
-    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
-    return false;
+    throw new Error(
+      `Codex 原生标题写入校验失败：期望“${expectedTitle}”，`
+      + `State DB 为“${persistedTitle || "空"}”，session index 为“${indexedTitle || "空"}”`
+    );
   }
 
-  private async resolveForkParentTitle(parentSessionId: string): Promise<string | null> {
-    const threadMetadata = this.sqliteClient.getThreadMetadata(parentSessionId);
-    const metadataTitle = pickUsableCodexTitle([
-      threadMetadata.title,
-      threadMetadata.firstUserMessage,
-      threadMetadata.preview,
-    ]);
-    if (metadataTitle) return metadataTitle;
-
-    try {
-      const filePath = await this.findConversationFilePath(parentSessionId);
-      const headEntries = await parseJsonlHead<CodexEntry>(filePath, 20);
-      const sessionMeta = headEntries.find((entry) => entry.type === "session_meta");
-      return pickUsableCodexTitle([
-        typeof sessionMeta?.payload?.title === "string" ? sessionMeta.payload.title : undefined,
-        ...headEntries.map((entry) => getCodexUserTitleCandidate(entry)),
-      ]);
-    } catch {
-      return null;
-    }
-  }
-
-  private async maybeInheritForkTitle(options: {
+  private async persistCodexDisplayTitle(options: {
     sessionId: string;
-    filePath: string;
-    forkedFromId: string;
-    threadMetadata: CodexThreadMetadata;
-    transcriptTitle?: string;
-    defaultTitle?: string;
-    fallbackTitle?: string;
-  }): Promise<string | null> {
-    const forkedFromId = options.forkedFromId.trim();
-    if (!forkedFromId || forkedFromId === options.sessionId) return null;
-
-    const explicitChildTitles = [
-      options.transcriptTitle,
-      options.threadMetadata.title,
-      options.threadMetadata.firstUserMessage,
-      options.threadMetadata.preview,
-    ];
-    if (hasUsableCodexTitle(explicitChildTitles)) return null;
-
-    const parentTitle = await this.resolveForkParentTitle(forkedFromId);
-    if (!parentTitle) return null;
-
-    try {
-      this.writeThreadDisplayTitle(options.sessionId, parentTitle);
-    } catch {
-      // Codex TUI 可能短暂占用 state db；仍继续同步 transcript 与 session_index。
+    title: string | null | undefined;
+    useAppServer?: boolean;
+  }): Promise<void> {
+    const normalizedTitle = normalizeCodexDisplayText(options.title);
+    if (!normalizedTitle) {
+      throw new Error("标题不能为空");
     }
 
-    await upsertCodexSessionIndexThreadName(this.getStoragePath(), options.sessionId, parentTitle);
-    await this.rewriteTranscriptSessionMeta(options.filePath, options.sessionId, (payload) => {
-      return {
-        ...payload,
-        id: payload.id || options.sessionId,
-        forked_from_id: typeof payload.forked_from_id === "string" ? payload.forked_from_id : forkedFromId,
-        title: parentTitle,
-      };
+    await runKeyedMutation(`codex-thread:${options.sessionId}`, async () => {
+      await this.writeCodexStateDisplayTitle(options.sessionId, normalizedTitle, {
+        useAppServer: options.useAppServer,
+      });
+      invalidateListCache(this.getListCacheKey());
     });
-
-    return parentTitle;
   }
 
   private getSessionIdFromMetaOrPath(meta: ConversationMeta | undefined, filePath: string): string {
@@ -1099,7 +942,6 @@ export class CodexProvider implements ConversationProvider {
     let sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     let cwd = "";
     let transcriptTitle = "";
-    let forkedFromId = "";
     let defaultTitle = "";
     let fallbackTitle = "";
     let userMessageCount = 0;
@@ -1120,7 +962,6 @@ export class CodexProvider implements ConversationProvider {
         if (!capturedSessionMeta) {
           sessionId = entry.payload?.id || sessionId;
           cwd = entry.payload?.cwd || cwd;
-          forkedFromId = getCodexForkedFromId(entry) || forkedFromId;
           if (typeof entry.payload?.title === "string") {
             transcriptTitle = normalizeCodexDisplayText(entry.payload.title) || transcriptTitle;
           }
@@ -1174,47 +1015,8 @@ export class CodexProvider implements ConversationProvider {
 
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
-    if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
-      fallbackTitle = await findCodexFallbackTitle(filePath);
-    }
-    let currentFileStat = fileStat;
-    let effectiveTranscriptTitle = transcriptTitle;
-    const managedTitle = await this.resolveManagedTitle(sessionId, threadMetadata);
-    if (managedTitle) {
-      effectiveTranscriptTitle = managedTitle;
-      const transcriptRewritten = await this.syncThreadDisplayTitleFromManagedTitle(
-        sessionId,
-        managedTitle,
-        transcriptTitle,
-        threadMetadata,
-        filePath
-      );
-      if (transcriptRewritten) {
-        currentFileStat = await stat(filePath);
-      }
-    } else {
-      const inheritedForkTitle = await this.maybeInheritForkTitle({
-        sessionId,
-        filePath,
-        forkedFromId,
-        threadMetadata,
-        transcriptTitle,
-        defaultTitle,
-        fallbackTitle,
-      });
-      if (inheritedForkTitle) {
-        effectiveTranscriptTitle = inheritedForkTitle;
-        currentFileStat = await stat(filePath);
-      } else {
-        const transcriptRewritten = await this.syncThreadDisplayTitleFromTranscript(sessionId, transcriptTitle, threadMetadata, filePath);
-        if (transcriptRewritten) {
-          currentFileStat = await stat(filePath);
-        }
-      }
-    }
     const titleChoice = pickCodexConversationTitle({
-      managedTitle: managedTitle ?? undefined,
-      transcriptTitle: effectiveTranscriptTitle,
+      transcriptTitle,
       nativeTitle: threadMetadata.title,
       firstUserMessage: threadMetadata.firstUserMessage,
       preview: threadMetadata.preview,
@@ -1229,9 +1031,9 @@ export class CodexProvider implements ConversationProvider {
       projectKey: normalizedCwd,
       projectId: normalizedCwd,
       createdAt: firstTimestamp ?? fileStat.birthtimeMs,
-      updatedAt: currentFileStat.mtimeMs,
+      updatedAt: fileStat.mtimeMs,
       messageCount: displayMessageCount,
-      fileSize: currentFileStat.size,
+      fileSize: fileStat.size,
       filePath,
       modelProvider: threadMetadata.modelProvider,
       contentStatus: "full",
@@ -1241,7 +1043,7 @@ export class CodexProvider implements ConversationProvider {
       ),
     };
 
-    setCache(filePath, currentFileStat.mtimeMs, meta);
+    setCache(filePath, fileStat.mtimeMs, meta);
 
     if (!searchBuilder) {
       return { meta };
@@ -1279,7 +1081,6 @@ export class CodexProvider implements ConversationProvider {
     const sessionMeta = headEntries.find((e) => e.type === "session_meta");
     const sessionId = sessionMeta?.payload?.id || filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     const cwd = sessionMeta?.payload?.cwd || "";
-    const forkedFromId = getCodexForkedFromId(sessionMeta);
     const transcriptTitle = typeof sessionMeta?.payload?.title === "string"
       ? normalizeCodexDisplayText(sessionMeta.payload.title)
       : "";
@@ -1291,7 +1092,7 @@ export class CodexProvider implements ConversationProvider {
 
     const defaultTitleCandidate = getCodexUserTitleCandidate(userMessages[0]);
     const defaultTitle = defaultTitleCandidate || "未知对话";
-    let fallbackTitle = userMessages
+    const fallbackTitle = userMessages
       .map((entry) => getCodexUserTitleCandidate(entry))
       .find((title) => !!title && !isWeakCodexTitle(title));
 
@@ -1318,47 +1119,8 @@ export class CodexProvider implements ConversationProvider {
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
 
     const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
-    if (!fallbackTitle && isCodexNativeOriginalWeakTitle(threadMetadata)) {
-      fallbackTitle = await findCodexFallbackTitle(filePath);
-    }
-    let currentFileStat = fileStat;
-    let effectiveTranscriptTitle = transcriptTitle;
-    const managedTitle = await this.resolveManagedTitle(sessionId, threadMetadata);
-    if (managedTitle) {
-      effectiveTranscriptTitle = managedTitle;
-      const transcriptRewritten = await this.syncThreadDisplayTitleFromManagedTitle(
-        sessionId,
-        managedTitle,
-        transcriptTitle,
-        threadMetadata,
-        filePath
-      );
-      if (transcriptRewritten) {
-        currentFileStat = await stat(filePath);
-      }
-    } else {
-      const inheritedForkTitle = await this.maybeInheritForkTitle({
-        sessionId,
-        filePath,
-        forkedFromId,
-        threadMetadata,
-        transcriptTitle,
-        defaultTitle: defaultTitleCandidate,
-        fallbackTitle,
-      });
-      if (inheritedForkTitle) {
-        effectiveTranscriptTitle = inheritedForkTitle;
-        currentFileStat = await stat(filePath);
-      } else {
-        const transcriptRewritten = await this.syncThreadDisplayTitleFromTranscript(sessionId, transcriptTitle, threadMetadata, filePath);
-        if (transcriptRewritten) {
-          currentFileStat = await stat(filePath);
-        }
-      }
-    }
     const titleChoice = pickCodexConversationTitle({
-      managedTitle: managedTitle ?? undefined,
-      transcriptTitle: effectiveTranscriptTitle,
+      transcriptTitle,
       nativeTitle: threadMetadata.title,
       firstUserMessage: threadMetadata.firstUserMessage,
       preview: threadMetadata.preview,
@@ -1373,9 +1135,9 @@ export class CodexProvider implements ConversationProvider {
       projectKey: normalizedCwd,
       projectId: normalizedCwd,
       createdAt: firstTs,
-      updatedAt: currentFileStat.mtimeMs,
+      updatedAt: fileStat.mtimeMs,
       messageCount: displayMessageCount,
-      fileSize: currentFileStat.size,
+      fileSize: fileStat.size,
       filePath,
       modelProvider: threadMetadata.modelProvider,
       contentStatus: "full",
@@ -1385,7 +1147,7 @@ export class CodexProvider implements ConversationProvider {
       ),
     };
 
-    setCache(filePath, currentFileStat.mtimeMs, meta);
+    setCache(filePath, fileStat.mtimeMs, meta);
     return meta;
   }
 
@@ -1700,40 +1462,15 @@ export class CodexProvider implements ConversationProvider {
     }
 
     const sessionId = id.replace("codex:", "");
-    let filePath: string | null = null;
-
-    try {
-      filePath = await this.findConversationFilePath(sessionId);
-    } catch {
-      const thread = this.sqliteClient.findThread(sessionId);
-      if (!thread) {
-        throw new Error(`对话不存在: ${id}`);
-      }
+    if (!this.sqliteClient.findThread(sessionId)) {
+      throw new Error(`对话不存在: ${id}`);
     }
 
-    if (shouldUseCodexAppServerRename()) {
-      try {
-        await setCodexThreadNameViaAppServer(sessionId, normalizedTitle);
-      } catch (error) {
-        logProviderError("codex.updateTitle.appServer", this.name, error);
-        await this.writeThreadDisplayTitle(sessionId, normalizedTitle);
-      }
-    } else {
-      await this.writeThreadDisplayTitle(sessionId, normalizedTitle);
-    }
-    await upsertCodexSessionIndexThreadName(this.getStoragePath(), sessionId, normalizedTitle);
-    if (filePath) {
-      await this.rewriteTranscriptSessionMeta(filePath, sessionId, (payload) => {
-        return {
-          ...payload,
-          id: payload.id || sessionId,
-          title: normalizedTitle,
-        };
-      });
-      this.invalidateConversationCaches(filePath);
-    } else {
-      invalidateListCache(this.getListCacheKey());
-    }
+    await this.persistCodexDisplayTitle({
+      sessionId,
+      title: normalizedTitle,
+      useAppServer: true,
+    });
   }
 
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
@@ -1763,7 +1500,8 @@ export class CodexProvider implements ConversationProvider {
           },
         };
         return JSON.stringify(nextEntry);
-      }
+      },
+      { mtimeMs: fileStat.mtimeMs, size: fileStat.size }
     );
     const nextFileStat = await stat(filePath);
     carryCodexMessageIdentityCacheAcrossEdit(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs);
@@ -1785,7 +1523,11 @@ export class CodexProvider implements ConversationProvider {
       throw new Error("待删除消息不能为空");
     }
     const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
-    await rewriteJsonlFileLines(filePath, lineNumbers);
+    await rewriteJsonlFileLines(
+      filePath,
+      lineNumbers,
+      { mtimeMs: fileStat.mtimeMs, size: fileStat.size }
+    );
     const nextFileStat = await stat(filePath);
     carryCodexMessageIdentityCacheAcrossDelete(filePath, fileStat.mtimeMs, nextFileStat.mtimeMs, uniqueMessageIds);
     invalidateCache(filePath);
@@ -1842,39 +1584,45 @@ export class CodexProvider implements ConversationProvider {
       return id.replace("codex:", "");
     });
 
-    const transcriptTargets = await Promise.all(
-      sessionIds.map(async (sessionId) => {
-        const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
-        const managedTitle = await this.resolveManagedTitle(sessionId, threadMetadata);
-        const currentTitle = managedTitle ?? pickUsableCodexTitle([
-          threadMetadata.title,
-          threadMetadata.firstUserMessage,
-          threadMetadata.preview,
-        ]);
-        try {
-          return {
-            sessionId,
-            currentTitle,
-            filePath: await this.findConversationFilePath(sessionId),
-          };
-        } catch {
-          return { sessionId, currentTitle, filePath: null };
+    await runKeyedMutations(
+      sessionIds.map((sessionId) => `codex-thread:${sessionId}`),
+      async () => {
+        const transcriptTargets = await Promise.all(
+          sessionIds.map(async (sessionId) => {
+            const titleBefore = normalizeCodexDisplayText(
+              this.sqliteClient.getThreadMetadata(sessionId).title
+            );
+            try {
+              return {
+                sessionId,
+                titleBefore,
+                filePath: await this.findConversationFilePath(sessionId),
+              };
+            } catch {
+              return { sessionId, titleBefore, filePath: null };
+            }
+          })
+        );
+
+        this.sqliteClient.changeModelProvidersForSessions(sessionIds, normalizedProvider);
+
+        for (const target of transcriptTargets) {
+          const titleAfter = normalizeCodexDisplayText(
+            this.sqliteClient.getThreadMetadata(target.sessionId).title
+          );
+          if (titleAfter !== target.titleBefore) {
+            throw new Error(`切换 provider 时检测到 Codex 原生标题发生变化: codex:${target.sessionId}`);
+          }
+
+          if (!target.filePath) continue;
+          await this.rewriteTranscriptSessionMeta(target.filePath, target.sessionId, (payload) => ({
+            ...payload,
+            model_provider: normalizedProvider,
+          }));
         }
-      })
+        invalidateListCache(this.getListCacheKey());
+      }
     );
-
-    this.sqliteClient.changeModelProvidersForSessions(sessionIds, normalizedProvider);
-
-    for (const target of transcriptTargets) {
-      if (!target.filePath) continue;
-      await this.rewriteTranscriptSessionMeta(target.filePath, target.sessionId, (payload) => ({
-        ...payload,
-        model_provider: normalizedProvider,
-      }));
-      await this.persistKnownThreadTitle(target.sessionId, target.currentTitle, target.filePath);
-      invalidateCache(target.filePath);
-    }
-    invalidateListCache(this.getListCacheKey());
 
     return sessionIds.length;
   }

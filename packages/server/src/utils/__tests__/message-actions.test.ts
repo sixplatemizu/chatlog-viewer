@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -36,6 +36,31 @@ test("rewriteJsonlFileLines 会删除多行并保留末尾换行", async () => {
 
     const content = await readFile(filePath, "utf-8");
     assert.equal(content, "{\"a\":1}\n");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("rewriteJsonlFileLine 会拒绝覆盖外部进程已经修改的文件", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "chatlog-viewer-message-actions-conflict-"));
+  const filePath = join(dir, "session.jsonl");
+
+  try {
+    await writeFile(filePath, "{\"a\":1}\n{\"b\":2}\n", "utf-8");
+    const revision = await stat(filePath);
+    await writeFile(filePath, "{\"a\":1}\n{\"external\":true}\n{\"b\":2}\n", "utf-8");
+
+    await assert.rejects(
+      rewriteJsonlFileLine(filePath, 2, "{\"b\":3}", {
+        mtimeMs: revision.mtimeMs,
+        size: revision.size,
+      }),
+      /已被其他进程修改/
+    );
+    assert.equal(
+      await readFile(filePath, "utf-8"),
+      "{\"a\":1}\n{\"external\":true}\n{\"b\":2}\n"
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

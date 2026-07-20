@@ -216,6 +216,11 @@ export class IFlowProvider implements ConversationProvider {
     titleSyncMode: "overlay",
     canUpdateTitle: false,
     canGenerateTitle: false,
+    canEditMessage: true,
+    canDeleteMessage: true,
+    canMoveConversation: true,
+    canDeleteConversation: true,
+    supportsMetadataOnly: false,
     updateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
     generateTitleDisabledReason: "iFlow 当前没有稳定的原生标题字段，已禁用修改标题",
   } as const;
@@ -675,7 +680,8 @@ export class IFlowProvider implements ConversationProvider {
           },
         };
         return JSON.stringify(nextEntry);
-      }
+      },
+      { mtimeMs: fileStat.mtimeMs, size: fileStat.size }
     );
     this.invalidateConversationCaches(filePath);
   }
@@ -693,7 +699,11 @@ export class IFlowProvider implements ConversationProvider {
       throw new Error("待删除消息不能为空");
     }
     const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
-    await rewriteJsonlFileLines(filePath, lineNumbers);
+    await rewriteJsonlFileLines(
+      filePath,
+      lineNumbers,
+      { mtimeMs: fileStat.mtimeMs, size: fileStat.size }
+    );
     this.invalidateConversationCaches(filePath);
   }
 

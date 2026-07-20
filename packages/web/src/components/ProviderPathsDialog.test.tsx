@@ -35,9 +35,9 @@ function createSettings(overrides?: Partial<ProviderPathSettings>): ProviderPath
     ai: {
       titleGenerationCliPriority: ["codex", "claude", "opencode"],
       titleGenerationCliSessionModes: {
-        codex: "fixed",
-        claude: "fixed",
-        opencode: "fixed",
+        codex: "fresh",
+        claude: "fresh",
+        opencode: "fresh",
       },
       titleGenerationCliDisabled: [],
     },
@@ -90,9 +90,9 @@ describe("ProviderPathsDialog", () => {
         ai: {
           titleGenerationCliPriority: ["codex", "claude", "opencode"],
           titleGenerationCliSessionModes: {
-            codex: "fixed",
-            claude: "fixed",
-            opencode: "fixed",
+            codex: "fresh",
+            claude: "fresh",
+            opencode: "fresh",
           },
           titleGenerationCliDisabled: [],
         },
@@ -234,24 +234,24 @@ describe("ProviderPathsDialog", () => {
     });
   });
 
-  it("允许切换 AI 标题生成固定模式并保存到 API", async () => {
+  it("默认使用 Fresh 模式并允许切换为固定模式", async () => {
     const settings = createSettings();
 
     mockFetchProviderPathSettings.mockResolvedValue(settings);
     mockUpdateProviderPathSettings.mockImplementation(async (payload) => {
       expect(payload.ai?.titleGenerationCliSessionModes).toEqual({
-        codex: "fresh",
-        claude: "fixed",
-        opencode: "fixed",
+        codex: "fixed",
+        claude: "fresh",
+        opencode: "fresh",
       });
       return {
         ...settings,
         ai: {
           titleGenerationCliPriority: settings.ai.titleGenerationCliPriority,
           titleGenerationCliSessionModes: {
-            codex: "fresh",
-            claude: "fixed",
-            opencode: "fixed",
+            codex: "fixed",
+            claude: "fresh",
+            opencode: "fresh",
           },
           titleGenerationCliDisabled: [],
         },
@@ -267,7 +267,8 @@ describe("ProviderPathsDialog", () => {
     );
 
     await screen.findByText("AI 标题生成优先级");
-    fireEvent.click(screen.getByLabelText("切换为不固定模式 Codex"));
+    expect(screen.getAllByText("Fresh 模式")).toHaveLength(3);
+    fireEvent.click(screen.getByLabelText("切换为固定模式 Codex"));
     fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
 
     await waitFor(() => {

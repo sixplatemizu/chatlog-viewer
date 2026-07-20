@@ -102,6 +102,17 @@ export function useBatchActions({
 
       const selectedConversations = conversations.filter((item) => selectedIds.has(item.id));
       if (selectedConversations.length === 0) return;
+      const unsupported = selectedConversations.find(
+        (item) => item.capabilities?.canMoveConversation === false
+      );
+      if (unsupported) {
+        pushToast({
+          variant: "warning",
+          title: "当前选择不支持批量移动",
+          description: unsupported.capabilities?.moveConversationDisabledReason,
+        });
+        return;
+      }
 
       const providerNames = new Set(selectedConversations.map((item) => item.provider));
       if (providerNames.size > 1) {

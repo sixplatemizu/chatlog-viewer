@@ -12,6 +12,7 @@ import {
   type IndexedCacheItem,
 } from "../utils/cache.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
+import { ProviderDataError, type ProviderDataErrorKind } from "../utils/errors.js";
 import {
   createIndexedListSourceSignature,
   type IndexedSourceFile,
@@ -36,6 +37,18 @@ const Database = require("better-sqlite3") as typeof BetterSqlite3;
 const OPENCODE_RECENT_SESSION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const OPENCODE_INTERNAL_TITLE_PREFIX = "ChatLog Viewer AI Title";
 const OPENCODE_ONE_SHOT_DENY_PERMISSIONS = new Set(["question", "plan_enter", "plan_exit"]);
+
+function classifyOpenCodeDataError(error: unknown): ProviderDataErrorKind {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (message.includes("locked") || message.includes("busy")) return "locked";
+  if (message.includes("malformed") || message.includes("corrupt") || message.includes("not a database")) {
+    return "corrupt";
+  }
+  if (message.includes("no such table") || message.includes("no such column")) {
+    return "schema-incompatible";
+  }
+  return "unavailable";
+}
 
 interface OpenCodeSessionRow {
   id: string;
@@ -75,6 +88,11 @@ interface OpenCodePartRow {
   time_created: number;
   time_updated: number;
   data: string;
+}
+
+interface OpenCodeSessionMessages {
+  messages: Message[];
+  dataSize: number;
 }
 
 interface OpenCodeMessageData {
@@ -358,6 +376,13 @@ export class OpenCodeProvider implements ConversationProvider {
     titleSyncMode: "native",
     canUpdateTitle: true,
     canGenerateTitle: true,
+    canEditMessage: false,
+    canDeleteMessage: false,
+    canMoveConversation: true,
+    canDeleteConversation: true,
+    supportsMetadataOnly: false,
+    editMessageDisabledReason: "OpenCode 消息由 message/part 多表结构组成，当前未开放安全编辑",
+    deleteMessageDisabledReason: "OpenCode 消息由 message/part 多表结构组成，当前未开放安全删除",
   } as const;
 
   private readDb: BetterSqlite3.Database | null = null;
@@ -392,11 +417,24 @@ export class OpenCodeProvider implements ConversationProvider {
           size: dbStat.size,
         },
         {
-          path: "opencode:list-filter:v2",
+          path: "opencode:list-filter:v3-wal-bulk-index",
           mtimeMs: 0,
           size: 0,
         },
       ];
+      for (const suffix of ["-wal", "-shm"]) {
+        const sidecarPath = `${dbPath}${suffix}`;
+        try {
+          const sidecarStat = await stat(sidecarPath);
+          sourceFiles.push({
+            path: normalizePath(sidecarPath),
+            mtimeMs: sidecarStat.mtimeMs,
+            size: sidecarStat.size,
+          });
+        } catch {
+          // sidecar 不存在时只使用主数据库 signature。
+        }
+      }
       return createIndexedListSourceSignature(sourceFiles);
     } catch {
       return null;
@@ -415,7 +453,7 @@ export class OpenCodeProvider implements ConversationProvider {
     this.readDbPath = null;
   }
 
-  private getReadDb(): BetterSqlite3.Database | null {
+  private getReadDb(): BetterSqlite3.Database {
     const dbPath = this.getDbPath();
     if (this.readDb && this.readDbPath === dbPath) {
       return this.readDb;
@@ -426,10 +464,15 @@ export class OpenCodeProvider implements ConversationProvider {
       this.readDb = new Database(dbPath, { readonly: true, fileMustExist: true });
       this.readDbPath = dbPath;
       return this.readDb;
-    } catch {
+    } catch (error) {
       this.readDb = null;
       this.readDbPath = null;
-      return null;
+      throw new ProviderDataError(
+        this.name,
+        classifyOpenCodeDataError(error),
+        `OpenCode 数据库无法读取: ${this.getDbPath()}`,
+        { cause: error }
+      );
     }
   }
 
@@ -444,7 +487,13 @@ export class OpenCodeProvider implements ConversationProvider {
 
   async list(options: ConversationListOptions = {}): Promise<ConversationMeta[]> {
     const sourceSignature = await this.getListSourceSignature();
-    if (!sourceSignature) return [];
+    if (!sourceSignature) {
+      throw new ProviderDataError(
+        this.name,
+        "unavailable",
+        `OpenCode 数据库不存在或无法读取: ${this.getDbPath()}`
+      );
+    }
 
     const cacheKey = this.getListCacheKey();
     const cachedList = getIndexedListCache(cacheKey, undefined, {
@@ -455,14 +504,21 @@ export class OpenCodeProvider implements ConversationProvider {
       return [...cachedList].sort((a, b) => b.updatedAt - a.updatedAt);
     }
 
-    const results = this.listSessionRows().map((row) => this.buildIndexedCacheItem(row));
-    setIndexedListCache(cacheKey, results, { searchReady: true, sourceSignature });
+    const rows = this.listSessionRows();
+    const eagerSearchIndex = options.eagerSearchIndex ?? false;
+    const results = eagerSearchIndex
+      ? this.buildSearchIndexedCacheItems(rows)
+      : rows.map((row) => ({ meta: this.buildMeta(row) }));
+    setIndexedListCache(cacheKey, results, {
+      searchReady: eagerSearchIndex,
+      sourceSignature,
+      writeSearchData: eagerSearchIndex,
+    });
     return results.map((item) => item.meta).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   private listSessionRows(): OpenCodeSessionRow[] {
     const db = this.getReadDb();
-    if (!db) return [];
 
     try {
       const rows = db.prepare(`
@@ -479,31 +535,32 @@ export class OpenCodeProvider implements ConversationProvider {
           s.path,
           p.worktree AS project_worktree,
           p.name AS project_name,
-          COUNT(m.id) AS message_count,
-          (
-            SELECT COALESCE(SUM(length(CAST(data AS BLOB))), 0)
-            FROM message
-            WHERE session_id = s.id
-          ) + (
-            SELECT COALESCE(SUM(length(CAST(data AS BLOB))), 0)
-            FROM part
-            WHERE session_id = s.id
-          ) AS data_size
+          COALESCE(m.message_count, 0) AS message_count,
+          0 AS data_size
         FROM session s
         LEFT JOIN project p ON p.id = s.project_id
-        LEFT JOIN message m ON m.session_id = s.id
-        GROUP BY s.id
+        LEFT JOIN (
+          SELECT
+            session_id,
+            COUNT(*) AS message_count
+          FROM message
+          GROUP BY session_id
+        ) m ON m.session_id = s.id
         ORDER BY s.time_updated DESC
       `).all() as OpenCodeSessionRow[];
       return rows;
-    } catch {
-      return [];
+    } catch (error) {
+      throw new ProviderDataError(
+        this.name,
+        classifyOpenCodeDataError(error),
+        `OpenCode 会话索引读取失败: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
     }
   }
 
   private findSessionRow(sessionId: string): OpenCodeSessionRow | null {
     const db = this.getReadDb();
-    if (!db) return null;
 
     try {
       return db.prepare(`
@@ -536,8 +593,13 @@ export class OpenCodeProvider implements ConversationProvider {
         WHERE s.id = ?
         GROUP BY s.id
       `).get(sessionId) as OpenCodeSessionRow | undefined ?? null;
-    } catch {
-      return null;
+    } catch (error) {
+      throw new ProviderDataError(
+        this.name,
+        classifyOpenCodeDataError(error),
+        `OpenCode 会话读取失败: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
     }
   }
 
@@ -568,8 +630,7 @@ export class OpenCodeProvider implements ConversationProvider {
     return meta;
   }
 
-  private buildIndexedCacheItem(row: OpenCodeSessionRow): IndexedCacheItem {
-    const messages = this.readMessages(row.id);
+  private buildIndexedCacheItem(row: OpenCodeSessionRow, messages: Message[]): IndexedCacheItem {
     const meta = this.buildMeta({
       ...row,
       message_count: messages.filter((message) => message.role !== "tool").length,
@@ -581,9 +642,64 @@ export class OpenCodeProvider implements ConversationProvider {
     };
   }
 
+  private buildSearchIndexedCacheItems(rows: OpenCodeSessionRow[]): IndexedCacheItem[] {
+    const messagesBySession = this.readAllMessagesBySession();
+    return rows.map((row) => {
+      const session = messagesBySession.get(row.id);
+      return this.buildIndexedCacheItem(
+        {
+          ...row,
+          data_size: session?.dataSize ?? row.data_size,
+        },
+        session?.messages ?? []
+      );
+    });
+  }
+
+  private readAllMessagesBySession(): Map<string, OpenCodeSessionMessages> {
+    const db = this.getReadDb();
+
+    const messageRows = db.prepare(`
+      SELECT id, session_id, time_created, time_updated, data
+      FROM message
+      ORDER BY session_id ASC, time_created ASC, id ASC
+    `).all() as OpenCodeMessageRow[];
+    const partRows = db.prepare(`
+      SELECT id, message_id, session_id, time_created, time_updated, data
+      FROM part
+      ORDER BY session_id ASC, time_created ASC, id ASC
+    `).all() as OpenCodePartRow[];
+    const messageRowsBySession = new Map<string, OpenCodeMessageRow[]>();
+    const partRowsBySession = new Map<string, OpenCodePartRow[]>();
+
+    for (const row of messageRows) {
+      const rows = messageRowsBySession.get(row.session_id) ?? [];
+      rows.push(row);
+      messageRowsBySession.set(row.session_id, rows);
+    }
+    for (const row of partRows) {
+      const rows = partRowsBySession.get(row.session_id) ?? [];
+      rows.push(row);
+      partRowsBySession.set(row.session_id, rows);
+    }
+
+    const messagesBySession = new Map<string, OpenCodeSessionMessages>();
+    for (const [sessionId, rows] of messageRowsBySession) {
+      const parts = partRowsBySession.get(sessionId) ?? [];
+      messagesBySession.set(
+        sessionId,
+        {
+          messages: buildMessagesFromRows(rows, parts),
+          dataSize: rows.reduce((sum, row) => sum + Buffer.byteLength(row.data), 0)
+            + parts.reduce((sum, row) => sum + Buffer.byteLength(row.data), 0),
+        }
+      );
+    }
+    return messagesBySession;
+  }
+
   private readMessages(sessionId: string): Message[] {
     const db = this.getReadDb();
-    if (!db) return [];
 
     const messageRows = db.prepare(`
       SELECT id, session_id, time_created, time_updated, data

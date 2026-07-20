@@ -6,9 +6,8 @@ import {
   pickCodexConversationTitle,
 } from "./codex-title.js";
 
-test("Codex 标题选择会让 UI 来源标题优先于所有本地标题", () => {
+test("Codex 标题选择始终以 State DB 原生 title 为准", () => {
   const result = pickCodexConversationTitle({
-    managedTitle: "UI 修改标题",
     nativeTitle: "state db 标题",
     firstUserMessage: "state db preview",
     preview: "state db preview",
@@ -17,12 +16,12 @@ test("Codex 标题选择会让 UI 来源标题优先于所有本地标题", () =
   });
 
   assert.deepEqual(result, {
-    title: "UI 修改标题",
+    title: "state db 标题",
     usedFallback: false,
   });
 });
 
-test("Codex 标题选择在没有 UI 来源时仍保留历史问候语兜底", () => {
+test("Codex 原生问候语标题不会被展示 fallback 擅自覆盖", () => {
   const result = pickCodexConversationTitle({
     nativeTitle: "hi",
     firstUserMessage: "hi",
@@ -31,8 +30,8 @@ test("Codex 标题选择在没有 UI 来源时仍保留历史问候语兜底", (
   });
 
   assert.deepEqual(result, {
-    title: "实际问题标题",
-    usedFallback: true,
+    title: "hi",
+    usedFallback: false,
   });
 });
 

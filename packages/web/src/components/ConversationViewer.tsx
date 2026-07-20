@@ -146,11 +146,15 @@ export function ConversationViewer({
   const sequenceTotal = Math.max(totalMessages, loadedMessages.length);
   const firstLoadedSequence = Math.max(1, sequenceTotal - loadedMessages.length + 1);
   const hiddenCount = Math.max(0, totalMessages - loadedMessages.length);
+  const canEditMessage = conversation?.capabilities?.canEditMessage ?? true;
+  const canDeleteMessage = conversation?.capabilities?.canDeleteMessage ?? true;
+  const canMoveConversation = conversation?.capabilities?.canMoveConversation ?? true;
+  const canDeleteConversation = conversation?.capabilities?.canDeleteConversation ?? true;
   const deletableMessageIds = useMemo(
-    () => loadedMessages
+    () => canDeleteMessage ? loadedMessages
       .filter((message) => message.deletable && message.messageId)
-      .map((message) => message.messageId!),
-    [loadedMessages]
+      .map((message) => message.messageId!) : [],
+    [canDeleteMessage, loadedMessages]
   );
   const selectedDeletableCount = selectedMessageIds.size;
   const titleSyncInfo = conversation
@@ -231,6 +235,7 @@ export function ConversationViewer({
     try {
       const result = await updateTitle(conversation.id, editValue.trim());
       await onTitleChanged(conversation.id, result.title);
+      await onRefreshConversation?.(conversation.id);
       setEditing(false);
       if (titleSyncInfo) {
         onNotify({
@@ -419,10 +424,18 @@ export function ConversationViewer({
                   }}
                   className="flex-1 text-base font-semibold text-gray-900 dark:text-gray-100 border border-blue-400 rounded-md px-2 py-0.5 bg-white dark:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
-                <button onClick={saveEdit} className="p-1 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded">
+                <button
+                  onClick={saveEdit}
+                  className="p-1 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded"
+                  title="保存标题"
+                >
                   <Check className="w-4 h-4" />
                 </button>
-                <button onClick={() => setEditing(false)} className="p-1 text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded">
+                <button
+                  onClick={() => setEditing(false)}
+                  className="p-1 text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
+                  title="取消修改"
+                >
                   <X className="w-4 h-4" />
                 </button>
               </div>
@@ -474,7 +487,7 @@ export function ConversationViewer({
                   </select>
                 </span>
               )}
-              {folderOptions.length > 0 && (
+              {canMoveConversation && folderOptions.length > 0 && (
                 <span className="flex items-center gap-1">
                   <ArrowRightLeft className="w-3 h-3 text-gray-400" />
                   <select
@@ -600,13 +613,15 @@ export function ConversationViewer({
               <Download className="w-3.5 h-3.5" />
               导出
             </button>
-            <button
-              onClick={() => onDelete(conversation.id)}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              {isCleanupOnlyConversation ? "清理残留记录" : "删除"}
-            </button>
+            {canDeleteConversation && (
+              <button
+                onClick={() => onDelete(conversation.id)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                {isCleanupOnlyConversation ? "清理残留记录" : "删除"}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -630,8 +645,8 @@ export function ConversationViewer({
                 sequenceNumber={firstLoadedSequence + index}
                 totalMessages={sequenceTotal}
                 dark={dark}
-                onUpdateMessage={handleUpdateMessage}
-                onDeleteMessage={handleDeleteMessage}
+                onUpdateMessage={canEditMessage ? handleUpdateMessage : undefined}
+                onDeleteMessage={canDeleteMessage ? handleDeleteMessage : undefined}
                 selectionMode={selectionMode}
                 selected={!!message.messageId && selectedMessageIds.has(message.messageId)}
                 selectable={!!message.deletable && !!message.messageId}

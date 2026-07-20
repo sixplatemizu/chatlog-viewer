@@ -8,12 +8,23 @@ if (testFiles.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ["--import", "tsx", "--test", ...testFiles], {
-  stdio: "inherit",
-});
+for (const testFile of testFiles) {
+  const result = spawnSync(process.execPath, [
+    "--import",
+    "tsx",
+    "--test",
+    "--test-concurrency=1",
+    testFile,
+  ], {
+    stdio: "inherit",
+  });
 
-if (result.error) {
-  throw result.error;
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
 }
 
-process.exit(result.status ?? 1);
+process.exit(0);

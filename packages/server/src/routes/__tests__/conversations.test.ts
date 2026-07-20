@@ -4,13 +4,22 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { createConversationRoutes } from "../conversations.js";
-import { buildTitleGenerationMessages } from "../../services/conversation-title.js";
+import {
+  buildTitleGenerationMessages,
+  cleanupFreshTitleGenerationSessions,
+} from "../../services/conversation-title.js";
 import {
   invalidateListCache,
   setIndexedListCache,
   setCacheStoreDirForTests,
 } from "../../utils/cache.js";
-import { getNativeTitle, getTitle, setTitle, setTitleStoreDirForTests } from "../../utils/title-store.js";
+import {
+  getNativeTitleSnapshot,
+  getTitle,
+  getTitleHistory,
+  setTitle,
+  setTitleStoreDirForTests,
+} from "../../utils/title-store.js";
 import type {
   ConversationProvider,
   ConversationMeta,
@@ -110,6 +119,11 @@ async function createFakeTitleEnv(toolName: "codex" | "opencode") {
 import { join } from "node:path";
 
 const [, , toolName, ...args] = process.argv;
+if (args.includes("--version")) {
+  process.stdout.write(\`\${toolName} fake 1.0.0\`);
+  process.exit(0);
+}
+
 let input = "";
 
 process.stdin.setEncoding("utf8");
@@ -117,12 +131,6 @@ process.stdin.on("data", (chunk) => {
   input += chunk;
 });
 process.stdin.on("end", () => {
-  if (args.includes("--version")) {
-    process.stdout.write(\`\${toolName} fake 1.0.0\`);
-    process.exit(0);
-    return;
-  }
-
   const cwd = process.cwd();
   const sessionFile = join(cwd, \`\${toolName}.session\`);
   const callsFile = join(cwd, \`\${toolName}.calls.log\`);
@@ -143,7 +151,14 @@ process.stdin.on("end", () => {
   }
 
   writeFileSync(sessionFile, "active", "utf8");
-  process.stdout.write("新建路由标题");
+  if (toolName === "opencode") {
+    process.stdout.write(JSON.stringify({
+      type: "text",
+      part: { type: "text", text: "新建路由标题", sessionID: "ses_route_title" },
+    }) + "\\n");
+  } else {
+    process.stdout.write("新建路由标题");
+  }
   process.exit(0);
 });
 
@@ -290,7 +305,11 @@ test("支持原生标题持久化的 provider 会调用 updateTitle 并记录 UI
     title: "同步到原生存储",
   }]);
   assert.equal(await getTitle("codex:native-1"), null);
-  assert.equal(await getNativeTitle("codex:native-1"), "同步到原生存储");
+  assert.equal(await getNativeTitleSnapshot("codex:native-1"), "同步到原生存储");
+  const history = await getTitleHistory("codex:native-1");
+  assert.equal(history.at(-1)?.source, "chatlog-viewer");
+  assert.equal(history.at(-1)?.action, "set-native-title");
+  assert.equal(history.at(-1)?.newTitle, "同步到原生存储");
 
   const res = await app.request("http://localhost/conversations?provider=codex");
   assert.equal(res.status, 200);
@@ -388,6 +407,9 @@ test("列表和详情接口会返回标题同步模式", async () => {
         }),
       ],
       updateTitle: async () => {},
+      updateMessage: async () => {},
+      deleteMessage: async () => {},
+      move: async () => {},
       read: async (id) => ({
         ...createConversationMeta({
           id,
@@ -437,6 +459,10 @@ test("列表和详情接口会返回标题同步模式", async () => {
   assert.equal(iflowConversation?.titleSyncMode, "overlay");
   assert.equal(codexConversation?.capabilities?.canUpdateTitle, true);
   assert.equal(codexConversation?.capabilities?.canGenerateTitle, true);
+  assert.equal(codexConversation?.capabilities?.canEditMessage, true);
+  assert.equal(codexConversation?.capabilities?.canDeleteMessage, true);
+  assert.equal(codexConversation?.capabilities?.canMoveConversation, true);
+  assert.equal(codexConversation?.capabilities?.canDeleteConversation, true);
   assert.equal(iflowConversation?.capabilities?.canUpdateTitle, false);
   assert.equal(iflowConversation?.capabilities?.canGenerateTitle, false);
 
@@ -457,8 +483,17 @@ test("provider capabilities 会覆盖默认标题能力", async () => {
         titleSyncMode: "overlay",
         canUpdateTitle: false,
         canGenerateTitle: false,
+        canEditMessage: false,
+        canDeleteMessage: false,
+        canMoveConversation: false,
+        canDeleteConversation: false,
+        supportsMetadataOnly: true,
         updateTitleDisabledReason: "禁用手动标题",
         generateTitleDisabledReason: "禁用 AI 标题",
+        editMessageDisabledReason: "禁用消息编辑",
+        deleteMessageDisabledReason: "禁用消息删除",
+        moveConversationDisabledReason: "禁用对话移动",
+        deleteConversationDisabledReason: "禁用对话删除",
       },
       conversations: [
         createConversationMeta({
@@ -485,8 +520,17 @@ test("provider capabilities 会覆盖默认标题能力", async () => {
   assert.equal(data.titleSyncMode, "overlay");
   assert.equal(data.capabilities?.canUpdateTitle, false);
   assert.equal(data.capabilities?.canGenerateTitle, false);
+  assert.equal(data.capabilities?.canEditMessage, false);
+  assert.equal(data.capabilities?.canDeleteMessage, false);
+  assert.equal(data.capabilities?.canMoveConversation, false);
+  assert.equal(data.capabilities?.canDeleteConversation, false);
+  assert.equal(data.capabilities?.supportsMetadataOnly, true);
   assert.equal(data.capabilities?.updateTitleDisabledReason, "禁用手动标题");
   assert.equal(data.capabilities?.generateTitleDisabledReason, "禁用 AI 标题");
+  assert.equal(data.capabilities?.editMessageDisabledReason, "禁用消息编辑");
+  assert.equal(data.capabilities?.deleteMessageDisabledReason, "禁用消息删除");
+  assert.equal(data.capabilities?.moveConversationDisabledReason, "禁用对话移动");
+  assert.equal(data.capabilities?.deleteConversationDisabledReason, "禁用对话删除");
 });
 
 test("iFlow 标题修改接口会被禁用", async () => {
@@ -573,6 +617,7 @@ test("AI 标题生成路由会复用固定 CLI 会话", async () => {
       JSON.stringify({
         ai: {
           titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliDisabled: ["claude", "opencode"],
           titleGenerationCliSessionModes: {
             codex: "fixed",
             claude: "fresh",
@@ -595,8 +640,10 @@ test("AI 标题生成路由会复用固定 CLI 会话", async () => {
             content: "请分析标题生成路由是否复用固定会话",
           }],
         }),
-        updateTitle: async (_id, title) => {
+        updateTitle: async (id, title) => {
           savedTitles.push(title);
+          const conversation = sourceConversations.find((item) => item.id === id);
+          if (conversation) conversation.title = title;
         },
         delete: async (id) => {
           deletedIds.push(id);
@@ -622,13 +669,16 @@ test("AI 标题生成路由会复用固定 CLI 会话", async () => {
     assert.equal(calls[1]?.isResume, true);
     assert.deepEqual(savedTitles, ["新建路由标题", "复用路由标题"]);
     assert.deepEqual(deletedIds, []);
+    const history = await getTitleHistory("codex:route-ai-title");
+    assert.deepEqual(history.map((entry) => entry.source), ["ai", "ai"]);
+    assert.deepEqual(history.map((entry) => entry.newTitle), ["新建路由标题", "复用路由标题"]);
   } finally {
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });
   }
 });
 
-test("AI 标题生成路由会自动删除 fresh 模式内部标题生成会话", async () => {
+test("Codex Fresh 模式使用 ephemeral 并保留历史标题会话", async () => {
   const env = await createFakeCodexTitleEnv();
   const targetConversation = createConversationMeta({
     id: "codex:route-ai-title-cleanup",
@@ -651,6 +701,7 @@ test("AI 标题生成路由会自动删除 fresh 模式内部标题生成会话"
       JSON.stringify({
         ai: {
           titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliDisabled: ["claude", "opencode"],
           titleGenerationCliSessionModes: {
             codex: "fresh",
             claude: "fixed",
@@ -678,6 +729,7 @@ test("AI 标题生成路由会自动删除 fresh 模式内部标题生成会话"
         },
         updateTitle: async (_id, title) => {
           savedTitles.push(title);
+          targetConversation.title = title;
         },
         delete: async (id) => {
           deletedIds.push(id);
@@ -697,9 +749,11 @@ test("AI 标题生成路由会自动删除 fresh 模式内部标题生成会话"
     };
     assert.equal(data.title, "新建路由标题");
     assert.equal(data.usedCli, "codex");
-    assert.equal(data.cleanedTitleSessions, 1);
+    assert.equal(data.cleanedTitleSessions, 0);
     assert.deepEqual(savedTitles, ["新建路由标题"]);
-    assert.deepEqual(deletedIds, [titleSession.id]);
+    assert.deepEqual(deletedIds, []);
+    const calls = await readFakeCodexTitleCalls(env.sessionDir);
+    assert.ok(calls[0]?.args.includes("--ephemeral"));
   } finally {
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });
@@ -728,6 +782,7 @@ test("AI 标题生成路由会自动删除 OpenCode fresh 模式内部标题生�
       JSON.stringify({
         ai: {
           titleGenerationCliPriority: ["opencode", "codex", "claude"],
+          titleGenerationCliDisabled: ["codex", "claude"],
           titleGenerationCliSessionModes: {
             codex: "fixed",
             claude: "fixed",
@@ -753,7 +808,9 @@ test("AI 标题生成路由会自动删除 OpenCode fresh 模式内部标题生�
             }],
           };
         },
-        updateTitle: async () => {},
+        updateTitle: async (_id, title) => {
+          targetConversation.title = title;
+        },
         delete: async (id) => {
           deletedIds.push(id);
         },
@@ -773,11 +830,184 @@ test("AI 标题生成路由会自动删除 OpenCode fresh 模式内部标题生�
     assert.equal(data.title, "新建路由标题");
     assert.equal(data.usedCli, "opencode");
     assert.equal(data.cleanedTitleSessions, 1);
-    assert.deepEqual(deletedIds, [titleSession.id]);
+    assert.deepEqual(deletedIds, ["opencode:ses_route_title"]);
+    assert.equal(deletedIds.includes(titleSession.id), false);
   } finally {
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });
   }
+});
+
+test("AI 标题生成不会覆盖生成期间发生的手动标题修改", async () => {
+  const env = await createFakeCodexTitleEnv();
+  let readCount = 0;
+  const savedTitles: string[] = [];
+
+  try {
+    await writeFile(
+      join(env.baseDir, "config.json"),
+      JSON.stringify({
+        ai: {
+          titleGenerationCliPriority: ["codex"],
+          titleGenerationCliDisabled: ["claude", "opencode"],
+          titleGenerationCliSessionModes: {
+            codex: "fresh",
+            claude: "fresh",
+            opencode: "fresh",
+          },
+        },
+      }),
+      "utf-8"
+    );
+
+    const provider = createProvider({
+      name: "codex",
+      displayName: "Codex",
+      read: async (id) => {
+        readCount += 1;
+        return {
+          ...createConversationMeta({
+            id,
+            provider: "codex",
+            title: readCount === 1 ? "生成开始标题" : "用户手动新标题",
+          }),
+          messages: [{ role: "user", content: "请生成标题" }],
+        };
+      },
+      updateTitle: async (_id, title) => {
+        savedTitles.push(title);
+      },
+    });
+    const app = createConversationRoutes([provider]);
+
+    const response = await app.request("http://localhost/conversations/codex%3Aai-conflict/generate-title", {
+      method: "POST",
+    });
+    assert.equal(response.status, 409);
+    assert.match((await response.json() as { error: string }).error, /已保留当前标题/);
+    assert.deepEqual(savedTitles, []);
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("Fresh 标题会话快照失败时只清理精确 session ID", async () => {
+  const env = await createFakeOpenCodeTitleEnv();
+  const deletedIds: string[] = [];
+  let listCalls = 0;
+
+  try {
+    await writeFile(
+      join(env.baseDir, "config.json"),
+      JSON.stringify({
+        ai: {
+          titleGenerationCliPriority: ["opencode"],
+          titleGenerationCliDisabled: ["codex", "claude"],
+          titleGenerationCliSessionModes: {
+            codex: "fresh",
+            claude: "fresh",
+            opencode: "fresh",
+          },
+        },
+      }),
+      "utf-8"
+    );
+
+    const target = createConversationMeta({
+      id: "opencode:snapshot-failure-target",
+      provider: "opencode",
+      title: "原始标题",
+    });
+    const provider = createProvider({
+      name: "opencode",
+      displayName: "OpenCode",
+      list: async () => {
+        listCalls += 1;
+        throw new Error("快照读取失败");
+      },
+      read: async () => ({
+        ...target,
+        messages: [{ role: "user", content: "请生成标题" }],
+      }),
+      updateTitle: async (_id, title) => {
+        target.title = title;
+      },
+      delete: async (id) => {
+        deletedIds.push(id);
+      },
+    });
+    const app = createConversationRoutes([provider]);
+
+    const response = await app.request(
+      "http://localhost/conversations/opencode%3Asnapshot-failure-target/generate-title",
+      { method: "POST" }
+    );
+    assert.equal(response.status, 200);
+    assert.equal(listCalls, 1);
+    assert.deepEqual(deletedIds, ["opencode:ses_route_title"]);
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("fresh 标题会话清理会保留调用前已有的 fixed 会话", async () => {
+  const existing = createConversationMeta({
+    id: "codex:existing-title-session",
+    provider: "codex",
+    title: "已有标题会话",
+    badges: [{ label: "标题生成", tone: "cyan" }],
+  });
+  const created = createConversationMeta({
+    id: "codex:created-title-session",
+    provider: "codex",
+    title: "新建标题会话",
+    badges: [{ label: "标题生成", tone: "cyan" }],
+  });
+  const deletedIds: string[] = [];
+  const provider = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    conversations: [existing, created],
+    delete: async (id) => {
+      deletedIds.push(id);
+    },
+  });
+
+  const cleaned = await cleanupFreshTitleGenerationSessions(
+    [provider],
+    "codex",
+    false,
+    true,
+    undefined,
+    new Set([existing.id])
+  );
+
+  assert.equal(cleaned, 1);
+  assert.deepEqual(deletedIds, [created.id]);
+});
+
+test("OpenCode fresh 标题会话按返回的 session ID 精确清理", async () => {
+  const deletedIds: string[] = [];
+  const provider = createProvider({
+    name: "opencode",
+    displayName: "OpenCode",
+    delete: async (id) => {
+      deletedIds.push(id);
+    },
+  });
+
+  const cleaned = await cleanupFreshTitleGenerationSessions(
+    [provider],
+    "opencode",
+    false,
+    true,
+    "ses_generated"
+  );
+
+  assert.equal(cleaned, 1);
+  assert.deepEqual(deletedIds, ["opencode:ses_generated"]);
 });
 
 test("AI 标题生成路由在不固定模式下每次新建 CLI 会话", async () => {
@@ -796,6 +1026,7 @@ test("AI 标题生成路由在不固定模式下每次新建 CLI 会话", async 
       JSON.stringify({
         ai: {
           titleGenerationCliPriority: ["codex", "claude", "opencode"],
+          titleGenerationCliDisabled: ["claude", "opencode"],
           titleGenerationCliSessionModes: {
             codex: "fresh",
             claude: "fixed",
@@ -818,7 +1049,9 @@ test("AI 标题生成路由在不固定模式下每次新建 CLI 会话", async 
             content: "请分析标题生成路由的不固定模式",
           }],
         }),
-        updateTitle: async () => {},
+        updateTitle: async (_id, title) => {
+          sourceConversations[0]!.title = title;
+        },
       }),
     ]);
 
@@ -1101,6 +1334,29 @@ test("消息编辑接口会把 messageId 和 content 透传给 provider.updateMe
       receivedContent: "更新后的消息",
     }
   );
+});
+
+test("消息编辑接口会拒绝超过 100 万字符的正文", async () => {
+  let updateCalls = 0;
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      updateMessage: async () => {
+        updateCalls += 1;
+      },
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations/codex%3Amsg-large/messages/text%3A1", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: "x".repeat(1_000_001) }),
+  });
+
+  assert.equal(res.status, 400);
+  assert.match((await res.json() as { error: string }).error, /1000000/);
+  assert.equal(updateCalls, 0);
 });
 
 test("消息删除接口在 provider 不支持时返回 400", async () => {
@@ -1408,6 +1664,44 @@ test("底层文件 signature 变化后会跳过旧 indexed cache 并触发 provi
   invalidateListCache(cacheKey);
 });
 
+test("provider 过滤只刷新当前选中的 provider", async () => {
+  let codexDetectCalls = 0;
+  let opencodeDetectCalls = 0;
+  let opencodeListCalls = 0;
+  const codex = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    detect: async () => {
+      codexDetectCalls += 1;
+      return true;
+    },
+    conversations: [createConversationMeta({
+      id: "codex:active-only",
+      provider: "codex",
+      title: "仅刷新 Codex",
+    })],
+  });
+  const opencode = createProvider({
+    name: "opencode",
+    displayName: "OpenCode",
+    detect: async () => {
+      opencodeDetectCalls += 1;
+      return true;
+    },
+    list: async () => {
+      opencodeListCalls += 1;
+      return [];
+    },
+  });
+  const app = createConversationRoutes([codex, opencode]);
+
+  const response = await app.request("http://localhost/conversations?provider=codex");
+  assert.equal(response.status, 200);
+  assert.equal(codexDetectCalls, 1);
+  assert.equal(opencodeDetectCalls, 0);
+  assert.equal(opencodeListCalls, 0);
+});
+
 test("/projects 会优先复用 fresh indexed cache 中的项目列表", async () => {
   let listProjectsCalls = 0;
 
@@ -1505,4 +1799,27 @@ test("搜索降级到标题和目录匹配时会返回 partialSearch 提示", as
   assert.equal(data.warnings.length, 1);
   assert.match(data.warnings[0] || "", /搜索索引尚未就绪/);
   assert.equal(data.conversations[0]?.id, "codex:fallback-only");
+});
+
+test("普通列表 provider 读取失败时返回 partialResults 和具体 warning", async () => {
+  const app = createConversationRoutes([
+    createProvider({
+      name: "opencode",
+      displayName: "OpenCode",
+      list: async () => {
+        throw new Error("database is locked");
+      },
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations?provider=opencode");
+  assert.equal(res.status, 200);
+  const data = await res.json() as {
+    total: number;
+    partialResults: boolean;
+    warnings: string[];
+  };
+  assert.equal(data.total, 0);
+  assert.equal(data.partialResults, true);
+  assert.match(data.warnings[0] || "", /database is locked/);
 });

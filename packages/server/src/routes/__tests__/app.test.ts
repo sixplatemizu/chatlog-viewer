@@ -86,3 +86,20 @@ test("API 对非法 JSON 请求体返回 400", async () => {
   assert.equal(res.status, 400);
   assert.equal((await res.json() as { error: string }).error, "请求 JSON 格式错误");
 });
+
+test("API 会拒绝超过 2 MiB 的请求体", async () => {
+  const app = createApp([]);
+  const body = JSON.stringify({ value: "x".repeat(2 * 1024 * 1024) });
+
+  const res = await app.request("http://localhost/api/export", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(body)),
+    },
+    body,
+  });
+
+  assert.equal(res.status, 413);
+  assert.equal((await res.json() as { error: string }).error, "请求体不能超过 2 MiB");
+});

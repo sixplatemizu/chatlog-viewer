@@ -4,7 +4,7 @@ import type {
   ConversationMeta,
 } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
-import { getAllTitles, getTitle, deleteTitle, deleteNativeTitle } from "../utils/title-store.js";
+import { getAllTitles, getTitle, deleteTitle, deleteNativeTitleSnapshot } from "../utils/title-store.js";
 import { getIndexedListSnapshot, hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
 import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
@@ -21,6 +21,7 @@ import {
 const MAX_BATCH_CONVERSATION_IDS = 500;
 const MAX_BATCH_MESSAGE_IDS = 2_000;
 const MAX_MODEL_PROVIDER_LENGTH = 100;
+const MAX_MESSAGE_CONTENT_LENGTH = 1_000_000;
 const DEFAULT_CONVERSATION_LIST_LIMIT = 5_000;
 const MAX_CONVERSATION_LIST_LIMIT = 5_000;
 
@@ -132,7 +133,7 @@ async function deleteConversationWithCleanup(
   try {
     await provider.delete(id);
     await deleteTitle(id);
-    await deleteNativeTitle(id);
+    await deleteNativeTitleSnapshot(id);
     return { cleanedStale: false };
   } catch (error) {
     if (!isNotFoundError(error)) {
@@ -140,7 +141,7 @@ async function deleteConversationWithCleanup(
     }
 
     await deleteTitle(id);
-    await deleteNativeTitle(id);
+    await deleteNativeTitleSnapshot(id);
     return { cleanedStale: true };
   }
 }
@@ -193,22 +194,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const customTitles = await getAllTitles();
     const indexedCacheKeys: string[] = [];
     const refreshedByProvider = new Map<string, ConversationMeta[]>();
-    const searchWarnings = new Set<string>();
+    const providerWarnings = new Set<string>();
     const parsedModelProviders = modelProviderFilter !== undefined
       ? modelProviderFilter.split(",").map((name) => name.trim()).filter(Boolean)
       : undefined;
 
-    const providerRefreshResults = await Promise.all(providers.map(async (provider) => {
-      const shouldReportWarning = activeProviderNameSet.has(provider.name);
+    const activeProviders = providers.filter((provider) => activeProviderNameSet.has(provider.name));
+    const providerRefreshResults = await Promise.all(activeProviders.map(async (provider) => {
       try {
         const cacheKey = getProviderListCacheKey(provider);
         if (!(await provider.detect())) {
-          if (requireSearchReady && shouldReportWarning) {
-            return {
-              warning: `${provider.displayName} 当前不可用，搜索结果可能不完整`,
-            };
-          }
-          return {};
+          return {
+            warning: `${provider.displayName} 当前不可用，结果可能不完整`,
+          };
         }
         const sourceSignature = (await provider.getListSourceSignature?.()) ?? undefined;
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
@@ -223,16 +221,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         return {
           providerName: provider.name,
           refreshedItems,
-          warning: requireSearchReady && shouldReportWarning
+          warning: requireSearchReady
             ? `${provider.displayName} 搜索索引尚未就绪，当前仅匹配标题和目录`
             : undefined,
         };
       } catch (error) {
         logProviderError("conversations.list", provider.name, error);
         return {
-          warning: requireSearchReady && shouldReportWarning
-            ? `${provider.displayName} 刷新失败，搜索结果可能不完整`
-            : undefined,
+          warning: `${provider.displayName} 刷新失败：${getErrorMessage(error)}，结果可能不完整`,
         };
       }
     }));
@@ -245,7 +241,7 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
         refreshedByProvider.set(result.providerName, result.refreshedItems);
       }
       if (result.warning) {
-        searchWarnings.add(result.warning);
+        providerWarnings.add(result.warning);
       }
     }
 
@@ -332,8 +328,9 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       nextOffset: conversationsPage.length + listOffset < filtered.length
         ? listOffset + conversationsPage.length
         : undefined,
-      partialSearch: requireSearchReady && searchWarnings.size > 0,
-      warnings: [...searchWarnings],
+      partialSearch: requireSearchReady && providerWarnings.size > 0,
+      partialResults: providerWarnings.size > 0,
+      warnings: [...providerWarnings],
     });
   });
 
@@ -376,13 +373,19 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = id.split(":")[0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
-    if (!provider.updateMessage) {
-      return c.json({ error: `${provider.displayName} 不支持编辑消息` }, 400);
+    const capabilities = resolveConversationCapabilities(provider);
+    if (!capabilities.canEditMessage || !provider.updateMessage) {
+      return c.json({
+        error: capabilities.editMessageDisabledReason ?? `${provider.displayName} 不支持编辑消息`,
+      }, 400);
     }
 
     const body = await c.req.json<{ content?: unknown }>();
     if (typeof body?.content !== "string" || !body.content.trim()) {
       return c.json({ error: "消息内容不能为空" }, 400);
+    }
+    if (body.content.length > MAX_MESSAGE_CONTENT_LENGTH) {
+      return c.json({ error: `消息内容不能超过 ${MAX_MESSAGE_CONTENT_LENGTH} 个字符` }, 400);
     }
 
     try {
@@ -398,8 +401,11 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = id.split(":")[0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
-    if (!provider.deleteMessages && !provider.deleteMessage) {
-      return c.json({ error: `${provider.displayName} 不支持删除消息` }, 400);
+    const capabilities = resolveConversationCapabilities(provider);
+    if (!capabilities.canDeleteMessage || (!provider.deleteMessages && !provider.deleteMessage)) {
+      return c.json({
+        error: capabilities.deleteMessageDisabledReason ?? `${provider.displayName} 不支持删除消息`,
+      }, 400);
     }
 
     const body = await c.req.json<{ messageIds?: unknown }>();
@@ -433,8 +439,11 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = id.split(":")[0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
-    if (!provider.deleteMessage) {
-      return c.json({ error: `${provider.displayName} 不支持删除消息` }, 400);
+    const capabilities = resolveConversationCapabilities(provider);
+    if (!capabilities.canDeleteMessage || !provider.deleteMessage) {
+      return c.json({
+        error: capabilities.deleteMessageDisabledReason ?? `${provider.displayName} 不支持删除消息`,
+      }, 400);
     }
 
     try {
@@ -463,6 +472,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       if (!provider) {
         throw new Error("未知的 provider");
       }
+      const capabilities = resolveConversationCapabilities(provider);
+      if (!capabilities.canDeleteConversation) {
+        throw new Error(
+          capabilities.deleteConversationDisabledReason ?? `${provider.displayName} 不支持删除对话`
+        );
+      }
 
       await deleteConversationWithCleanup(provider, id);
       return id;
@@ -490,6 +505,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = id.split(":")[0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
+    const capabilities = resolveConversationCapabilities(provider);
+    if (!capabilities.canDeleteConversation) {
+      return c.json({
+        error: capabilities.deleteConversationDisabledReason ?? `${provider.displayName} 不支持删除对话`,
+      }, 400);
+    }
 
     try {
       const result = await deleteConversationWithCleanup(provider, id);
@@ -595,7 +616,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = id.split(":")[0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
-    if (!provider.move) return c.json({ error: `${provider.displayName} 不支持移动对话` }, 400);
+    const capabilities = resolveConversationCapabilities(provider);
+    if (!capabilities.canMoveConversation || !provider.move) {
+      return c.json({
+        error: capabilities.moveConversationDisabledReason ?? `${provider.displayName} 不支持移动对话`,
+      }, 400);
+    }
 
     const body = await c.req.json<{ targetProjectKey?: unknown }>();
     let targetProjectKey: string;
@@ -643,7 +669,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const providerName = [...providerNames][0];
     const provider = providers.find((p) => p.name === providerName);
     if (!provider) return c.json({ error: "未知的 provider" }, 404);
-    if (!provider.move) return c.json({ error: `${provider.displayName} 不支持移动对话` }, 400);
+    const capabilities = resolveConversationCapabilities(provider);
+    if (!capabilities.canMoveConversation || !provider.move) {
+      return c.json({
+        error: capabilities.moveConversationDisabledReason ?? `${provider.displayName} 不支持移动对话`,
+      }, 400);
+    }
 
     const settled = await Promise.allSettled(ids.map(async (id) => {
       await provider.move!(id, targetProjectKey);

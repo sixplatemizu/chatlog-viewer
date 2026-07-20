@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { ClaudeCodeProvider } from "./claude-code.js";
 import { clearProviderPathCache } from "../utils/provider-paths.js";
 import { getIndexedCacheSnapshot, getIndexedListCacheKey, setCacheStoreDirForTests } from "../utils/cache.js";
-import { setNativeTitle } from "../utils/title-store.js";
+import { setNativeTitleSnapshot } from "../utils/title-store.js";
 
 function createHistoryLine(input: {
   display: string;
@@ -279,7 +279,7 @@ test("Claude Code 在 eagerSearchIndex 模式下会为 transcript 一次构建�
   }
 });
 
-test("Claude Code UI 标题会优先于原生旧标题并写回 transcript", async () => {
+test("Claude Code 标题以 transcript 原生 metadata 为准并按 /rename 语义追加", async () => {
   const fixture = await createProviderFixture();
   const sessionId = "88888888-8888-4888-8888-888888888888";
   const projectKey = "C--Users-tester-Desktop-code_area-chatlog-viewer";
@@ -331,38 +331,62 @@ test("Claude Code UI 标题会优先于原生旧标题并写回 transcript", asy
       "utf-8"
     );
 
-    await setNativeTitle(`claude-code:${sessionId}`, "UI 持久标题");
+    await setNativeTitleSnapshot(`claude-code:${sessionId}`, "UI 持久标题");
     const listed = await fixture.provider.list();
-    assert.equal(listed[0]?.title, "UI 持久标题");
+    assert.equal(listed[0]?.title, "transcript 旧标题");
 
     const detail = await fixture.provider.read(`claude-code:${sessionId}`);
-    assert.equal(detail.title, "UI 持久标题");
+    assert.equal(detail.title, "transcript 旧标题");
 
     await fixture.provider.updateTitle(`claude-code:${sessionId}`, "二次修改标题");
-    await setNativeTitle(`claude-code:${sessionId}`, "二次修改标题");
 
     const updatedIndex = JSON.parse(
       await readFile(join(projectDir, "sessions-index.json"), "utf-8")
     ) as {
-      entries: Array<{ sessionId: string; summary?: string; customTitle?: string }>;
+      entries: Array<{ sessionId: string; summary?: string; customTitle?: string; agentName?: string }>;
     };
     const updatedEntry = updatedIndex.entries.find((entry) => entry.sessionId === sessionId);
     assert.equal(updatedEntry?.summary, "二次修改标题");
     assert.equal(updatedEntry?.customTitle, "二次修改标题");
+    assert.equal(updatedEntry?.agentName, "二次修改标题");
 
     const transcriptLines = (await readFile(transcriptPath, "utf-8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { type: string; customTitle?: string; summary?: string });
+      .map((line) => JSON.parse(line) as {
+        type: string;
+        customTitle?: string;
+        agentName?: string;
+        sessionId?: string;
+      });
     const customTitleEntries = transcriptLines.filter((entry) => entry.type === "custom-title");
-    assert.equal(customTitleEntries.length, 1);
-    assert.equal(customTitleEntries[0]?.customTitle, "二次修改标题");
-    assert.equal(customTitleEntries[0]?.summary, "二次修改标题");
+    const agentNameEntries = transcriptLines.filter((entry) => entry.type === "agent-name");
+    assert.equal(customTitleEntries.length, 2);
+    assert.equal(customTitleEntries.at(-1)?.customTitle, "二次修改标题");
+    assert.equal(customTitleEntries.at(-1)?.sessionId, sessionId);
+    assert.equal(agentNameEntries.length, 1);
+    assert.equal(agentNameEntries[0]?.agentName, "二次修改标题");
+    assert.equal(agentNameEntries[0]?.sessionId, sessionId);
 
     const relisted = await fixture.provider.list();
     assert.equal(relisted[0]?.title, "二次修改标题");
     const reread = await fixture.provider.read(`claude-code:${sessionId}`);
     assert.equal(reread.title, "二次修改标题");
+
+    await Promise.all([
+      fixture.provider.updateTitle(`claude-code:${sessionId}`, "并发标题一"),
+      fixture.provider.updateTitle(`claude-code:${sessionId}`, "并发标题二"),
+    ]);
+    const concurrentIndex = JSON.parse(
+      await readFile(join(projectDir, "sessions-index.json"), "utf-8")
+    ) as {
+      entries: Array<{ sessionId: string; customTitle?: string; summary?: string; agentName?: string }>;
+    };
+    const concurrentEntry = concurrentIndex.entries.find((entry) => entry.sessionId === sessionId);
+    assert.equal(concurrentEntry?.customTitle, "并发标题二");
+    assert.equal(concurrentEntry?.summary, "并发标题二");
+    assert.equal(concurrentEntry?.agentName, "并发标题二");
+    assert.equal((await fixture.provider.read(`claude-code:${sessionId}`)).title, "并发标题二");
   } finally {
     await fixture.cleanup();
   }
@@ -452,6 +476,114 @@ test("Claude Code move 会拒绝越界的目标目录", async () => {
     );
     const content = await readFile(transcriptPath, "utf-8");
     assert.match(content, /移动测试/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("Claude Code move 会迁移 transcript 并同步源目标 index", async () => {
+  const fixture = await createProviderFixture();
+  const sessionId = "77777777-7777-4777-8777-777777777777";
+  const sourceProjectKey = "source-project";
+  const targetProjectKey = "target-project";
+  const sourceProjectDir = join(fixture.storagePath, sourceProjectKey);
+  const targetProjectDir = join(fixture.storagePath, targetProjectKey);
+  const sourceTranscriptPath = join(sourceProjectDir, `${sessionId}.jsonl`);
+  const sourceIndexPath = join(sourceProjectDir, "sessions-index.json");
+  const targetIndexPath = join(targetProjectDir, "sessions-index.json");
+
+  try {
+    await mkdir(sourceProjectDir, { recursive: true });
+    await writeFile(sourceTranscriptPath, `${JSON.stringify({
+      type: "user",
+      uuid: "claude-move-success",
+      sessionId,
+      cwd: "C:/source-project",
+      timestamp: "2026-03-03T00:00:00.000Z",
+      message: { role: "user", content: "迁移成功测试" },
+    })}\n`, "utf-8");
+    await writeFile(sourceIndexPath, JSON.stringify({
+      version: 1,
+      entries: [{
+        sessionId,
+        fullPath: sourceTranscriptPath,
+        summary: "迁移成功测试",
+        firstPrompt: "迁移成功测试",
+        modified: "2026-03-03T00:00:00.000Z",
+        isSidechain: false,
+      }],
+    }), "utf-8");
+
+    await fixture.provider.move(`claude-code:${sessionId}`, targetProjectKey);
+
+    await assert.rejects(() => readFile(sourceTranscriptPath, "utf-8"));
+    assert.match(await readFile(join(targetProjectDir, `${sessionId}.jsonl`), "utf-8"), /迁移成功测试/);
+    const sourceIndex = JSON.parse(await readFile(sourceIndexPath, "utf-8")) as { entries: Array<{ sessionId: string }> };
+    const targetIndex = JSON.parse(await readFile(targetIndexPath, "utf-8")) as { entries: Array<{ sessionId: string }> };
+    assert.equal(sourceIndex.entries.some((entry) => entry.sessionId === sessionId), false);
+    assert.equal(targetIndex.entries.some((entry) => entry.sessionId === sessionId), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("Claude Code move 在目标 index 写入失败时会恢复文件和两个 index", async () => {
+  const fixture = await createProviderFixture();
+  const sessionId = "88888888-8888-4888-8888-888888888888";
+  const sourceProjectKey = "source-rollback";
+  const targetProjectKey = "target-rollback";
+  const sourceProjectDir = join(fixture.storagePath, sourceProjectKey);
+  const targetProjectDir = join(fixture.storagePath, targetProjectKey);
+  const sourceTranscriptPath = join(sourceProjectDir, `${sessionId}.jsonl`);
+  const sourceIndexPath = join(sourceProjectDir, "sessions-index.json");
+  const targetIndexPath = join(targetProjectDir, "sessions-index.json");
+  const sourceIndexContent = JSON.stringify({
+    version: 1,
+    entries: [{
+      sessionId,
+      fullPath: sourceTranscriptPath,
+      summary: "回滚测试",
+      firstPrompt: "回滚测试",
+      modified: "2026-03-03T00:00:00.000Z",
+      isSidechain: false,
+    }],
+  }, null, 2);
+  const targetIndexContent = JSON.stringify({ version: 1, entries: [] }, null, 2);
+
+  try {
+    await mkdir(sourceProjectDir, { recursive: true });
+    await mkdir(targetProjectDir, { recursive: true });
+    await writeFile(sourceTranscriptPath, `${JSON.stringify({
+      type: "user",
+      uuid: "claude-move-rollback",
+      sessionId,
+      cwd: "C:/source-rollback",
+      timestamp: "2026-03-03T00:00:00.000Z",
+      message: { role: "user", content: "回滚测试" },
+    })}\n`, "utf-8");
+    await writeFile(sourceIndexPath, sourceIndexContent, "utf-8");
+    await writeFile(targetIndexPath, targetIndexContent, "utf-8");
+
+    const mutableProvider = fixture.provider as unknown as {
+      writeSessionIndexFile(indexPath: string, indexFile: unknown): Promise<void>;
+    };
+    const originalWriteIndex = mutableProvider.writeSessionIndexFile.bind(fixture.provider);
+    mutableProvider.writeSessionIndexFile = async (indexPath, indexFile) => {
+      if (indexPath.replace(/\\/g, "/") === targetIndexPath.replace(/\\/g, "/")) {
+        throw new Error("注入目标 index 写入失败");
+      }
+      await originalWriteIndex(indexPath, indexFile);
+    };
+
+    await assert.rejects(
+      fixture.provider.move(`claude-code:${sessionId}`, targetProjectKey),
+      /注入目标 index 写入失败/
+    );
+
+    assert.match(await readFile(sourceTranscriptPath, "utf-8"), /回滚测试/);
+    await assert.rejects(() => readFile(join(targetProjectDir, `${sessionId}.jsonl`), "utf-8"));
+    assert.equal(await readFile(sourceIndexPath, "utf-8"), sourceIndexContent);
+    assert.equal(await readFile(targetIndexPath, "utf-8"), targetIndexContent);
   } finally {
     await fixture.cleanup();
   }

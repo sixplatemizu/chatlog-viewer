@@ -4,7 +4,14 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { Message } from "../../providers/types.js";
-import { buildTitlePromptContextForTest, extractCleanOutput, generateTitle, getAvailableClis, resetSession } from "../ai.js";
+import {
+  buildTitlePromptContextForTest,
+  extractCleanOutput,
+  extractOpenCodeSessionId,
+  generateTitle,
+  getAvailableClis,
+  resetSession,
+} from "../ai.js";
 
 const SAMPLE_MESSAGES: Message[] = [
   {
@@ -102,7 +109,7 @@ exec "${process.execPath}" "$SCRIPT_DIR/fake-title-cli.mjs" codex "$@"
   };
 }
 
-async function createFakeOpenCodeEnv(options: { emptyOutput?: boolean; invalidProjectDir?: string } = {}) {
+async function createFakeOpenCodeEnv(options: { emptyOutput?: boolean } = {}) {
   const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-ai-opencode-test-"));
   const binDir = join(baseDir, "bin");
   const configPath = join(baseDir, "config.json");
@@ -126,14 +133,11 @@ if (args.includes("--version")) {
 }
 
 appendFileSync(join(process.cwd(), "opencode.calls.log"), JSON.stringify({ args, cwd: process.cwd() }) + "\\n", "utf8");
-const dirIndex = args.indexOf("--dir");
-const projectDir = dirIndex >= 0 ? args[dirIndex + 1] : undefined;
-const invalidProjectDir = ${JSON.stringify(options.invalidProjectDir ?? null)};
-if (invalidProjectDir && projectDir === invalidProjectDir) {
-  process.stdout.write(JSON.stringify({ type: "step_start", part: { type: "step-start" } }) + "\\n");
-  process.exit(0);
-}
-${options.emptyOutput ? "process.exit(0);" : "process.stdout.write(JSON.stringify({ type: \"text\", part: { type: \"text\", text: \"OpenCode 标题\" } }) + \"\\n\");\nprocess.exit(0);"}
+${options.emptyOutput ? "process.exit(0);" : `const sessionId = "ses_chatlog_title";
+const isResume = args.includes("--session");
+const text = isResume ? "OpenCode 复用标题" : "OpenCode 标题";
+process.stdout.write(JSON.stringify({ type: "text", part: { type: "text", text, sessionID: sessionId } }) + "\\n");
+process.exit(0);`}
 `,
     "utf-8"
   );
@@ -142,6 +146,7 @@ ${options.emptyOutput ? "process.exit(0);" : "process.stdout.write(JSON.stringif
     `#!/usr/bin/env sh
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec "${process.execPath}" "$SCRIPT_DIR/fake-opencode-cli.mjs" "$@"
+# cmd-shim-target=${runnerPath.replaceAll(String.fromCharCode(92), "/")}
 `,
     "utf-8"
   );
@@ -231,6 +236,17 @@ test("标题提取会拒绝 CLI 状态占位输出", () => {
   assert.equal(extractCleanOutput("> default · deepseek-v4-flash"), "");
 });
 
+test("OpenCode session ID 会从 JSON event 中提取", () => {
+  assert.equal(
+    extractOpenCodeSessionId(JSON.stringify({
+      type: "text",
+      part: { type: "text", text: "标题", sessionID: "ses_chatlog_title" },
+    })),
+    "ses_chatlog_title"
+  );
+  assert.equal(extractOpenCodeSessionId("非 JSON 输出"), null);
+});
+
 test("标题上下文会优先保留近期对话", () => {
   const messages = Array.from({ length: 24 }, (_, index): Message => ({
     role: index % 2 === 0 ? "user" : "assistant",
@@ -244,7 +260,17 @@ test("标题上下文会优先保留近期对话", () => {
   assert.doesNotMatch(context, /第3轮/);
 });
 
-test("OpenCode 生成标题时会显式传入项目目录", async () => {
+test("指定的 AI CLI 不可用时不会回退到优先级外工具", async () => {
+  await assert.rejects(
+    generateTitle(SAMPLE_MESSAGES, {
+      priority: ["opencode"],
+      availableCliNames: ["codex"],
+    }),
+    /没有可用的 AI CLI 工具/
+  );
+});
+
+test("OpenCode 生成标题时始终使用专用 session 目录", async () => {
   const env = await createFakeOpenCodeEnv();
   const projectDir = join(env.baseDir, "project");
 
@@ -258,11 +284,73 @@ test("OpenCode 生成标题时会显式传入项目目录", async () => {
 
     assert.equal(result.title, "OpenCode 标题");
     assert.equal(result.usedCli, "opencode");
+    assert.equal(result.sessionRetained, false);
+    assert.equal(result.sessionPersisted, true);
+    assert.equal(result.generatedSessionId, "ses_chatlog_title");
 
     const calls = await readOpenCodeCallLog(env.sessionDir);
     assert.equal(calls.length, 1);
-    assert.deepEqual(calls[0]?.args.slice(0, 4), ["run", "--dir", projectDir, "--format"]);
+    assert.deepEqual(calls[0]?.args.slice(0, 5), [
+      "run",
+      "--dir",
+      env.sessionDir,
+      "--title",
+      "ChatLog Viewer AI Title",
+    ]);
     assert.ok(calls[0]?.args.includes("--"));
+    assert.equal(calls[0]?.cwd, env.sessionDir);
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("AI 标题生成过程日志只写入 stderr", async () => {
+  const env = await createFakeOpenCodeEnv();
+  const stdoutLogs: string[] = [];
+  const stderrLogs: string[] = [];
+  const originalLog = console.log;
+  const originalStderrWrite = process.stderr.write;
+
+  console.log = (...args: unknown[]) => {
+    stdoutLogs.push(args.map(String).join(" "));
+  };
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderrLogs.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+
+  try {
+    const result = await generateTitle(SAMPLE_MESSAGES, {
+      priority: ["opencode"],
+    });
+
+    assert.equal(result.title, "OpenCode 标题");
+    assert.deepEqual(stdoutLogs, []);
+    assert.ok(stderrLogs.some((line) => line.includes("[AI] 执行 opencode")));
+    assert.ok(stderrLogs.some((line) => line.includes("[AI] 成功使用 opencode")));
+  } finally {
+    console.log = originalLog;
+    process.stderr.write = originalStderrWrite;
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("Windows pnpm shim 会绕过 cmd 并原样传递 prompt 元字符", async () => {
+  const env = await createFakeOpenCodeEnv();
+  const message = '检查 <tag> | 管道 & 命令 ^ 转义 %PATH% 和 "引号"';
+
+  try {
+    const result = await generateTitle([{ role: "user", content: message }], {
+      priority: ["opencode"],
+    });
+
+    assert.equal(result.title, "OpenCode 标题");
+    const calls = await readOpenCodeCallLog(env.sessionDir);
+    assert.equal(calls.length, 1);
+    const prompt = calls[0]?.args.at(-1) ?? "";
+    assert.ok(prompt.includes(message));
   } finally {
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });
@@ -284,7 +372,7 @@ test("OpenCode 空输出会返回可诊断错误", async () => {
       (error) => {
         assert.ok(error instanceof Error);
         assert.match(error.message, /opencode 未产生输出/);
-        assert.ok(error.message.includes(`dir=${projectDir}`));
+        assert.ok(error.message.includes(`dir=${env.sessionDir}`));
         return true;
       }
     );
@@ -294,31 +382,66 @@ test("OpenCode 空输出会返回可诊断错误", async () => {
   }
 });
 
-test("OpenCode 项目目录无有效 text 时会继续尝试无 --dir 模式", async () => {
-  const projectDir = process.cwd();
-  const env = await createFakeOpenCodeEnv({ invalidProjectDir: projectDir });
+test("OpenCode 固定模式会按准确 session ID 复用会话", async () => {
+  const env = await createFakeOpenCodeEnv();
 
   try {
-    const result = await generateTitle(SAMPLE_MESSAGES, {
+    const first = await generateTitle(SAMPLE_MESSAGES, {
       priority: ["opencode"],
-      projectDir,
+      reuseSession: true,
+    });
+    const second = await generateTitle(SAMPLE_MESSAGES, {
+      priority: ["opencode"],
+      reuseSession: true,
     });
 
-    assert.equal(result.title, "OpenCode 标题");
-    assert.equal(result.usedCli, "opencode");
+    assert.equal(first.title, "OpenCode 标题");
+    assert.equal(first.sessionRetained, true);
+    assert.equal(second.title, "OpenCode 复用标题");
+    assert.equal(second.sessionRetained, true);
 
     const calls = await readOpenCodeCallLog(env.sessionDir);
     assert.equal(calls.length, 2);
-    assert.ok(calls[0]?.args.includes("--dir"));
-    assert.equal(calls[0]?.args[calls[0].args.indexOf("--dir") + 1], projectDir);
-    assert.equal(calls[1]?.args.includes("--dir"), false);
+    assert.ok(calls[0]?.args.includes("--title"));
+    assert.equal(calls[1]?.args[calls[1].args.indexOf("--session") + 1], "ses_chatlog_title");
+    assert.equal(calls[1]?.args[calls[1].args.indexOf("--dir") + 1], env.sessionDir);
+
+    const marker = JSON.parse(await readFile(join(env.sessionDir, ".session.json"), "utf-8")) as {
+      sessionId?: string;
+    };
+    assert.equal(marker.sessionId, "ses_chatlog_title");
   } finally {
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });
   }
 });
 
-test("首次生成标题会创建固定会话并写入 session 状态", async () => {
+test("Codex Fresh 模式使用 ephemeral 且不记录固定会话", async () => {
+  const env = await createFakeCodexEnv();
+
+  try {
+    const result = await generateTitle(SAMPLE_MESSAGES, {
+      priority: ["codex"],
+      reuseSession: false,
+    });
+
+    assert.equal(result.title, "新建会话标题");
+    assert.equal(result.sessionRetained, false);
+    assert.equal(result.sessionPersisted, false);
+
+    const calls = await readCallLog(env.sessionDir);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0]?.args.includes("--ephemeral"));
+
+    const available = await getAvailableClis();
+    assert.equal(findCli(available, "codex")?.hasSession, false);
+  } finally {
+    env.restoreEnv();
+    await rm(env.baseDir, { recursive: true, force: true });
+  }
+});
+
+test("首次固定模式生成会创建可复用会话并写入 session 状态", async () => {
   const env = await createFakeCodexEnv();
 
   try {
@@ -338,6 +461,7 @@ test("首次生成标题会创建固定会话并写入 session 状态", async ()
     const calls = await readCallLog(env.sessionDir);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.isResume, false);
+    assert.equal(calls[0]?.args.includes("--ephemeral"), false);
     assert.ok((calls[0]?.inputLength ?? 0) > 0);
 
     const after = await getAvailableClis();

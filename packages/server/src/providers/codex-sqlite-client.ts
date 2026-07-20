@@ -321,53 +321,32 @@ export class CodexSqliteClient {
 
   writeDisplayTitle(
     sessionId: string,
-    title: string,
-    options?: { updateTitleField?: boolean }
+    title: string
   ): void {
     const db = this.getWriteDb({ fileMustExist: true });
     const columns = this.getTableColumns(db, "threads");
-    const shouldUpdateTitle = options?.updateTitleField !== false;
-    if (!columns.has("id") || !columns.has("first_user_message")) {
+    if (!columns.has("id")) {
       throw new Error("Codex state db 缺少标题字段，无法写入标题");
     }
-    if (shouldUpdateTitle && !columns.has("title")) {
+
+    const titleColumn = columns.has("title")
+      ? "title"
+      : (columns.has("first_user_message") ? "first_user_message" : null);
+    if (!titleColumn) {
       throw new Error("Codex state db 缺少 title 字段，无法写入标题");
     }
 
-    const assignments: string[] = [];
-    const values: unknown[] = [];
-    if (shouldUpdateTitle) {
-      assignments.push("title = ?");
-      values.push(title);
-    }
-    assignments.push("first_user_message = ?");
-    values.push(title);
-    if (columns.has("preview")) {
-      assignments.push("preview = ?");
-      values.push(title);
-    }
-
-    values.push(sessionId);
-    const result = db.prepare(`UPDATE threads SET ${assignments.join(", ")} WHERE id = ?`).run(...values);
+    const result = db.prepare(`UPDATE threads SET ${titleColumn} = ? WHERE id = ?`).run(title, sessionId);
     if (result.changes === 0) {
       throw new Error(`SQLite 中未找到对话: ${sessionId}`);
     }
 
     const row = db.prepare(`
-      SELECT
-        ${columns.has("title") ? "title" : "NULL"} AS title,
-        first_user_message,
-        ${columns.has("preview") ? "preview" : "NULL"} AS preview
+      SELECT ${titleColumn} AS persisted_title
       FROM threads
       WHERE id = ?
-    `).get(sessionId) as {
-      title?: string | null;
-      first_user_message: string | null;
-      preview?: string | null;
-    } | undefined;
-    const titleMatches = !shouldUpdateTitle || row?.title === title;
-    const previewMatches = !columns.has("preview") || row?.preview === title;
-    if (!row || !titleMatches || row.first_user_message !== title || !previewMatches) {
+    `).get(sessionId) as { persisted_title: string | null } | undefined;
+    if (row?.persisted_title !== title) {
       throw new Error(`Codex state db 标题写入校验失败: ${sessionId}`);
     }
   }

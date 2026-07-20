@@ -1,18 +1,19 @@
 import { spawn, type ChildProcess } from "child_process";
-import { accessSync, constants } from "fs";
-import { access, mkdir, rm, stat, writeFile } from "fs/promises";
+import { accessSync, constants, readFileSync } from "fs";
+import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { delimiter, dirname, isAbsolute, join } from "path";
 import type { Message } from "../providers/types.js";
 import type { TitleGenerationCli } from "./provider-paths.js";
 import { getProviderConfigPath } from "./provider-paths.js";
 
 type CliToolName = TitleGenerationCli;
-type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh" | "fresh-fallback-dir" | "resume-fallback-dir";
+type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh";
 
 interface CliTool {
   name: CliToolName;
   command: string;
   freshArgs: string[];
+  ephemeralArgs?: string[];
   resumeArgs?: string[];
   healthcheckArgs: string[];
   timeoutMs?: number;
@@ -20,11 +21,17 @@ interface CliTool {
   projectDirArg?: string;
 }
 
+interface TitleSessionMarker {
+  lastUsedAt: string;
+  sessionId?: string;
+}
+
 const CLI_TOOLS: CliTool[] = [
   {
     name: "codex",
     command: "codex",
     freshArgs: ["exec", "--skip-git-repo-check", "--color", "never", "-"],
+    ephemeralArgs: ["exec", "--ephemeral", "--skip-git-repo-check", "--color", "never", "-"],
     resumeArgs: ["exec", "resume", "--last", "--skip-git-repo-check", "-"],
     healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
@@ -33,6 +40,7 @@ const CLI_TOOLS: CliTool[] = [
     name: "claude",
     command: "claude",
     freshArgs: ["-p", ""],
+    ephemeralArgs: ["--no-session-persistence", "-p", ""],
     resumeArgs: ["-c", "-p", ""],
     healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
@@ -40,7 +48,8 @@ const CLI_TOOLS: CliTool[] = [
   {
     name: "opencode",
     command: "opencode",
-    freshArgs: ["run", "--format", "json", "--", "__PROMPT__"],
+    freshArgs: ["run", "--title", "ChatLog Viewer AI Title", "--format", "json", "--", "__PROMPT__"],
+    resumeArgs: ["run", "--session", "__SESSION_ID__", "--format", "json", "--", "__PROMPT__"],
     healthcheckArgs: ["--version"],
     timeoutMs: 45_000,
     promptMode: "args",
@@ -61,6 +70,10 @@ const RESUME_MISS_PATTERNS = [
 ];
 const executablePathCache = new Map<string, string>();
 
+function logAiDiagnostic(message: string): void {
+  process.stderr.write(`${message}\n`);
+}
+
 export interface GenerateTitleOptions {
   priority?: string[];
   reuseSession?: boolean | Partial<Record<CliToolName, boolean>>;
@@ -68,12 +81,27 @@ export interface GenerateTitleOptions {
   timeoutMs?: number;
   retries?: number;
   availableCliNames?: CliToolName[];
+  beforeToolRun?: (
+    toolName: CliToolName,
+    run: { sessionWillPersist: boolean }
+  ) => Promise<void> | void;
+  afterToolRun?: (
+    toolName: CliToolName,
+    run: {
+      sessionRetained: boolean;
+      sessionPersisted: boolean;
+      generatedSessionId?: string;
+    }
+  ) => Promise<void> | void;
 }
 
 export interface GenerateTitleResult {
   title: string;
   usedCli: string;
   attempts: number;
+  sessionRetained: boolean;
+  sessionPersisted: boolean;
+  generatedSessionId?: string;
 }
 
 async function terminateProcessTree(child: ChildProcess): Promise<void> {
@@ -145,10 +173,30 @@ function resolveSpawnInvocation(command: string, args: string[]): { command: str
     return { command: executablePath, args };
   }
 
+  const shimTarget = resolvePnpmShimTarget(executablePath);
+  if (shimTarget) {
+    return /\.(?:c?js|mjs)$/i.test(shimTarget)
+      ? { command: process.execPath, args: [shimTarget, ...args] }
+      : { command: shimTarget, args };
+  }
+
   return {
     command: process.env.ComSpec || "cmd.exe",
     args: ["/d", "/c", executablePath, ...args.map((arg) => arg.replace(/%/g, "%%"))],
   };
+}
+
+function resolvePnpmShimTarget(executablePath: string): string | null {
+  const shimMetadataPath = executablePath.replace(/\.(cmd|bat)$/i, "");
+  try {
+    const content = readFileSync(shimMetadataPath, "utf-8");
+    const target = content.match(/^# cmd-shim-target=(.+)$/m)?.[1]?.trim();
+    if (!target) return null;
+    accessSync(target, constants.F_OK);
+    return target;
+  } catch {
+    return null;
+  }
 }
 
 async function detectAvailableCli(): Promise<CliTool[]> {
@@ -216,7 +264,6 @@ function orderToolsByPriority(tools: CliTool[], priority?: readonly string[]): C
 
   const prioritySet = new Set(priority);
   const filtered = tools.filter((tool) => prioritySet.has(tool.name));
-  if (filtered.length === 0) return tools;
 
   const rank = new Map(priority.map((name, index) => [name, index]));
   return [...filtered].sort((a, b) => {
@@ -416,20 +463,26 @@ async function ensureCliSessionDir(toolName: CliToolName): Promise<string> {
   return sessionDir;
 }
 
-async function hasPersistedSession(toolName: CliToolName): Promise<boolean> {
+async function readSessionMarker(toolName: CliToolName): Promise<TitleSessionMarker | null> {
   try {
-    await access(getSessionMarkerPath(toolName));
-    return true;
+    const content = await readFile(getSessionMarkerPath(toolName), "utf-8");
+    const marker = JSON.parse(content) as TitleSessionMarker;
+    return marker && typeof marker.lastUsedAt === "string" ? marker : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-async function writeSessionMarker(toolName: CliToolName): Promise<void> {
+async function hasPersistedSession(toolName: CliToolName): Promise<boolean> {
+  const marker = await readSessionMarker(toolName);
+  return !!marker && (toolName !== "opencode" || !!marker.sessionId);
+}
+
+async function writeSessionMarker(toolName: CliToolName, sessionId?: string): Promise<void> {
   await ensureCliSessionDir(toolName);
   await writeFile(
     getSessionMarkerPath(toolName),
-    `${JSON.stringify({ lastUsedAt: new Date().toISOString() })}\n`,
+    `${JSON.stringify({ lastUsedAt: new Date().toISOString(), ...(sessionId ? { sessionId } : {}) })}\n`,
     "utf-8"
   );
 }
@@ -443,10 +496,36 @@ function isResumeMissError(error: unknown): boolean {
   return RESUME_MISS_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-// 规范化 Windows 长路径前缀 `\\?\` 以及大小写、斜杠方向，用于路径比较。
-// 注意：路径换 `/` 后 `\\?\` 变成 `//?/`，要在 normalize 之后再剥离。
-function normalizeProjectDirForCompare(p: string): string {
-  return p.replace(/\\/g, "/").replace(/^\/\/\?\//, "").toLowerCase();
+export function extractOpenCodeSessionId(stdout: string): string | null {
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const event = JSON.parse(trimmed) as {
+        sessionID?: unknown;
+        sessionId?: unknown;
+        session_id?: unknown;
+        part?: { sessionID?: unknown; sessionId?: unknown; session_id?: unknown };
+        properties?: { sessionID?: unknown; sessionId?: unknown; session_id?: unknown };
+      };
+      const candidates = [
+        event.sessionID,
+        event.sessionId,
+        event.session_id,
+        event.part?.sessionID,
+        event.part?.sessionId,
+        event.part?.session_id,
+        event.properties?.sessionID,
+        event.properties?.sessionId,
+        event.properties?.session_id,
+      ];
+      const sessionId = candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+      if (sessionId) return sessionId.trim();
+    } catch {
+      // 忽略非 JSON 行和无效事件。
+    }
+  }
+  return null;
 }
 
 function addProjectDirArg(tool: CliTool, args: string[], projectDir?: string): string[] {
@@ -490,8 +569,8 @@ async function executeCli(
       })
     : argsWithProjectDir;
 
-  console.log(`[AI] 执行 ${tool.name} (prompt ${prompt.length} chars, mode=${promptViaArgs ? "args" : "stdin"})`);
-  console.debug(`[AI] ${tool.name} argv count=${resolvedArgs.length}`);
+  logAiDiagnostic(`[AI] 执行 ${tool.name} (prompt ${prompt.length} chars, mode=${promptViaArgs ? "args" : "stdin"})`);
+  logAiDiagnostic(`[AI] ${tool.name} argv count=${resolvedArgs.length}`);
 
   return await new Promise<string>((resolve, reject) => {
     const invocation = resolveSpawnInvocation(tool.command, resolvedArgs);
@@ -540,7 +619,7 @@ async function executeCli(
     });
     child.once("close", (code) => {
       if (timedOut) return;
-      console.log(`[AI] ${tool.name} 退出 code=${code} stdout=${stdout.length}B stderr=${stderr.length}B`);
+      logAiDiagnostic(`[AI] ${tool.name} 退出 code=${code} stdout=${stdout.length}B stderr=${stderr.length}B`);
       if (stderr.trim()) {
         console.error(`[AI] ${tool.name} stderr: ${stderr.slice(0, 500)}`);
       }
@@ -570,79 +649,69 @@ async function runCliTool(
   tool: CliTool,
   prompt: string,
   options?: { reuseSession?: boolean; projectDir?: string; timeoutMs?: number }
-): Promise<{ stdout: string; mode: CliRunMode }> {
+): Promise<{
+  stdout: string;
+  mode: CliRunMode;
+  sessionRetained: boolean;
+  sessionPersisted: boolean;
+  generatedSessionId?: string;
+}> {
   const workDir = await ensureCliSessionDir(tool.name);
   const allowReuseSession = options?.reuseSession ?? false;
-  const hasSession = allowReuseSession ? await hasPersistedSession(tool.name) : false;
-  const requestedProjectDir = tool.projectDirArg ? options?.projectDir?.trim() || process.cwd() : undefined;
+  const sessionMarker = allowReuseSession ? await readSessionMarker(tool.name) : null;
+  const hasSession = !!sessionMarker && (tool.name !== "opencode" || !!sessionMarker.sessionId);
+  const requestedProjectDir = tool.name === "opencode"
+    ? workDir
+    : (tool.projectDirArg ? options?.projectDir?.trim() || process.cwd() : undefined);
   const projectDir = await resolveCliProjectDir(requestedProjectDir) ?? (tool.projectDirArg ? process.cwd() : undefined);
-  const opencodeFallbackProjectDirs = tool.name === "opencode"
-    ? [process.cwd(), undefined].filter((candidate, index, candidates) => {
-        if (candidate && projectDir && normalizeProjectDirForCompare(candidate) === normalizeProjectDirForCompare(projectDir)) {
-          return false;
-        }
-        return candidates.findIndex((item) => (
-          item === undefined && candidate === undefined
-            ? true
-            : !!item && !!candidate && normalizeProjectDirForCompare(item) === normalizeProjectDirForCompare(candidate)
-        )) === index;
-      })
-    : [];
 
-  const runWithOptionalDirFallback = async (
-    args: string[],
-    mode: CliRunMode
-  ): Promise<{ stdout: string; mode: CliRunMode }> => {
-    const stdout = await executeCli(tool, args, prompt, workDir, { projectDir, timeoutMs: options?.timeoutMs });
-    if (tool.name !== "opencode") {
-      return { stdout, mode };
+  const run = async (args: string[], mode: CliRunMode) => {
+    const stdout = await executeCli(tool, args, prompt, workDir, {
+      projectDir,
+      timeoutMs: options?.timeoutMs,
+    });
+    return { stdout, mode };
+  };
+
+  const finalize = async (
+    result: { stdout: string; mode: CliRunMode },
+    fallbackSessionId?: string
+  ) => {
+    const generatedSessionId = tool.name === "opencode"
+      ? extractOpenCodeSessionId(result.stdout) ?? fallbackSessionId
+      : undefined;
+    const sessionRetained = allowReuseSession
+      && (tool.name !== "opencode" || !!generatedSessionId);
+    const sessionPersisted = allowReuseSession || !tool.ephemeralArgs;
+
+    if (sessionRetained) {
+      await writeSessionMarker(tool.name, generatedSessionId);
     }
 
-    if (extractCleanOutput(stdout).trim().length > 0) {
-      return { stdout, mode };
-    }
-
-    const failedDirs = [projectDir ? `dir=${projectDir}` : "无 --dir"];
-    for (const fallbackProjectDir of opencodeFallbackProjectDirs) {
-      const fallbackLabel = fallbackProjectDir ? `dir=${fallbackProjectDir}` : "无 --dir";
-      console.warn(`[AI] ${tool.name} 在 ${failedDirs[failedDirs.length - 1]} 下未产生有效标题，回退到 ${fallbackLabel}`);
-      const fallbackStdout = await executeCli(tool, args, prompt, workDir, {
-        projectDir: fallbackProjectDir,
-        timeoutMs: options?.timeoutMs,
-      });
-      if (extractCleanOutput(fallbackStdout).trim().length > 0) {
-        return {
-          stdout: fallbackStdout,
-          mode: mode === "resume" ? "resume-fallback-dir" : "fresh-fallback-dir",
-        };
-      }
-      failedDirs.push(fallbackLabel);
-    }
-
-    throw new Error(`${tool.name} 在 ${failedDirs.join("、")} 下都未产生有效输出`);
+    return { ...result, sessionRetained, sessionPersisted, generatedSessionId };
   };
 
   if (hasSession && tool.resumeArgs) {
     try {
-      const result = await runWithOptionalDirFallback(tool.resumeArgs, "resume");
-      await writeSessionMarker(tool.name);
-      return result;
+      const resumeArgs = tool.resumeArgs.map((arg) => (
+        arg === "__SESSION_ID__" ? sessionMarker?.sessionId ?? arg : arg
+      ));
+      return await finalize(await run(resumeArgs, "resume"), sessionMarker?.sessionId);
     } catch (error) {
       if (!isResumeMissError(error)) {
         throw error;
       }
 
-      console.warn(`[AI] ${tool.name} 未找到可复用会话，回退为新建会话`);
+      logAiDiagnostic(`[AI] ${tool.name} 未找到可复用会话，回退为新建会话`);
       await clearSessionMarker(tool.name);
-      const result = await runWithOptionalDirFallback(tool.freshArgs, "resume-fallback-fresh");
-      await writeSessionMarker(tool.name);
-      return result;
+      return await finalize(await run(tool.freshArgs, "resume-fallback-fresh"));
     }
   }
 
-  const result = await runWithOptionalDirFallback(tool.freshArgs, "fresh");
-  await writeSessionMarker(tool.name);
-  return result;
+  const freshArgs = !allowReuseSession && tool.ephemeralArgs
+    ? tool.ephemeralArgs
+    : tool.freshArgs;
+  return await finalize(await run(freshArgs, "fresh"));
 }
 
 export async function generateTitle(
@@ -667,25 +736,40 @@ export async function generateTitle(
   const maxAttemptsPerTool = Math.max(1, (options?.retries ?? 0) + 1);
 
   for (const tool of tools) {
+    const reuseSession = typeof options?.reuseSession === "object"
+      ? options.reuseSession[tool.name] ?? false
+      : options?.reuseSession ?? false;
+    await options?.beforeToolRun?.(tool.name, {
+      sessionWillPersist: reuseSession || !tool.ephemeralArgs,
+    });
     for (let attempt = 1; attempt <= maxAttemptsPerTool; attempt += 1) {
       attempts += 1;
       try {
-        const reuseSession = typeof options?.reuseSession === "object"
-          ? options.reuseSession[tool.name] ?? false
-          : options?.reuseSession;
         const result = await runCliTool(tool, fullPrompt, {
           reuseSession,
           projectDir: options?.projectDir,
           timeoutMs: options?.timeoutMs,
         });
-        console.log(`[AI] 调用 ${tool.name} (${result.mode}, attempt=${attempt})`);
+        await options?.afterToolRun?.(tool.name, {
+          sessionRetained: result.sessionRetained,
+          sessionPersisted: result.sessionPersisted,
+          generatedSessionId: result.generatedSessionId,
+        });
+        logAiDiagnostic(`[AI] 调用 ${tool.name} (${result.mode}, attempt=${attempt})`);
         const title = extractCleanOutput(result.stdout);
-        console.log(`[AI] ${tool.name} 提取标题: "${title}"`);
+        logAiDiagnostic(`[AI] ${tool.name} 提取标题: "${title}"`);
         if (title && title.length > 0 && title.length < 100) {
-          console.log(`[AI] 成功使用 ${tool.name} 生成标题: "${title}"`);
-          return { title, usedCli: tool.name, attempts };
+          logAiDiagnostic(`[AI] 成功使用 ${tool.name} 生成标题: "${title}"`);
+          return {
+            title,
+            usedCli: tool.name,
+            attempts,
+            sessionRetained: result.sessionRetained,
+            sessionPersisted: result.sessionPersisted,
+            generatedSessionId: result.generatedSessionId,
+          };
         }
-        console.log(`[AI] ${tool.name} 失败: 输出为空或格式无效`);
+        logAiDiagnostic(`[AI] ${tool.name} 失败: 输出为空或格式无效`);
         failures.push(`${tool.name}#${attempt}: 输出为空或格式无效`);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);

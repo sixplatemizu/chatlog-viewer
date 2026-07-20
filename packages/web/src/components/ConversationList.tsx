@@ -181,6 +181,10 @@ const ConversationRow = memo(function ConversationRow({
   onToggleSelect: (id: string) => void;
 }) {
   const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+    if (conv.capabilities?.canMoveConversation === false) {
+      e.preventDefault();
+      return;
+    }
     e.dataTransfer.setData("application/x-conv-id", conv.id);
     e.dataTransfer.setData("application/x-conv-provider", conv.provider);
     e.dataTransfer.effectAllowed = "move";
@@ -188,9 +192,11 @@ const ConversationRow = memo(function ConversationRow({
 
   return (
     <div
-      draggable
+      draggable={conv.capabilities?.canMoveConversation !== false}
       onDragStart={handleDragStart}
-      className={`flex items-start gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors cursor-grab active:cursor-grabbing ${
+      className={`flex items-start gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${
+        conv.capabilities?.canMoveConversation === false ? "cursor-pointer" : "cursor-grab active:cursor-grabbing"
+      } ${
         selected
           ? "bg-blue-50 dark:bg-blue-900/20 border-r-2 border-blue-500"
           : ""

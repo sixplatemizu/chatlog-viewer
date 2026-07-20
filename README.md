@@ -19,8 +19,8 @@
 
 | Provider | 数据来源 | 浏览 / 搜索 / 导出 | 标题同步 | 消息编辑 / 删除 | 移动 / 删除会话 | 默认路径 |
 | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | JSONL transcript、`sessions-index.json`、`history.jsonl` | 支持 | 原生写回 index + transcript；UI 标题优先 | 支持 | 支持 | `~/.claude/projects` |
-| Codex | JSONL transcript、`state_5.sqlite` | 支持 | 原生写回 transcript + state db；UI 标题优先 | 支持 | 支持 | `~/.codex/sessions` |
+| Claude Code | JSONL transcript、`sessions-index.json`、`history.jsonl` | 支持 | 按 `/rename` 语义写回 transcript + index | 支持 | 支持 | `~/.claude/projects` |
+| Codex | JSONL transcript、`state_5.sqlite`、`session_index.jsonl` | 支持 | 通过 app-server 写回原生 title + thread name | 支持 | 支持 | `~/.codex/sessions` |
 | Codex state db | `threads` / `conversation_index` | 支持 metadata-only 回填 | 与 Codex 同步 | 不适用于 metadata-only | 支持残留清理 | `~/.codex/state_5.sqlite` |
 | OpenCode | SQLite `session` / `message` / `part` | 支持 | 原生写回 `session.title` | 暂不支持 | 支持 | `~/.local/share/opencode/opencode.db` |
 | iFlow CLI | JSONL transcript | 支持 | 暂禁用，缺少稳定原生标题字段 | 支持 | 支持 | `~/.iflow/projects` |
@@ -103,40 +103,48 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 ### 4. 标题与整理
 
 - 支持手动改标题；对支持原生标题的 provider，UI 修改会写回对应本地记录
-- Codex 标题会同步 transcript `session_meta`、`state_5.sqlite` 的 `title / first_user_message / preview`
-- Claude Code 标题会同步 `sessions-index.json` 和 transcript 中的 `custom-title`
+- Codex 标题优先通过 app-server `thread/name/set` 写回 State DB `title`，并同步 `session_index.jsonl.thread_name`；不会改写首条消息或 preview
+- Claude Code 标题按 `/rename` 语义追加 transcript `custom-title` / `agent-name`，并同步 `sessions-index.json`
 - OpenCode 标题会同步 SQLite `session.title`
-- UI 手动标题是最高优先级来源，后续列表 / 详情读取会优先使用该来源，避免回退到旧标题
+- UI、title CLI 与 skill 共用同一原生持久化服务，写入后会重新读取并校验 provider 的最终标题
 - 支持调用本地 AI CLI 自动生成标题
 - 标题生成支持 `codex -> claude -> opencode` 等可调 fallback 优先级
-- 每个标题生成 CLI 可选择 `固定模式` 或 `不固定模式`
-- 固定模式会复用最近一次标题生成会话；不固定模式每次新建，并在生成后自动清理内部标题生成会话
+- 每个标题生成 CLI 可选择 `Fresh 模式` 或 `固定模式`，默认使用 Fresh
+- Fresh 模式下 Codex 使用 `--ephemeral`、Claude Code 使用 `--no-session-persistence`，不会保留辅助会话；OpenCode 会在生成后按 `sessionID` 精确删除辅助会话
+- 固定模式仅在明确需要时启用，会复用最近一次标题生成会话
 - 设置页支持查看每个 CLI 是否可用、是否已有固定会话，并可单独或全部重置
 - 支持批量选择、批量删除
 - 支持在同 provider 的不同项目目录间移动会话
 - Codex 会话支持修改 `model_provider`
 
-#### Codex 标题 CLI / Skill
+#### 多 Provider 标题 CLI / Skill
 
-当前 Codex CLI 没有公开的自定义 slash command 注册机制，因此项目提供 `pnpm title` 和 `$chatlog-viewer-title` skill 作为桥接方案，复用 Web UI 的标题写回逻辑。
+项目提供 `pnpm title` 和 `$chatlog-viewer-title` skill，用同一套流程管理 Codex、Claude Code 与 OpenCode 标题。默认 provider 为 Codex，以保持旧命令兼容；使用 `--provider all` 可统一列出或批量处理三者。
 
 ```bash
-pnpm title
-pnpm title -- list --scope all --search "关键词" --limit 20
-pnpm title -- list --cwd "$PWD" --exact --limit 30
+pnpm title -- --provider all
+pnpm title -- list --provider all --scope all --search "关键词" --limit 20
+pnpm title -- list --provider claude-code --cwd "$PWD" --exact --limit 30
 pnpm title -- rename codex:<session-id> "新标题"
-pnpm title -- generate codex:<session-id> --cli opencode,codex --timeout 90000 --retries 2
-pnpm title -- generate-batch --cwd "$PWD" --exact --dry-run
-pnpm title -- generate-batch --cwd "$PWD" --exact --json --continue-on-error
-pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/codex-title-generate-batch-<timestamp>.json
+pnpm title -- rename claude-code:<session-id> "新标题"
+pnpm title -- rename opencode:<session-id> "新标题"
+pnpm title -- generate claude-code:<session-id> --cli opencode,codex,claude --timeout 90000 --retries 2
+pnpm title -- generate-batch --provider all --cwd "$PWD" --exact --dry-run
+pnpm title -- generate-batch --provider all --cwd "$PWD" --exact --json --continue-on-error
+pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/conversation-title-generate-batch-<timestamp>.json
 ```
 
-- `list` 默认查看 Codex provider，可用 `--cwd <path> --exact` 精确匹配项目，或 `--project <path> --recursive` 包含子目录；内部标题生成会话默认排除
-- `rename` 优先调用 Codex app-server 的 `thread/name/set`，与 Codex `/rename` 使用同一类原生命名语义
-- `generate` / `generate-batch` 会调用本地 AI CLI 生成标题，支持 `--cli`、`--timeout`、`--retries`，并按设置清理内部标题生成会话；标题上下文以近期消息为主，辅以少量开头/中段信息
+- `list` 默认查看 Codex；`--provider codex|claude-code|opencode|all` 选择数据源，`--cwd <path> --exact` 精确匹配项目，`--project <path> --recursive` 包含子目录；内部标题生成会话默认排除
+- `rename` 按目标 provider 原生写回：Codex 使用 app-server 命名语义，Claude Code 使用 `/rename` metadata，OpenCode 更新 `session.title`
+- `--provider` 决定目标对话来源，`--cli` 决定 AI 生成引擎，两者互相独立；可将 OpenCode 配置为首选引擎，为任意受支持 provider 的对话生成标题
+- OpenCode 的完整 AI 会话仍统一存储在 `~/.local/share/opencode/opencode.db`；`~/.chatlog-viewer/ai-title-sessions/opencode` 仅是隔离工作目录和 fixed session marker，Fresh 模式生成的会话会按 `sessionID` 自动删除
+- `generate` / `generate-batch` 支持 `--cli`、`--timeout`、`--retries`，按本次实际使用的 CLI 复用或清理内部会话；标题上下文以近期消息为主，辅以少量开头/中段信息
 - `generate-batch` 会在 `~/.backups/chatlog-viewer-title/<date>/` 写入包含 `id / oldTitle / newTitle / filePath / usedCli / attempts / error` 的 JSON 报告，方便审计和回滚
 - `generate-batch --dry-run` 只生成目标列表和报告，不调用 AI CLI、不写回标题；`rollback --report <path>` 会按报告中的 `oldTitle` 回滚成功生成过的记录
-- 仓库内 `skills/chatlog-viewer-title` 可同步安装到 `~/.codex/skills/chatlog-viewer-title`，在 Codex 中用 `$chatlog-viewer-title` 触发同样的 CLI 工作流
+- `rename`、`generate`、`generate-batch` 与 `rollback` 支持 `--json`：stdout 只返回一个 `schemaVersion: 1` JSON，使用 `ok`、`summary.total/success/failed/skipped` 和 `entries[].status` 判断结果；AI 诊断日志写入 stderr
+- `--json` 模式下，dry-run、提前停止后未处理的条目和回滚冲突计入 `skipped`；存在失败条目时进程以非零 code 退出，致命错误以版本化 JSON 写入 stderr
+- 通过 pnpm 调用 JSON 模式时使用 `pnpm --silent`，否则 pnpm 自身的 lifecycle banner 会出现在 stdout，影响直接 JSON 解析
+- 仓库内 `skills/chatlog-viewer-title` 可安装到本机 skill 目录，在 Codex 中用 `$chatlog-viewer-title` 触发同样的三 provider CLI 工作流
 
 ### 5. 消息级操作
 
@@ -227,7 +235,7 @@ CHATLOG_VIEWER_IFLOW_PATH=/path/to/iflow/projects
 packages/
 ├── server/
 │   └── src/
-│       ├── cli/           # 本地维护命令，例如 Codex 标题管理
+│       ├── cli/           # 本地维护命令，例如多 provider 标题管理
 │       ├── providers/     # 各 provider 读取 / 删除 / 移动 / 索引逻辑
 │       ├── routes/        # API 路由与设置接口
 │       ├── utils/         # provider path、JSONL、cache、search index 等工具
@@ -238,7 +246,7 @@ packages/
         ├── hooks/         # 数据获取与交互状态
         └── lib/           # API 封装与类型
 skills/
-└── chatlog-viewer-title/   # Codex 中调用标题管理 CLI 的 skill
+└── chatlog-viewer-title/   # Codex 中调用三 provider 标题 CLI 的 skill
 ```
 
 ## TODO
