@@ -15,6 +15,39 @@ interface BenchJsonlMessage {
   timestamp: number;
 }
 
+interface BenchmarkThresholds {
+  batchMs: number;
+  incrementalMs: number;
+  streamedMs: number;
+  heapMb: number;
+}
+
+const DEFAULT_THRESHOLDS: BenchmarkThresholds = {
+  batchMs: 2_500,
+  incrementalMs: 2_500,
+  streamedMs: 6_000,
+  heapMb: 512,
+};
+
+function getThreshold(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function loadThresholds(): BenchmarkThresholds {
+  return {
+    batchMs: getThreshold("CHATLOG_VIEWER_BENCH_BATCH_MS", DEFAULT_THRESHOLDS.batchMs),
+    incrementalMs: getThreshold("CHATLOG_VIEWER_BENCH_INCREMENTAL_MS", DEFAULT_THRESHOLDS.incrementalMs),
+    streamedMs: getThreshold("CHATLOG_VIEWER_BENCH_STREAMED_MS", DEFAULT_THRESHOLDS.streamedMs),
+    heapMb: getThreshold("CHATLOG_VIEWER_BENCH_HEAP_MB", DEFAULT_THRESHOLDS.heapMb),
+  };
+}
+
+function assertThreshold(label: string, actual: number, maximum: number, unit: string): void {
+  if (actual <= maximum) return;
+  throw new Error(`${label} 超过性能阈值：${actual.toFixed(2)}${unit} > ${maximum}${unit}`);
+}
+
 function createMessages(count: number): Message[] {
   return Array.from({ length: count }, (_, index) => ({
     role: index % 2 === 0 ? "user" : "assistant",
@@ -39,6 +72,7 @@ async function measure<T>(label: string, task: () => Promise<T> | T): Promise<{ 
 }
 
 async function main(): Promise<void> {
+  const thresholds = loadThresholds();
   const messages = createMessages(4_000);
   const tempDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-bench-"));
   const filePath = join(tempDir, "messages.jsonl");
@@ -65,14 +99,25 @@ async function main(): Promise<void> {
       });
       return builder.build();
     });
+    const heapMb = process.memoryUsage().heapUsed / 1024 / 1024;
 
     console.log("search-index benchmark");
     console.log(`messages=${messages.length}`);
     console.log(`batch build: ${batch.durationMs.toFixed(2)}ms`);
     console.log(`incremental build: ${incremental.durationMs.toFixed(2)}ms`);
     console.log(`jsonl visit + incremental build: ${streamed.durationMs.toFixed(2)}ms`);
+    console.log(`heap used: ${heapMb.toFixed(2)}MB`);
     console.log(`searchText length=${batch.value.searchText?.length ?? 0}`);
     console.log(`searchChunks=${batch.value.searchChunks?.length ?? 0}`);
+    console.log(
+      `thresholds: batch<=${thresholds.batchMs}ms incremental<=${thresholds.incrementalMs}ms `
+      + `streamed<=${thresholds.streamedMs}ms heap<=${thresholds.heapMb}MB`
+    );
+
+    assertThreshold("batch build", batch.durationMs, thresholds.batchMs, "ms");
+    assertThreshold("incremental build", incremental.durationMs, thresholds.incrementalMs, "ms");
+    assertThreshold("jsonl visit + incremental build", streamed.durationMs, thresholds.streamedMs, "ms");
+    assertThreshold("heap used", heapMb, thresholds.heapMb, "MB");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

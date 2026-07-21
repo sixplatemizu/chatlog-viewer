@@ -13,9 +13,14 @@ import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSear
 import { logProviderError } from "../utils/logger.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
 import {
+  createProviderDataError,
+  isFileSystemNotFoundError,
+} from "../utils/errors.js";
+import {
   collectGlobFileStates,
   collectIndexedCacheItemsInBatches,
   createIndexedListSourceSignature,
+  type IndexedSourceFile,
 } from "../utils/provider-indexing.js";
 import {
   createConversationSearchIndexBuilder,
@@ -230,12 +235,22 @@ export class IFlowProvider implements ConversationProvider {
     return getProviderPaths("iflow").storagePath;
   }
 
+  private async collectSessionFileStates(): Promise<IndexedSourceFile[]> {
+    const pattern = join(this.getStoragePath(), "*", "session-*.jsonl").replace(/\\/g, "/");
+    try {
+      return await collectGlobFileStates(pattern);
+    } catch (error) {
+      throw createProviderDataError(this.name, "iFlow 会话索引读取失败", error);
+    }
+  }
+
   async detect(): Promise<boolean> {
     try {
       await stat(this.getStoragePath());
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return false;
+      throw createProviderDataError(this.name, "iFlow 数据目录检测失败", error);
     }
   }
 
@@ -247,13 +262,8 @@ export class IFlowProvider implements ConversationProvider {
   }
 
   async getListSourceSignature(): Promise<string | null> {
-    try {
-      const pattern = join(this.getStoragePath(), "*", "session-*.jsonl").replace(/\\/g, "/");
-      const fileStates = await collectGlobFileStates(pattern);
-      return createIndexedListSourceSignature(fileStates);
-    } catch {
-      return null;
-    }
+    const fileStates = await this.collectSessionFileStates();
+    return createIndexedListSourceSignature(fileStates);
   }
 
   private scheduleBackgroundIndexRefresh(): void {
@@ -288,8 +298,7 @@ export class IFlowProvider implements ConversationProvider {
   }): Promise<ConversationMeta[]> {
     const basePath = this.getStoragePath();
     const cacheKey = getListCacheKey(this.name, basePath);
-    const pattern = join(basePath, "*", "session-*.jsonl").replace(/\\/g, "/");
-    const fileStates = await collectGlobFileStates(pattern);
+    const fileStates = await this.collectSessionFileStates();
     const sourceSignature = createIndexedListSourceSignature(fileStates);
     const cachedList = getIndexedListCache(cacheKey, undefined, {
       requireSearchReady: options.eagerSearchIndex,
@@ -712,8 +721,9 @@ export class IFlowProvider implements ConversationProvider {
     try {
       const entries = await readdir(basePath, { withFileTypes: true });
       return entries.filter((e) => e.isDirectory()).map((e) => e.name);
-    } catch {
-      return [];
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return [];
+      throw createProviderDataError(this.name, `iFlow 项目目录无法读取: ${basePath}`, error);
     }
   }
 }

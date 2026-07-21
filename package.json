@@ -8,11 +8,13 @@
     "build": "pnpm --filter web build && pnpm --filter server build",
     "typecheck": "pnpm --filter web typecheck && pnpm --filter server typecheck",
     "test": "pnpm --filter server test && pnpm --filter web test",
+    "test:e2e": "playwright test",
     "bench:search-index": "pnpm --filter server bench:search-index",
     "title": "pnpm --filter server title"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@playwright/test": "^1.61.1",
     "concurrently": "^9.1.2",
     "eslint": "^9.39.4",
     "eslint-plugin-react-hooks": "^7.0.1",

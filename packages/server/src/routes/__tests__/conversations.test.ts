@@ -1702,6 +1702,77 @@ test("provider 过滤只刷新当前选中的 provider", async () => {
   assert.equal(opencodeListCalls, 0);
 });
 
+test("列表接口会在索引层完成分页、项目和 model provider 筛选", async () => {
+  let listCalls = 0;
+  const provider = createProvider({
+    name: "codex",
+    displayName: "Codex",
+    list: async () => {
+      listCalls += 1;
+      return [];
+    },
+  });
+  const cacheKey = `codex::${provider.getStoragePath()}::indexed`;
+  setIndexedListCache(cacheKey, [
+    createConversationMeta({
+      id: "codex:v",
+      provider: "codex",
+      project: "/tmp/project-a",
+      projectKey: "/tmp/project-a",
+      modelProvider: "v",
+      updatedAt: 50,
+    }),
+    createConversationMeta({
+      id: "codex:custom",
+      provider: "codex",
+      project: "/tmp/project-a",
+      projectKey: "/tmp/project-a",
+      modelProvider: "custom",
+      updatedAt: 40,
+    }),
+    createConversationMeta({
+      id: "codex:no-model",
+      provider: "codex",
+      project: "/tmp/project-a",
+      projectKey: "/tmp/project-a",
+      updatedAt: 30,
+    }),
+    createConversationMeta({
+      id: "codex:other-project",
+      provider: "codex",
+      project: "/tmp/project-b",
+      projectKey: "/tmp/project-b",
+      modelProvider: "v",
+      updatedAt: 20,
+    }),
+  ]);
+
+  const app = createConversationRoutes([provider]);
+  const res = await app.request(
+    "http://localhost/conversations?provider=codex&project=%2Ftmp%2Fproject-a&modelProvider=v&limit=1&offset=1"
+  );
+  assert.equal(res.status, 200);
+
+  const data = await res.json() as {
+    total: number;
+    conversations: ConversationMeta[];
+    providerCounts: Record<string, number>;
+    codexModelProviderCounts: Record<string, number>;
+    listTruncated: boolean;
+  };
+  assert.equal(listCalls, 0);
+  assert.equal(data.total, 2);
+  assert.deepEqual(data.conversations.map((item) => item.id), ["codex:no-model"]);
+  assert.deepEqual(data.providerCounts, { codex: 2 });
+  assert.deepEqual(data.codexModelProviderCounts, {
+    custom: 1,
+    v: 1,
+  });
+  assert.equal(data.listTruncated, false);
+
+  invalidateListCache(cacheKey);
+});
+
 test("/projects 会优先复用 fresh indexed cache 中的项目列表", async () => {
   let listProjectsCalls = 0;
 
@@ -1822,4 +1893,35 @@ test("普通列表 provider 读取失败时返回 partialResults 和具体 warni
   assert.equal(data.total, 0);
   assert.equal(data.partialResults, true);
   assert.match(data.warnings[0] || "", /database is locked/);
+});
+
+test("provider 返回部分数据 warning 时保留列表并标记 partialResults", async () => {
+  const conversation = createConversationMeta({
+    id: "codex:partial-state-db",
+    provider: "codex",
+    title: "来自 transcript 的标题",
+  });
+  const app = createConversationRoutes([
+    createProvider({
+      name: "codex",
+      displayName: "Codex",
+      list: async (options) => {
+        options?.onWarning?.("Codex State DB 已损坏，已仅使用 transcript 数据");
+        return [conversation];
+      },
+    }),
+  ]);
+
+  const res = await app.request("http://localhost/conversations?provider=codex");
+  assert.equal(res.status, 200);
+  const data = await res.json() as {
+    total: number;
+    conversations: ConversationMeta[];
+    partialResults: boolean;
+    warnings: string[];
+  };
+  assert.equal(data.total, 1);
+  assert.equal(data.conversations[0]?.id, conversation.id);
+  assert.equal(data.partialResults, true);
+  assert.match(data.warnings[0] || "", /仅使用 transcript/);
 });

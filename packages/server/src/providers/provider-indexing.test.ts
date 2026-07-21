@@ -484,6 +484,102 @@ test("OpenCode schema 不兼容时不会伪装成空列表", async () => {
   }
 });
 
+test("Codex State DB schema 不兼容时保留 transcript 并返回 warning", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-codex-partial-state-db-");
+  const storagePath = join(fixture.baseDir, "sessions");
+  const stateDbPath = join(fixture.baseDir, "state_5.sqlite");
+  const previousSessionsPath = process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH;
+  const previousStateDbPath = process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH;
+  const sessionId = "codex-partial-session";
+  let provider: CodexProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH = stateDbPath;
+    clearProviderPathCache();
+
+    await mkdir(join(storagePath, "project-a"), { recursive: true });
+    await writeFile(
+      join(storagePath, "project-a", `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          timestamp: "2026-07-21T00:00:00.000Z",
+          type: "session_meta",
+          payload: {
+            id: sessionId,
+            cwd: "C:/Users/tester/project-a",
+          },
+        }),
+        JSON.stringify({
+          timestamp: "2026-07-21T00:00:01.000Z",
+          type: "event_msg",
+          payload: {
+            type: "user_message",
+            message: "仅来自 transcript 的标题",
+          },
+        }),
+      ].join("\n") + "\n",
+      "utf-8"
+    );
+
+    const db = new Database(stateDbPath);
+    db.exec("CREATE TABLE unrelated (id TEXT PRIMARY KEY)");
+    db.close();
+
+    const warnings: string[] = [];
+    provider = new CodexProvider();
+    const conversations = await provider.list({
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    assert.equal(conversations.length, 1);
+    assert.equal(conversations[0]?.id, `codex:${sessionId}`);
+    assert.equal(conversations[0]?.title, "仅来自 transcript 的标题");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0] || "", /schema 不兼容/);
+    assert.match(warnings[0] || "", /仅使用 transcript/);
+  } finally {
+    (provider as unknown as { closeDb?: () => void } | null)?.closeDb?.();
+    await fixture.cleanup(() => {
+      if (previousSessionsPath === undefined) delete process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH;
+      else process.env.CHATLOG_VIEWER_CODEX_SESSIONS_PATH = previousSessionsPath;
+      if (previousStateDbPath === undefined) delete process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH;
+      else process.env.CHATLOG_VIEWER_CODEX_STATE_DB_PATH = previousStateDbPath;
+    });
+  }
+});
+
+test("Claude Code session index 损坏时不会伪装成空列表", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-claude-corrupt-index-");
+  const storagePath = join(fixture.baseDir, "projects");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_CLAUDE_CODE_PATH;
+
+  try {
+    process.env.CHATLOG_VIEWER_CLAUDE_CODE_PATH = storagePath;
+    clearProviderPathCache();
+
+    const projectDir = join(storagePath, "project-a");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, "sessions-index.json"), "{\"version\":1,\"entries\":[", "utf-8");
+
+    const provider = new ClaudeCodeProvider();
+    await assert.rejects(
+      provider.list(),
+      (error: unknown) => {
+        assert.equal((error as { status?: number }).status, 503);
+        assert.equal((error as { kind?: string }).kind, "corrupt");
+        assert.match((error as Error).message, /session index 已损坏/);
+        return true;
+      }
+    );
+  } finally {
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) delete process.env.CHATLOG_VIEWER_CLAUDE_CODE_PATH;
+      else process.env.CHATLOG_VIEWER_CLAUDE_CODE_PATH = previousStoragePath;
+    });
+  }
+});
+
 test("OpenCode 会从 SQLite 构建列表、详情和搜索索引", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-opencode-indexing-");
   const storagePath = join(fixture.baseDir, "opencode");

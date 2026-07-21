@@ -1,6 +1,12 @@
 import { createRequire } from "module";
 import { createHash } from "crypto";
+import { statSync } from "fs";
 import type BetterSqlite3 from "better-sqlite3";
+import {
+  ProviderDataError,
+  createProviderDataError,
+  isFileSystemNotFoundError,
+} from "../utils/errors.js";
 import { normalizePath } from "./shared/provider-utils.js";
 
 const require = createRequire(import.meta.url);
@@ -87,12 +93,20 @@ export class CodexSqliteClient {
     this.closeRead();
 
     try {
+      statSync(dbPath);
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return null;
+      throw createProviderDataError("codex", `Codex State DB 无法访问: ${dbPath}`, error);
+    }
+
+    try {
       this.readDb = new Database(dbPath, { readonly: true, fileMustExist: true });
       this.readDbPath = dbPath;
       return this.readDb;
-    } catch {
+    } catch (error) {
+      this.readDb = null;
       this.readDbPath = null;
-      return null;
+      throw createProviderDataError("codex", `Codex State DB 无法读取: ${dbPath}`, error);
     }
   }
 
@@ -104,9 +118,15 @@ export class CodexSqliteClient {
     this.closeWrite();
     this.closeRead();
 
-    this.writeDb = new Database(dbPath, options.fileMustExist === false ? undefined : { fileMustExist: true });
-    this.writeDbPath = dbPath;
-    return this.writeDb;
+    try {
+      this.writeDb = new Database(dbPath, options.fileMustExist === false ? undefined : { fileMustExist: true });
+      this.writeDbPath = dbPath;
+      return this.writeDb;
+    } catch (error) {
+      this.writeDb = null;
+      this.writeDbPath = null;
+      throw createProviderDataError("codex", `Codex State DB 无法写入: ${dbPath}`, error);
+    }
   }
 
   getTableColumns(db: BetterSqlite3.Database, tableName: string): Set<string> {
@@ -121,23 +141,34 @@ export class CodexSqliteClient {
       nextTables.set(tableName, columns);
       this.tableColumnsByDb.set(db, nextTables);
       return columns;
-    } catch {
-      return new Set();
+    } catch (error) {
+      throw createProviderDataError("codex", `Codex State DB 表结构读取失败: ${tableName}`, error);
     }
+  }
+
+  private getRequiredThreadColumns(db: BetterSqlite3.Database): Set<string> {
+    const columns = this.getTableColumns(db, "threads");
+    if (!columns.has("id")) {
+      throw new ProviderDataError(
+        "codex",
+        "schema-incompatible",
+        "Codex State DB schema 不兼容：缺少 threads.id"
+      );
+    }
+    return columns;
   }
 
   getThreadColumns(): Set<string> {
     const db = this.getReadDb();
     if (!db) return new Set();
-    return this.getTableColumns(db, "threads");
+    return this.getRequiredThreadColumns(db);
   }
 
   getThreadMetadata(sessionId: string): CodexThreadMetadata {
     const db = this.getReadDb();
     if (!db) return {};
     try {
-      const columns = this.getTableColumns(db, "threads");
-      if (!columns.has("id")) return {};
+      const columns = this.getRequiredThreadColumns(db);
 
       const row = db
         .prepare(`
@@ -161,8 +192,8 @@ export class CodexSqliteClient {
         firstUserMessage: row?.first_user_message ?? undefined,
         preview: row?.preview ?? undefined,
       };
-    } catch {
-      return {};
+    } catch (error) {
+      throw createProviderDataError("codex", "Codex State DB 对话 metadata 读取失败", error);
     }
   }
 
@@ -171,8 +202,7 @@ export class CodexSqliteClient {
     if (!db) return [];
 
     try {
-      const columns = this.getTableColumns(db, "threads");
-      if (!columns.has("id")) return [];
+      const columns = this.getRequiredThreadColumns(db);
 
       const hasRolloutPath = columns.has("rollout_path");
       const hasCreatedAt = columns.has("created_at");
@@ -224,8 +254,8 @@ export class CodexSqliteClient {
           firstUserMessage: row.first_user_message ?? undefined,
         };
       });
-    } catch {
-      return [];
+    } catch (error) {
+      throw createProviderDataError("codex", "Codex State DB 对话索引读取失败", error);
     }
   }
 
@@ -238,8 +268,7 @@ export class CodexSqliteClient {
     if (!db) return null;
 
     try {
-      const columns = this.getTableColumns(db, "threads");
-      if (!columns.has("id")) return null;
+      const columns = this.getRequiredThreadColumns(db);
 
       const selectedColumns = [
         "id",
@@ -269,8 +298,8 @@ export class CodexSqliteClient {
         hash.update(JSON.stringify(row));
       }
       return hash.digest("hex");
-    } catch {
-      return null;
+    } catch (error) {
+      throw createProviderDataError("codex", "Codex State DB signature 读取失败", error);
     }
   }
 
@@ -386,12 +415,14 @@ export class CodexSqliteClient {
     const db = this.getReadDb();
     if (!db) return [];
     try {
+      const columns = this.getRequiredThreadColumns(db);
+      if (!columns.has("model_provider")) return [];
       const rows = db
         .prepare("SELECT DISTINCT model_provider FROM threads ORDER BY model_provider")
         .all() as { model_provider: string }[];
       return rows.map((r) => r.model_provider);
-    } catch {
-      return [];
+    } catch (error) {
+      throw createProviderDataError("codex", "Codex model provider 读取失败", error);
     }
   }
 

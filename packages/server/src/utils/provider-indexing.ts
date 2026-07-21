@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import { stat } from "fs/promises";
 import { glob } from "glob";
 import type { IndexedCacheItem } from "./cache.js";
+import { isFileSystemNotFoundError } from "./errors.js";
 
 const FILE_STATE_STAT_BATCH_SIZE = 128;
 
@@ -29,8 +30,9 @@ export async function collectGlobFileStates(pattern: string): Promise<IndexedSou
           mtimeMs: fileStat.mtimeMs,
           size: fileStat.size,
         };
-      } catch {
-        return null;
+      } catch (error) {
+        if (isFileSystemNotFoundError(error)) return null;
+        throw error;
       }
     })));
   }

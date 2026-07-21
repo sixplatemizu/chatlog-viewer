@@ -12,6 +12,11 @@ import {
 import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
 import { getProviderConfigPath, getProviderPaths } from "../utils/provider-paths.js";
+import {
+  ProviderDataError,
+  createProviderDataError,
+  isFileSystemNotFoundError,
+} from "../utils/errors.js";
 import { runKeyedMutation, runKeyedMutations } from "../utils/mutation-queue.js";
 import {
   collectIndexedCacheItemsInBatches,
@@ -549,8 +554,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
     try {
       await stat(this.getStoragePath());
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return false;
+      throw createProviderDataError(this.name, "Claude Code 数据目录检测失败", error);
     }
   }
 
@@ -562,12 +568,8 @@ export class ClaudeCodeProvider implements ConversationProvider {
   }
 
   async getListSourceSignature(): Promise<string | null> {
-    try {
-      const { sourceSignature } = await this.collectSessionSources();
-      return sourceSignature;
-    } catch {
-      return null;
-    }
+    const { sourceSignature } = await this.collectSessionSources();
+    return sourceSignature;
   }
 
   private getBackgroundRefreshKey(): string {
@@ -909,46 +911,51 @@ export class ClaudeCodeProvider implements ConversationProvider {
         mtimeMs: historyStat.mtimeMs,
         size: historyStat.size,
       });
-    } catch {
-      return new Map();
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return new Map();
+      throw createProviderDataError(this.name, `Claude Code history 无法读取: ${historyPath}`, error);
     }
 
     const sessions = new Map<string, ClaudeHistorySession>();
-    await visitJsonl<ClaudeCodeHistoryEntry>(historyPath, (entry) => {
-      const sessionId = entry.sessionId?.trim();
-      const display = entry.display?.trim();
-      if (!sessionId || !display) {
-        return;
-      }
+    try {
+      await visitJsonl<ClaudeCodeHistoryEntry>(historyPath, (entry) => {
+        const sessionId = entry.sessionId?.trim();
+        const display = entry.display?.trim();
+        if (!sessionId || !display) {
+          return;
+        }
 
-      const current = sessions.get(sessionId) ?? {
-        messageCount: 0,
-        messages: [],
-      };
-      const timestamp = typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp)
-        ? entry.timestamp
-        : undefined;
+        const current = sessions.get(sessionId) ?? {
+          messageCount: 0,
+          messages: [],
+        };
+        const timestamp = typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp)
+          ? entry.timestamp
+          : undefined;
 
-      current.projectPath = entry.project ? normalizePath(entry.project) : current.projectPath;
-      current.createdAt = current.createdAt === undefined
-        ? timestamp
-        : (timestamp === undefined ? current.createdAt : Math.min(current.createdAt, timestamp));
-      current.updatedAt = current.updatedAt === undefined
-        ? timestamp
-        : (timestamp === undefined ? current.updatedAt : Math.max(current.updatedAt, timestamp));
-      current.messageCount += 1;
-      current.messages.push({
-        role: "user",
-        content: display,
-        timestamp,
+        current.projectPath = entry.project ? normalizePath(entry.project) : current.projectPath;
+        current.createdAt = current.createdAt === undefined
+          ? timestamp
+          : (timestamp === undefined ? current.createdAt : Math.min(current.createdAt, timestamp));
+        current.updatedAt = current.updatedAt === undefined
+          ? timestamp
+          : (timestamp === undefined ? current.updatedAt : Math.max(current.updatedAt, timestamp));
+        current.messageCount += 1;
+        current.messages.push({
+          role: "user",
+          content: display,
+          timestamp,
+        });
+
+        if (!display.startsWith("/") && !current.firstPrompt) {
+          current.firstPrompt = display;
+        }
+
+        sessions.set(sessionId, current);
       });
-
-      if (!display.startsWith("/") && !current.firstPrompt) {
-        current.firstPrompt = display;
-      }
-
-      sessions.set(sessionId, current);
-    });
+    } catch (error) {
+      throw createProviderDataError(this.name, `Claude Code history 解析失败: ${historyPath}`, error);
+    }
 
     return sessions;
   }
@@ -970,14 +977,22 @@ export class ClaudeCodeProvider implements ConversationProvider {
           originalPath: parsed.originalPath,
         };
       }
-    } catch {
-      // 继续返回空索引
+    } catch (error) {
+      if (!isFileSystemNotFoundError(error)) {
+        throw createProviderDataError(this.name, `Claude Code session index 无法读取: ${indexPath}`, error);
+      }
+
+      return {
+        version: 1,
+        entries: [],
+      };
     }
 
-    return {
-      version: 1,
-      entries: [],
-    };
+    throw new ProviderDataError(
+      this.name,
+      "corrupt",
+      `Claude Code session index 已损坏且无法恢复: ${indexPath}`
+    );
   }
 
   private async collectSessionSources(): Promise<{ sources: ClaudeCodeSessionSource[]; sourceSignature: string }> {
@@ -986,7 +1001,12 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const historyBySessionId = await this.readHistorySessions(signatureFiles);
     const sourceBySessionId = new Map<string, ClaudeCodeSessionSource>();
 
-    const projectEntries = await readdir(basePath, { withFileTypes: true });
+    let projectEntries;
+    try {
+      projectEntries = await readdir(basePath, { withFileTypes: true });
+    } catch (error) {
+      throw createProviderDataError(this.name, `Claude Code 项目目录无法读取: ${basePath}`, error);
+    }
     for (const projectEntry of projectEntries) {
       if (!projectEntry.isDirectory()) continue;
 
@@ -996,7 +1016,12 @@ export class ClaudeCodeProvider implements ConversationProvider {
       const transcriptBySessionId = new Map<string, IndexedSourceFile>();
       const sessionDirBySessionId = new Map<string, IndexedSourceFile>();
 
-      const projectDirEntries = await readdir(projectDirPath, { withFileTypes: true });
+      let projectDirEntries;
+      try {
+        projectDirEntries = await readdir(projectDirPath, { withFileTypes: true });
+      } catch (error) {
+        throw createProviderDataError(this.name, `Claude Code 项目目录无法读取: ${projectDirPath}`, error);
+      }
       for (const entry of projectDirEntries) {
         const fullPath = normalizePath(join(projectDirPath, entry.name));
         if (entry.isFile() && entry.name.endsWith(".jsonl")) {
@@ -1036,8 +1061,12 @@ export class ClaudeCodeProvider implements ConversationProvider {
           size: indexStat.size,
         });
         sessionIndex = await this.readSessionIndexFile(indexPath);
-      } catch {
-        sessionIndex = null;
+      } catch (error) {
+        if (isFileSystemNotFoundError(error)) {
+          sessionIndex = null;
+        } else {
+          throw createProviderDataError(this.name, `Claude Code session index 检测失败: ${indexPath}`, error);
+        }
       }
 
       for (const entry of sessionIndex?.entries ?? []) {
@@ -1728,8 +1757,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
     try {
       const entries = await readdir(basePath, { withFileTypes: true });
       return entries.filter((e) => e.isDirectory()).map((e) => e.name);
-    } catch {
-      return [];
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return [];
+      throw createProviderDataError(this.name, `Claude Code 项目目录无法读取: ${basePath}`, error);
     }
   }
 }

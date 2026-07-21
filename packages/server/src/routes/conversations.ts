@@ -5,7 +5,12 @@ import type {
 } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
 import { getAllTitles, getTitle, deleteTitle, deleteNativeTitleSnapshot } from "../utils/title-store.js";
-import { getIndexedListSnapshot, hasFreshIndexedListCache, queryConversationIndex } from "../utils/cache.js";
+import {
+  getIndexedListSnapshot,
+  hasFreshIndexedListCache,
+  queryConversationIndexPage,
+  type ConversationIndexSort,
+} from "../utils/cache.js";
 import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {
@@ -27,6 +32,28 @@ const MAX_CONVERSATION_LIST_LIMIT = 5_000;
 
 function normalizeProjectDisplayPath(value: string): string {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").trim();
+}
+
+function sortConversationItems(
+  items: ConversationMeta[],
+  sort: ConversationIndexSort
+): ConversationMeta[] {
+  return [...items].sort((a, b) => {
+    if (sort === "createdAt") return b.createdAt - a.createdAt;
+    if (sort === "provider") {
+      return a.provider.localeCompare(b.provider) || b.updatedAt - a.updatedAt;
+    }
+    return b.updatedAt - a.updatedAt;
+  });
+}
+
+function mergeCountMaps(
+  target: Record<string, number>,
+  source: Readonly<Record<string, number>>
+): void {
+  for (const [key, count] of Object.entries(source)) {
+    target[key] = (target[key] ?? 0) + count;
+  }
 }
 
 function normalizeStringArrayField(
@@ -171,8 +198,12 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
   app.get("/conversations", async (c) => {
     const providerFilter = c.req.query("provider");
     const search = c.req.query("search")?.toLowerCase();
-    const sort = c.req.query("sort") || "updatedAt";
+    const requestedSort = c.req.query("sort");
+    const sort: ConversationIndexSort = requestedSort === "createdAt" || requestedSort === "provider"
+      ? requestedSort
+      : "updatedAt";
     const modelProviderFilter = c.req.query("modelProvider");
+    const projectFilter = c.req.query("project");
     const requireSearchReady = !!search;
     const limitParam = c.req.query("limit");
     const offsetParam = c.req.query("offset");
@@ -198,6 +229,9 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     const parsedModelProviders = modelProviderFilter !== undefined
       ? modelProviderFilter.split(",").map((name) => name.trim()).filter(Boolean)
       : undefined;
+    const parsedProjects = projectFilter !== undefined
+      ? projectFilter.split(",").map((name) => name.trim()).filter(Boolean)
+      : undefined;
 
     const activeProviders = providers.filter((provider) => activeProviderNameSet.has(provider.name));
     const providerRefreshResults = await Promise.all(activeProviders.map(async (provider) => {
@@ -208,12 +242,18 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
             warning: `${provider.displayName} 当前不可用，结果可能不完整`,
           };
         }
-        const sourceSignature = (await provider.getListSourceSignature?.()) ?? undefined;
+        const onWarning = (warning: string) => {
+          providerWarnings.add(warning);
+        };
+        const sourceSignature = (await provider.getListSourceSignature?.({ onWarning })) ?? undefined;
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
           return { cacheKey };
         }
 
-        const refreshedItems = await provider.list({ eagerSearchIndex: requireSearchReady });
+        const refreshedItems = await provider.list({
+          eagerSearchIndex: requireSearchReady,
+          onWarning,
+        });
         if (hasFreshIndexedListCache(cacheKey, undefined, { requireSearchReady, sourceSignature })) {
           return { cacheKey };
         }
@@ -245,12 +285,6 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       }
     }
 
-    const indexedConversationsBase = queryConversationIndex({
-      cacheKeys: indexedCacheKeys,
-      search,
-      sort: sort === "createdAt" || sort === "provider" ? sort : "updatedAt",
-    });
-
     const indexedProviderSet = new Set(
       indexedCacheKeys.map((cacheKey) => cacheKey.split("::")[0])
     );
@@ -262,7 +296,14 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
       return parsedModelProviders.includes(item.modelProvider);
     };
 
-    let filteredRefreshed = [...refreshedByProvider.entries()].flatMap(([providerName, items]) => {
+    const filterByProjects = (item: ConversationMeta): boolean => {
+      if (projectFilter === undefined) return true;
+      if (!parsedProjects || parsedProjects.length === 0) return false;
+      return [item.project, item.projectKey, item.projectId]
+        .some((value) => !!value && parsedProjects.includes(value));
+    };
+
+    let refreshedItems = [...refreshedByProvider.entries()].flatMap(([providerName, items]) => {
       if (indexedProviderSet.has(providerName)) {
         return [];
       }
@@ -270,33 +311,51 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
     });
 
     if (search) {
-      filteredRefreshed = filteredRefreshed.filter(
+      refreshedItems = refreshedItems.filter(
         (item) =>
           item.title.toLowerCase().includes(search) ||
           item.project.toLowerCase().includes(search)
       );
     }
+    refreshedItems = refreshedItems.filter(filterByProjects);
 
-    const baseConversations = [...indexedConversationsBase, ...filteredRefreshed];
-
-    // Codex provider facet 依赖当前搜索结果，但不受 modelProvider 自身筛选影响。
-    const codexModelProviderCounts: Record<string, number> = {};
-    const providerCounts: Record<string, number> = {};
-    const providerFacetBase: ConversationMeta[] = [];
-    for (const item of baseConversations) {
+    const fallbackModelProviderCounts: Record<string, number> = {};
+    for (const item of refreshedItems) {
       if (item.provider === "codex" && item.modelProvider) {
-        codexModelProviderCounts[item.modelProvider] = (codexModelProviderCounts[item.modelProvider] ?? 0) + 1;
+        fallbackModelProviderCounts[item.modelProvider] =
+          (fallbackModelProviderCounts[item.modelProvider] ?? 0) + 1;
       }
-      if (modelProviderFilter !== undefined && !filterByModelProviders(item)) continue;
-      providerFacetBase.push(item);
+    }
+
+    const filteredRefreshed = refreshedItems.filter(filterByModelProviders);
+    const hasFallbackItems = filteredRefreshed.length > 0;
+    const indexedQuery = queryConversationIndexPage({
+      cacheKeys: indexedCacheKeys,
+      search,
+      sort,
+      modelProviders: modelProviderFilter === undefined ? undefined : parsedModelProviders ?? [],
+      projects: projectFilter === undefined ? undefined : parsedProjects ?? [],
+      limit: hasFallbackItems ? listOffset + listLimit : listLimit,
+      offset: hasFallbackItems ? 0 : listOffset,
+    });
+
+    const providerCounts = { ...indexedQuery.providerCounts };
+    for (const item of filteredRefreshed) {
       providerCounts[item.provider] = (providerCounts[item.provider] ?? 0) + 1;
     }
 
-    const filteredBase = providerFilter !== undefined
-      ? providerFacetBase.filter((item) => activeProviderNameSet.has(item.provider))
-      : providerFacetBase;
+    const codexModelProviderCounts = { ...indexedQuery.codexModelProviderCounts };
+    mergeCountMaps(codexModelProviderCounts, fallbackModelProviderCounts);
 
-    const filtered = (await Promise.all(filteredBase
+    const total = indexedQuery.total + filteredRefreshed.length;
+    const conversationsPageBase = hasFallbackItems
+      ? sortConversationItems(
+          [...indexedQuery.conversations, ...filteredRefreshed],
+          sort
+        ).slice(listOffset, listOffset + listLimit)
+      : indexedQuery.conversations;
+
+    const conversationsPage = await Promise.all(conversationsPageBase
       .map(async (conv) => {
         const provider = providerByName.get(conv.provider);
         const resolvedTitle = await resolveConversationTitle(provider, conv.title, customTitles[conv.id]);
@@ -308,24 +367,15 @@ export function createConversationRoutes(providers: ConversationProvider[]) {
           titleSyncMode: resolveProviderTitleSyncMode(provider),
           capabilities,
         };
-      })))
-      .sort((a, b) => {
-        if (sort === "createdAt") return b.createdAt - a.createdAt;
-        if (sort === "provider") {
-          return a.provider.localeCompare(b.provider) || b.updatedAt - a.updatedAt;
-        }
-        return b.updatedAt - a.updatedAt;
-      });
-
-    const conversationsPage = filtered.slice(listOffset, listOffset + listLimit);
+      }));
 
     return c.json({
-      total: filtered.length,
+      total,
       conversations: conversationsPage,
       providerCounts,
       codexModelProviderCounts,
-      listTruncated: conversationsPage.length + listOffset < filtered.length,
-      nextOffset: conversationsPage.length + listOffset < filtered.length
+      listTruncated: conversationsPage.length + listOffset < total,
+      nextOffset: conversationsPage.length + listOffset < total
         ? listOffset + conversationsPage.length
         : undefined,
       partialSearch: requireSearchReady && providerWarnings.size > 0,

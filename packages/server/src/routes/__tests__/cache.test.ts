@@ -8,6 +8,7 @@ import {
   getIndexedListCache,
   hasFreshIndexedListCache,
   queryConversationIndex,
+  queryConversationIndexPage,
   setIndexedListCache,
   invalidateListCache,
   setCacheStoreDirForTests,
@@ -29,7 +30,10 @@ test.after(async () => {
   }
 });
 
-function createConversationMeta(id: string): ConversationMeta {
+function createConversationMeta(
+  id: string,
+  overrides: Partial<ConversationMeta> = {}
+): ConversationMeta {
   return {
     id,
     provider: "codex",
@@ -41,6 +45,7 @@ function createConversationMeta(id: string): ConversationMeta {
     messageCount: 3,
     fileSize: 4,
     filePath: `/tmp/${id}.jsonl`,
+    ...overrides,
   };
 }
 
@@ -101,6 +106,62 @@ test("conversation index 支持按消息内容搜索", () => {
   assert.equal(matched.some((item) => item.id === "codex:3"), true);
 
   invalidateListCache(cacheKey);
+});
+
+test("conversation index 会在 SQLite 中完成分页、项目和 model provider 筛选", () => {
+  const codexCacheKey = `test-index-page-codex-${Date.now()}`;
+  const openCodeCacheKey = `test-index-page-opencode-${Date.now()}`;
+
+  setIndexedListCache(codexCacheKey, [
+    createConversationMeta("codex:v", {
+      modelProvider: "v",
+      project: "/tmp/project-a",
+      projectKey: "/tmp/project-a",
+      updatedAt: 50,
+    }),
+    createConversationMeta("codex:custom", {
+      modelProvider: "custom",
+      project: "/tmp/project-a",
+      projectKey: "/tmp/project-a",
+      updatedAt: 40,
+    }),
+    createConversationMeta("codex:no-model", {
+      project: "/tmp/project-b",
+      projectKey: "/tmp/project-b",
+      updatedAt: 30,
+    }),
+  ]);
+  setIndexedListCache(openCodeCacheKey, [
+    createConversationMeta("opencode:1", {
+      provider: "opencode",
+      project: "/tmp/project-a",
+      projectKey: "/tmp/project-a",
+      updatedAt: 45,
+    }),
+  ]);
+
+  const result = queryConversationIndexPage({
+    cacheKeys: [codexCacheKey, openCodeCacheKey],
+    projects: ["/tmp/project-a"],
+    modelProviders: ["v"],
+    sort: "updatedAt",
+    limit: 1,
+    offset: 1,
+  });
+
+  assert.equal(result.total, 2);
+  assert.deepEqual(result.conversations.map((item) => item.id), ["opencode:1"]);
+  assert.deepEqual(result.providerCounts, {
+    codex: 1,
+    opencode: 1,
+  });
+  assert.deepEqual(result.codexModelProviderCounts, {
+    custom: 1,
+    v: 1,
+  });
+
+  invalidateListCache(codexCacheKey);
+  invalidateListCache(openCodeCacheKey);
 });
 
 test("indexed cache snapshot 会保留并读回 searchChunks", () => {

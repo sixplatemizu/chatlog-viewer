@@ -17,6 +17,19 @@ type PendingRequest = {
 
 const APP_SERVER_START_TIMEOUT_MS = 8000;
 const APP_SERVER_REQUEST_TIMEOUT_MS = 8000;
+const DEFAULT_APP_SERVER_IDLE_TIMEOUT_MS = 30_000;
+const APP_SERVER_TERMINATE_TIMEOUT_MS = 5_000;
+
+export interface CodexAppServerSession {
+  isAlive(): boolean;
+  setThreadName(threadId: string, name: string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface CodexAppServerManagerOptions {
+  createSession?: (codexHome?: string) => Promise<CodexAppServerSession>;
+  idleTimeoutMs?: number;
+}
 
 function buildCodexAppServerSpawn(port: number, codexHome?: string): {
   command: string;
@@ -94,6 +107,10 @@ class CodexAppServerClient {
 
   constructor(private readonly url: string) {}
 
+  isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
   async connect(): Promise<void> {
     const WebSocketCtor = globalThis.WebSocket;
     if (!WebSocketCtor) {
@@ -126,6 +143,11 @@ class CodexAppServerClient {
   }
 
   close(): void {
+    const error = new Error("Codex app-server client 已关闭");
+    for (const request of this.pending.values()) {
+      request.reject(error);
+    }
+    this.pending.clear();
     this.ws?.close();
     this.ws = null;
   }
@@ -222,14 +244,33 @@ export function shouldUseCodexAppServerRename(): boolean {
   return true;
 }
 
-export async function setCodexThreadNameViaAppServer(
-  threadId: string,
-  name: string,
-  codexHome?: string
-): Promise<void> {
+class RunningCodexAppServerSession implements CodexAppServerSession {
+  constructor(
+    private readonly child: ChildProcess,
+    private readonly client: CodexAppServerClient
+  ) {}
+
+  isAlive(): boolean {
+    return this.child.exitCode === null && this.client.isOpen();
+  }
+
+  async setThreadName(threadId: string, name: string): Promise<void> {
+    await this.client.setThreadName(threadId, name);
+  }
+
+  async close(): Promise<void> {
+    this.client.close();
+    if (this.child.exitCode !== null) return;
+    await terminateAppServer(this.child);
+  }
+}
+
+async function createCodexAppServerSession(codexHome?: string): Promise<CodexAppServerSession> {
   const port = await getFreePort();
   const appServer = buildCodexAppServerSpawn(port, codexHome);
   const child = spawn(appServer.command, appServer.args, appServer.options);
+  child.stdout?.resume();
+  child.stderr?.resume();
 
   try {
     await waitForReady(port, child);
@@ -237,15 +278,145 @@ export async function setCodexThreadNameViaAppServer(
     try {
       await client.connect();
       await client.initialize();
-      await client.setThreadName(threadId, name);
-    } finally {
+      return new RunningCodexAppServerSession(child, client);
+    } catch (error) {
       client.close();
+      throw error;
     }
-  } finally {
+  } catch (error) {
     if (child.exitCode === null) {
       await terminateAppServer(child);
     }
+    throw error;
   }
+}
+
+export class CodexAppServerManager {
+  private session: CodexAppServerSession | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
+  private queue: Promise<void> = Promise.resolve();
+  private readonly createSession: (codexHome?: string) => Promise<CodexAppServerSession>;
+  private readonly idleTimeoutMs: number;
+
+  constructor(options: CodexAppServerManagerOptions = {}) {
+    this.createSession = options.createSession ?? createCodexAppServerSession;
+    this.idleTimeoutMs = Math.max(
+      0,
+      options.idleTimeoutMs ?? getAppServerIdleTimeoutMs()
+    );
+  }
+
+  setThreadName(threadId: string, name: string, codexHome?: string): Promise<void> {
+    const operation = this.queue.then(
+      () => this.setThreadNameInternal(threadId, name, codexHome),
+      () => this.setThreadNameInternal(threadId, name, codexHome)
+    );
+    this.queue = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    return operation;
+  }
+
+  async close(): Promise<void> {
+    await this.queue;
+    await this.closeSession();
+  }
+
+  private async setThreadNameInternal(
+    threadId: string,
+    name: string,
+    codexHome?: string
+  ): Promise<void> {
+    this.clearIdleTimer();
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const session = await this.getSession(codexHome);
+        await session.setThreadName(threadId, name);
+        this.scheduleIdleClose();
+        return;
+      } catch (error) {
+        lastError = error;
+        await this.closeSession();
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(String(lastError));
+  }
+
+  private async getSession(codexHome?: string): Promise<CodexAppServerSession> {
+    if (this.session?.isAlive()) {
+      return this.session;
+    }
+
+    await this.closeSession();
+    this.session = await this.createSession(codexHome);
+    return this.session;
+  }
+
+  private scheduleIdleClose(): void {
+    if (this.idleTimeoutMs === 0) return;
+    this.clearIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      void this.closeSession();
+    }, this.idleTimeoutMs);
+    this.idleTimer.unref();
+  }
+
+  private clearIdleTimer(): void {
+    if (!this.idleTimer) return;
+    clearTimeout(this.idleTimer);
+    this.idleTimer = null;
+  }
+
+  private async closeSession(): Promise<void> {
+    this.clearIdleTimer();
+
+    const session = this.session;
+    this.session = null;
+    if (session) await session.close();
+  }
+}
+
+function getAppServerIdleTimeoutMs(): number {
+  const configured = Number.parseInt(
+    process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_IDLE_MS ?? "",
+    10
+  );
+  return Number.isFinite(configured) && configured >= 0
+    ? configured
+    : DEFAULT_APP_SERVER_IDLE_TIMEOUT_MS;
+}
+
+const appServerManagers = new Map<string, CodexAppServerManager>();
+
+function getAppServerManager(codexHome?: string): CodexAppServerManager {
+  const key = codexHome?.trim() ?? "";
+  const existing = appServerManagers.get(key);
+  if (existing) return existing;
+
+  const manager = new CodexAppServerManager();
+  appServerManagers.set(key, manager);
+  return manager;
+}
+
+export async function setCodexThreadNameViaAppServer(
+  threadId: string,
+  name: string,
+  codexHome?: string
+): Promise<void> {
+  await getAppServerManager(codexHome).setThreadName(threadId, name, codexHome);
+}
+
+export async function closeCodexAppServerClients(): Promise<void> {
+  const managers = [...appServerManagers.values()];
+  appServerManagers.clear();
+  await Promise.all(managers.map((manager) => manager.close()));
 }
 
 async function terminateAppServer(child: ChildProcess): Promise<void> {
@@ -255,8 +426,18 @@ async function terminateAppServer(child: ChildProcess): Promise<void> {
       stdio: "ignore",
     });
     await new Promise<void>((resolve) => {
-      killer.once("error", () => resolve());
-      killer.once("close", () => resolve());
+      const timeout = setTimeout(() => {
+        killer.kill();
+        resolve();
+      }, APP_SERVER_TERMINATE_TIMEOUT_MS);
+      killer.once("error", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      killer.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
     });
     return;
   }

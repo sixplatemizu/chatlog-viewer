@@ -7,6 +7,7 @@ export interface ConversationReadOptions {
 
 export interface ConversationListOptions {
   eagerSearchIndex?: boolean;
+  onWarning?: (message: string) => void;
 }
 
 export type TitleSyncMode = "native" | "overlay";
@@ -50,7 +51,7 @@ export interface ConversationProvider {
   capabilities?: ConversationProviderCapabilities;
   detect(): Promise<boolean>;
   list(options?: ConversationListOptions): Promise<ConversationMeta[]>;
-  getListSourceSignature?(): Promise<string | null>;
+  getListSourceSignature?(options?: ConversationListOptions): Promise<string | null>;
   read(id: string, options?: ConversationReadOptions): Promise<Conversation>;
   delete(id: string): Promise<void>;
   move?(id: string, targetProjectKey: string): Promise<void>;

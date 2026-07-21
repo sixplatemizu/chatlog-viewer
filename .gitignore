@@ -5,3 +5,5 @@ dist/
 .ace-tool/
 packages/server/codex.calls.log
 packages/server/codex.session
+test-results/
+playwright-report/

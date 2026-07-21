@@ -1,6 +1,11 @@
 type ErrorStatusCode = 400 | 404 | 409 | 500 | 503;
 
-export type ProviderDataErrorKind = "unavailable" | "locked" | "corrupt" | "schema-incompatible";
+export type ProviderDataErrorKind =
+  | "unavailable"
+  | "locked"
+  | "corrupt"
+  | "schema-incompatible"
+  | "permission-denied";
 
 export class ProviderDataError extends Error {
   readonly status = 503;
@@ -43,6 +48,75 @@ export function getErrorMessage(error: unknown, fallback = "未知错误"): stri
     return error;
   }
   return fallback;
+}
+
+export function classifyProviderDataError(error: unknown): ProviderDataErrorKind {
+  const message = getErrorMessage(error, "").toLowerCase();
+  const code = getErrorCode(error);
+
+  if (
+    code === "EACCES"
+    || code === "EPERM"
+    || code === "SQLITE_READONLY"
+    || message.includes("permission denied")
+    || message.includes("access is denied")
+    || message.includes("operation not permitted")
+    || message.includes("readonly database")
+  ) {
+    return "permission-denied";
+  }
+  if (
+    code === "SQLITE_BUSY"
+    || code === "SQLITE_LOCKED"
+    || message.includes("locked")
+    || message.includes("busy")
+  ) {
+    return "locked";
+  }
+  if (
+    code === "SQLITE_CORRUPT"
+    || code === "SQLITE_NOTADB"
+    || message.includes("malformed")
+    || message.includes("corrupt")
+    || message.includes("not a database")
+    || message.includes("disk image is malformed")
+  ) {
+    return "corrupt";
+  }
+  if (
+    message.includes("no such table")
+    || message.includes("no such column")
+    || message.includes("schema")
+  ) {
+    return "schema-incompatible";
+  }
+  return "unavailable";
+}
+
+export function createProviderDataError(
+  providerName: string,
+  context: string,
+  error: unknown
+): ProviderDataError {
+  if (error instanceof ProviderDataError) {
+    return error;
+  }
+  return new ProviderDataError(
+    providerName,
+    classifyProviderDataError(error),
+    `${context}: ${getErrorMessage(error)}`,
+    error instanceof Error ? { cause: error } : undefined
+  );
+}
+
+export function getErrorCode(error: unknown): string {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code ?? "").toUpperCase()
+    : "";
+}
+
+export function isFileSystemNotFoundError(error: unknown): boolean {
+  return getErrorCode(error) === "ENOENT";
 }
 
 export function isNotFoundError(error: unknown): boolean {

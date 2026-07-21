@@ -215,6 +215,7 @@ export async function fetchConversations(params: {
   search?: string;
   sort?: string;
   modelProvider?: string;
+  project?: string;
   limit?: number;
   offset?: number;
   signal?: AbortSignal;
@@ -224,6 +225,7 @@ export async function fetchConversations(params: {
   if (params.search) qs.set("search", params.search);
   if (params.sort) qs.set("sort", params.sort);
   if (params.modelProvider !== undefined) qs.set("modelProvider", params.modelProvider);
+  if (params.project !== undefined) qs.set("project", params.project);
   if (params.limit !== undefined) qs.set("limit", String(params.limit));
   if (params.offset !== undefined) qs.set("offset", String(params.offset));
   return requestJson<ConversationListResponse>(

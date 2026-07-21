@@ -25,7 +25,12 @@ import {
 } from "../utils/cache.js";
 import { logProviderError } from "../utils/logger.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
-import { isNotFoundError } from "../utils/errors.js";
+import {
+  createProviderDataError,
+  getErrorMessage,
+  isFileSystemNotFoundError,
+  isNotFoundError,
+} from "../utils/errors.js";
 import {
   collectGlobFileStates,
   collectIndexedCacheItemsInBatches,
@@ -114,6 +119,16 @@ interface CodexProviderOptions {
   setThreadNameViaAppServer?: typeof setCodexThreadNameViaAppServer;
   shouldUseAppServerRename?: typeof shouldUseCodexAppServerRename;
 }
+
+interface CodexStateDbReader {
+  read<T>(fallback: T, operation: () => T): T;
+  hasFailed(): boolean;
+}
+
+const strictCodexStateDbReader: CodexStateDbReader = {
+  read: (_fallback, operation) => operation(),
+  hasFailed: () => false,
+};
 
 export function clearCodexMessageIdentityCacheForTests(): void {
   codexMessageIdentityCache.clear();
@@ -508,17 +523,49 @@ export class CodexProvider implements ConversationProvider {
     ]);
   }
 
-  private async getListSourceFiles() {
-    const pattern = join(this.getStoragePath(), "**", "*.jsonl").replace(/\\/g, "/");
-    const fileStates = await collectGlobFileStates(pattern);
+  private createStateDbReader(onWarning?: (message: string) => void): CodexStateDbReader {
+    let failed = false;
 
-    const threadsSignature = this.sqliteClient.getThreadsSignature();
+    return {
+      read: <T>(fallback: T, operation: () => T): T => {
+        if (failed) return fallback;
+
+        try {
+          return operation();
+        } catch (error) {
+          failed = true;
+          this.sqliteClient.close();
+          logProviderError("codex.state-db.partial", this.name, error);
+          onWarning?.(`Codex State DB 读取失败：${getErrorMessage(error)}，已仅使用 transcript 数据`);
+          return fallback;
+        }
+      },
+      hasFailed: () => failed,
+    };
+  }
+
+  private async getListSourceFiles(
+    stateDbRead: CodexStateDbReader = strictCodexStateDbReader,
+    onWarning?: (message: string) => void
+  ) {
+    const pattern = join(this.getStoragePath(), "**", "*.jsonl").replace(/\\/g, "/");
+    let fileStates: Array<{ path: string; mtimeMs: number; size: number }>;
+    try {
+      fileStates = await collectGlobFileStates(pattern);
+    } catch (error) {
+      throw createProviderDataError(this.name, "Codex transcript 索引读取失败", error);
+    }
+
+    const threadsSignature = stateDbRead.read(null, () => this.sqliteClient.getThreadsSignature());
     if (threadsSignature) {
       fileStates.push({
         path: this.getNormalizedStateDbPath(),
         mtimeMs: Number.parseInt(threadsSignature.slice(0, 12), 16),
         size: Number.parseInt(threadsSignature.slice(12, 24), 16),
       });
+      return fileStates;
+    }
+    if (stateDbRead.hasFailed()) {
       return fileStates;
     }
 
@@ -529,17 +576,23 @@ export class CodexProvider implements ConversationProvider {
         mtimeMs: fileStat.mtimeMs,
         size: fileStat.size,
       });
-    } catch {
-      // 允许缺失 state db，此时仅依赖 jsonl 目录。
+    } catch (error) {
+      if (!isFileSystemNotFoundError(error)) {
+        logProviderError("codex.state-db.stat", this.name, error);
+        onWarning?.(`Codex State DB 状态读取失败：${getErrorMessage(error)}，已仅使用 transcript 数据`);
+      }
     }
 
     return fileStates;
   }
 
-  private async buildStateOnlyMeta(thread: CodexThreadRow): Promise<ConversationMeta | null> {
+  private async buildStateOnlyMeta(
+    thread: CodexThreadRow,
+    stateDbRead: CodexStateDbReader = strictCodexStateDbReader
+  ): Promise<ConversationMeta | null> {
     const isTitleGenerationSession = isCodexTitleGenerationProject(thread.cwd);
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(thread.cwd);
-    const threadMetadata = this.sqliteClient.getThreadMetadata(thread.id);
+    const threadMetadata = stateDbRead.read({}, () => this.sqliteClient.getThreadMetadata(thread.id));
 
     const normalizedTitle = normalizeCodexDisplayText(threadMetadata.title ?? thread.title);
     const normalizedFirstUserMessage = normalizeCodexDisplayText(
@@ -736,8 +789,9 @@ export class CodexProvider implements ConversationProvider {
     try {
       await stat(this.getStoragePath());
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return false;
+      throw createProviderDataError(this.name, "Codex transcript 目录检测失败", error);
     }
   }
 
@@ -745,16 +799,14 @@ export class CodexProvider implements ConversationProvider {
     return this.listInternal({
       eagerSearchIndex: options.eagerSearchIndex ?? false,
       allowBackground: true,
+      onWarning: options.onWarning,
     });
   }
 
-  async getListSourceSignature(): Promise<string | null> {
-    try {
-      const fileStates = await this.getListSourceFiles();
-      return this.createListSourceSignature(fileStates);
-    } catch {
-      return null;
-    }
+  async getListSourceSignature(options: ConversationListOptions = {}): Promise<string | null> {
+    const stateDbRead = this.createStateDbReader(options.onWarning);
+    const fileStates = await this.getListSourceFiles(stateDbRead, options.onWarning);
+    return this.createListSourceSignature(fileStates);
   }
 
   private scheduleBackgroundIndexRefresh(): void {
@@ -774,6 +826,7 @@ export class CodexProvider implements ConversationProvider {
         this.listInternal({
           eagerSearchIndex: true,
           allowBackground: false,
+          onWarning: undefined,
         })
           .then(() => undefined)
           .catch((error) => {
@@ -792,10 +845,12 @@ export class CodexProvider implements ConversationProvider {
   private async listInternal(options: {
     eagerSearchIndex: boolean;
     allowBackground: boolean;
+    onWarning?: (message: string) => void;
   }): Promise<ConversationMeta[]> {
+    const stateDbRead = this.createStateDbReader(options.onWarning);
     const basePath = this.getStoragePath();
     const cacheKey = this.getListCacheKey(basePath);
-    const fileStates = await this.getListSourceFiles();
+    const fileStates = await this.getListSourceFiles(stateDbRead, options.onWarning);
     const sourceSignature = this.createListSourceSignature(fileStates);
     const cachedList = getIndexedListCache(cacheKey, undefined, {
       requireSearchReady: options.eagerSearchIndex,
@@ -825,7 +880,7 @@ export class CodexProvider implements ConversationProvider {
         continue;
       }
 
-      const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+      const threadMetadata = stateDbRead.read({}, () => this.sqliteClient.getThreadMetadata(sessionId));
       if (
         isReusableCodexMetaHint(previousMeta.meta, fileState, threadMetadata)
         && (!options.eagerSearchIndex || hasIndexedSearchData(previousMeta))
@@ -841,11 +896,12 @@ export class CodexProvider implements ConversationProvider {
       this.buildIndexedCacheItem(filePath, {
         includeSearchIndex: options.eagerSearchIndex,
         metaHint: previousByFilePath.get(filePath)?.meta,
+        stateDbRead,
       })
     )));
 
     const seenIds = new Set(results.map((item) => item.meta.id));
-    for (const thread of this.sqliteClient.listThreads()) {
+    for (const thread of stateDbRead.read<CodexThreadRow[]>([], () => this.sqliteClient.listThreads())) {
       if (transcriptSessionIds.has(thread.id)) {
         continue;
       }
@@ -853,7 +909,7 @@ export class CodexProvider implements ConversationProvider {
       const filePath = buildCodexStateOnlyFilePath(thread.id, thread.rolloutPath);
       const previousItem = previousByFilePath.get(filePath);
       const previousMeta = previousItem?.meta;
-      const meta = await this.buildStateOnlyMeta(thread);
+      const meta = await this.buildStateOnlyMeta(thread, stateDbRead);
       if (!meta || seenIds.has(meta.id)) {
         continue;
       }
@@ -904,12 +960,14 @@ export class CodexProvider implements ConversationProvider {
     options: {
       includeSearchIndex: boolean;
       metaHint?: ConversationMeta;
+      stateDbRead?: CodexStateDbReader;
     }
   ): Promise<IndexedCacheItem | null> {
     const fileStat = await stat(filePath);
     const metaHint = options.metaHint;
     const sessionId = this.getSessionIdFromMetaOrPath(metaHint, filePath);
-    const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+    const stateDbRead = options.stateDbRead ?? strictCodexStateDbReader;
+    const threadMetadata = stateDbRead.read({}, () => this.sqliteClient.getThreadMetadata(sessionId));
 
     if (isReusableCodexMetaHint(metaHint, fileStat, threadMetadata)) {
       setCache(filePath, fileStat.mtimeMs, metaHint);
@@ -923,11 +981,11 @@ export class CodexProvider implements ConversationProvider {
     }
 
     if (!options.includeSearchIndex) {
-      const meta = await this.extractMeta(filePath, metaHint);
+      const meta = await this.extractMeta(filePath, metaHint, stateDbRead);
       return meta ? { meta } : null;
     }
 
-    return this.scanConversationFile(filePath, fileStat, true);
+    return this.scanConversationFile(filePath, fileStat, true, stateDbRead);
   }
 
   private async scanConversationFile(
@@ -937,7 +995,8 @@ export class CodexProvider implements ConversationProvider {
       size: number;
       birthtimeMs: number;
     },
-    includeSearchIndex: boolean
+    includeSearchIndex: boolean,
+    stateDbRead: CodexStateDbReader = strictCodexStateDbReader
   ): Promise<IndexedCacheItem | null> {
     let sessionId = filePath.split(/[/\\]/).pop()!.replace(".jsonl", "");
     let cwd = "";
@@ -1014,7 +1073,7 @@ export class CodexProvider implements ConversationProvider {
     const isTitleGenerationSession = isCodexTitleGenerationProject(cwd);
 
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
-    const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+    const threadMetadata = stateDbRead.read({}, () => this.sqliteClient.getThreadMetadata(sessionId));
     const titleChoice = pickCodexConversationTitle({
       transcriptTitle,
       nativeTitle: threadMetadata.title,
@@ -1063,12 +1122,16 @@ export class CodexProvider implements ConversationProvider {
     return builder.build();
   }
 
-  private async extractMeta(filePath: string, metaHint?: ConversationMeta): Promise<ConversationMeta | null> {
+  private async extractMeta(
+    filePath: string,
+    metaHint?: ConversationMeta,
+    stateDbRead: CodexStateDbReader = strictCodexStateDbReader
+  ): Promise<ConversationMeta | null> {
     const fileStat = await stat(filePath);
     const cached = getCached(filePath, fileStat.mtimeMs);
     if (cached) {
       const sessionId = this.getSessionIdFromMetaOrPath(cached, filePath);
-      const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+      const threadMetadata = stateDbRead.read({}, () => this.sqliteClient.getThreadMetadata(sessionId));
       if (isReusableCodexMetaHint(cached, fileStat, threadMetadata)) {
         return cached;
       }
@@ -1118,7 +1181,7 @@ export class CodexProvider implements ConversationProvider {
     const firstTs = new Date(headEntries[0].timestamp).getTime();
     const normalizedCwd = canonicalizeProjectPathResolvingSymlinks(cwd);
 
-    const threadMetadata = this.sqliteClient.getThreadMetadata(sessionId);
+    const threadMetadata = stateDbRead.read({}, () => this.sqliteClient.getThreadMetadata(sessionId));
     const titleChoice = pickCodexConversationTitle({
       transcriptTitle,
       nativeTitle: threadMetadata.title,

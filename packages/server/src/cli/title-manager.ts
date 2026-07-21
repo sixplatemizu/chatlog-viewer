@@ -2,12 +2,13 @@
 
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createDefaultProviders } from "../app.js";
 import type { ConversationMeta, ConversationProvider } from "../providers/types.js";
+import { closeCodexAppServerClients } from "../providers/codex-app-server.js";
 import { detectAvailableTitleGenerationClis } from "../utils/ai.js";
 import type { TitleGenerationCli } from "../utils/provider-paths.js";
 import {
@@ -17,20 +18,46 @@ import {
   normalizeTitle,
   persistConversationTitle,
 } from "../services/conversation-title.js";
+import {
+  buildRollbackEntries,
+  buildTitleCliJsonResult,
+  createTitleReportPath,
+  formatCliJson,
+  synchronizeBatchReport,
+  synchronizeRollbackReport,
+  writeBatchReport,
+  writeRollbackReport,
+  TITLE_CLI_SCHEMA_VERSION,
+  type BatchReport,
+  type ManagedProviderName,
+  type ProjectMode,
+  type ProviderSelection,
+  type RollbackReport,
+  type RollbackReportEntry,
+  type TitleCliSummary,
+} from "./title-report.js";
+
+export {
+  buildRollbackEntries,
+  buildTitleCliJsonResult,
+  formatCliJson,
+  summarizeTitleEntries,
+  TITLE_CLI_SCHEMA_VERSION,
+} from "./title-report.js";
+export type {
+  BatchReport,
+  BatchReportEntry,
+  ManagedProviderName,
+  ProjectMode,
+  ProviderSelection,
+  RollbackReport,
+  RollbackReportEntry,
+  TitleCliCommand,
+  TitleCliSummary,
+} from "./title-report.js";
 
 export type Scope = "all" | "cwd";
 export type OutputFormat = "table" | "json";
-export type ProjectMode = "exact" | "recursive";
-export type ManagedProviderName = "codex" | "claude-code" | "opencode";
-export type ProviderSelection = ManagedProviderName | "all";
-export type TitleCliCommand = "list" | "rename" | "generate" | "generate-batch" | "rollback";
-
-export interface TitleCliSummary {
-  total: number;
-  success: number;
-  failed: number;
-  skipped: number;
-}
 
 export interface CliOptions {
   scope: Scope;
@@ -58,12 +85,10 @@ interface CliContext {
 }
 
 const DEFAULT_LIMIT = 20;
-export const TITLE_CLI_SCHEMA_VERSION = 1;
 const TITLE_GENERATION_BADGE_LABEL = "标题生成";
 const TITLE_GENERATION_CLI_SET = new Set<TitleGenerationCli>(["codex", "claude", "opencode"]);
 const MANAGED_PROVIDER_NAMES: ManagedProviderName[] = ["codex", "claude-code", "opencode"];
 const MANAGED_PROVIDER_SET = new Set<ManagedProviderName>(MANAGED_PROVIDER_NAMES);
-const TITLE_SUCCESS_STATUSES = new Set(["success", "rolled-back"]);
 
 function printHelp(): void {
   console.log(`ChatLog Viewer title manager
@@ -287,10 +312,6 @@ function formatDate(timestamp: number): string {
   return new Date(timestamp).toLocaleString();
 }
 
-export function formatCliJson(value: unknown): string {
-  return `${JSON.stringify(value, null, 2)}\n`;
-}
-
 function writeCliJson(value: unknown): void {
   process.stdout.write(formatCliJson(value));
 }
@@ -308,44 +329,6 @@ function writeCliJsonError(command: string, error: unknown): void {
     } satisfies TitleCliSummary,
     error: formatTitleActionError(error),
   }));
-}
-
-export function summarizeTitleEntries(
-  entries: ReadonlyArray<{ status: string }>,
-  successStatuses: ReadonlySet<string> = TITLE_SUCCESS_STATUSES
-): TitleCliSummary {
-  return entries.reduce<TitleCliSummary>((summary, entry) => {
-    summary.total += 1;
-    if (successStatuses.has(entry.status)) {
-      summary.success += 1;
-    } else if (entry.status === "failed") {
-      summary.failed += 1;
-    } else {
-      summary.skipped += 1;
-    }
-    return summary;
-  }, {
-    total: 0,
-    success: 0,
-    failed: 0,
-    skipped: 0,
-  });
-}
-
-export function buildTitleCliJsonResult<T extends { status: string }>(
-  command: Exclude<TitleCliCommand, "list">,
-  entries: readonly T[],
-  extra: Record<string, unknown> = {}
-): Record<string, unknown> {
-  const summary = summarizeTitleEntries(entries);
-  return {
-    ...extra,
-    schemaVersion: TITLE_CLI_SCHEMA_VERSION,
-    command,
-    ok: summary.failed === 0 && !entries.some((entry) => entry.status === "pending"),
-    summary,
-    entries,
-  };
 }
 
 function truncate(value: string, maxLength: number): string {
@@ -630,48 +613,6 @@ async function generateConversationTitle(
   };
 }
 
-export interface BatchReportEntry {
-  id: string;
-  oldTitle: string;
-  newTitle?: string;
-  filePath?: string;
-  usedCli?: string;
-  attempts?: number;
-  cleanedTitleSessions?: number;
-  durationMs?: number;
-  status: "pending" | "success" | "failed" | "skipped" | "dry-run";
-  error?: string;
-}
-
-export interface BatchReport {
-  schemaVersion?: number;
-  command?: "generate-batch";
-  ok?: boolean;
-  summary?: TitleCliSummary;
-  kind: "generate-batch";
-  dryRun: boolean;
-  startedAt: string;
-  finishedAt?: string;
-  durationMs?: number;
-  projectPath?: string;
-  projectMode: ProjectMode;
-  provider?: ProviderSelection;
-  detectedCliNames?: TitleGenerationCli[];
-  total: number;
-  success: number;
-  failed: number;
-  skipped?: number;
-  entries: BatchReportEntry[];
-}
-
-export interface RollbackReportEntry {
-  id: string;
-  oldTitle: string;
-  generatedTitle?: string;
-  status: "pending" | "rolled-back" | "failed" | "dry-run" | "skipped" | "skipped-conflict";
-  error?: string;
-}
-
 export async function applyRollbackEntry(
   provider: ConversationProvider,
   entry: RollbackReportEntry,
@@ -693,73 +634,6 @@ export async function applyRollbackEntry(
     entry.status = "failed";
     entry.error = formatTitleActionError(error);
   }
-}
-
-export interface RollbackReport {
-  schemaVersion?: number;
-  command?: "rollback";
-  ok?: boolean;
-  summary?: TitleCliSummary;
-  kind: "rollback";
-  dryRun: boolean;
-  sourceReportPath: string;
-  startedAt: string;
-  finishedAt?: string;
-  durationMs?: number;
-  total: number;
-  success: number;
-  failed: number;
-  skipped: number;
-  entries: RollbackReportEntry[];
-}
-
-function formatBackupDate(date: Date): { day: string; stamp: string } {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  const day = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
-  const stamp = `${day}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
-  return { day, stamp };
-}
-
-async function createTitleReportPath(prefix: string): Promise<string> {
-  const now = new Date();
-  const { day, stamp } = formatBackupDate(now);
-  const dir = join(homedir(), ".backups", "chatlog-viewer-title", day);
-  await mkdir(dir, { recursive: true });
-  return join(dir, `conversation-title-${prefix}-${stamp}.json`);
-}
-
-function synchronizeBatchReport(report: BatchReport): void {
-  const summary = summarizeTitleEntries(report.entries);
-  report.schemaVersion = TITLE_CLI_SCHEMA_VERSION;
-  report.command = "generate-batch";
-  report.summary = summary;
-  report.total = summary.total;
-  report.success = summary.success;
-  report.failed = summary.failed;
-  report.skipped = summary.skipped;
-  report.ok = summary.failed === 0 && !report.entries.some((entry) => entry.status === "pending");
-}
-
-function synchronizeRollbackReport(report: RollbackReport): void {
-  const summary = summarizeTitleEntries(report.entries);
-  report.schemaVersion = TITLE_CLI_SCHEMA_VERSION;
-  report.command = "rollback";
-  report.summary = summary;
-  report.total = summary.total;
-  report.success = summary.success;
-  report.failed = summary.failed;
-  report.skipped = summary.skipped;
-  report.ok = summary.failed === 0 && !report.entries.some((entry) => entry.status === "pending");
-}
-
-async function writeBatchReport(filePath: string, report: BatchReport): Promise<void> {
-  synchronizeBatchReport(report);
-  await writeFile(filePath, formatCliJson(report), "utf-8");
-}
-
-async function writeRollbackReport(filePath: string, report: RollbackReport): Promise<void> {
-  synchronizeRollbackReport(report);
-  await writeFile(filePath, formatCliJson(report), "utf-8");
 }
 
 function printBatchReport(report: BatchReport, reportPath: string, options: CliOptions): void {
@@ -871,30 +745,6 @@ async function generateBatch(context: CliContext, options: CliOptions): Promise<
   await writeBatchReport(reportPath, report);
   printBatchReport(report, reportPath, options);
   return report;
-}
-
-function isRollbackCandidate(entry: BatchReportEntry): boolean {
-  return entry.status === "success" && !!entry.id.trim() && !!entry.oldTitle.trim();
-}
-
-export function buildRollbackEntries(report: BatchReport): RollbackReportEntry[] {
-  return report.entries.map((entry) => {
-    if (!isRollbackCandidate(entry)) {
-      return {
-        id: entry.id,
-        oldTitle: entry.oldTitle,
-        generatedTitle: entry.newTitle,
-        status: "skipped",
-      };
-    }
-
-    return {
-      id: entry.id,
-      oldTitle: entry.oldTitle,
-      generatedTitle: entry.newTitle,
-      status: "pending",
-    };
-  });
 }
 
 async function readBatchReport(filePath: string): Promise<BatchReport> {
@@ -1196,5 +1046,8 @@ if (isMainModule()) {
       console.error(formatTitleActionError(error));
     }
     process.exitCode = 1;
-  }).finally(restoreConsole);
+  }).finally(async () => {
+    await closeCodexAppServerClients();
+    restoreConsole();
+  });
 }

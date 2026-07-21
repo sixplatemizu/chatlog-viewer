@@ -12,7 +12,11 @@ import {
   type IndexedCacheItem,
 } from "../utils/cache.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
-import { ProviderDataError, type ProviderDataErrorKind } from "../utils/errors.js";
+import {
+  ProviderDataError,
+  createProviderDataError,
+  isFileSystemNotFoundError,
+} from "../utils/errors.js";
 import {
   createIndexedListSourceSignature,
   type IndexedSourceFile,
@@ -37,18 +41,6 @@ const Database = require("better-sqlite3") as typeof BetterSqlite3;
 const OPENCODE_RECENT_SESSION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const OPENCODE_INTERNAL_TITLE_PREFIX = "ChatLog Viewer AI Title";
 const OPENCODE_ONE_SHOT_DENY_PERMISSIONS = new Set(["question", "plan_enter", "plan_exit"]);
-
-function classifyOpenCodeDataError(error: unknown): ProviderDataErrorKind {
-  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  if (message.includes("locked") || message.includes("busy")) return "locked";
-  if (message.includes("malformed") || message.includes("corrupt") || message.includes("not a database")) {
-    return "corrupt";
-  }
-  if (message.includes("no such table") || message.includes("no such column")) {
-    return "schema-incompatible";
-  }
-  return "unavailable";
-}
 
 interface OpenCodeSessionRow {
   id: string;
@@ -401,8 +393,9 @@ export class OpenCodeProvider implements ConversationProvider {
     try {
       const dbStat = await stat(this.getDbPath());
       return dbStat.isFile();
-    } catch {
-      return false;
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return false;
+      throw createProviderDataError(this.name, "OpenCode 数据库检测失败", error);
     }
   }
 
@@ -431,13 +424,16 @@ export class OpenCodeProvider implements ConversationProvider {
             mtimeMs: sidecarStat.mtimeMs,
             size: sidecarStat.size,
           });
-        } catch {
-          // sidecar 不存在时只使用主数据库 signature。
+        } catch (error) {
+          if (!isFileSystemNotFoundError(error)) {
+            throw createProviderDataError(this.name, `OpenCode sidecar 读取失败: ${sidecarPath}`, error);
+          }
         }
       }
       return createIndexedListSourceSignature(sourceFiles);
-    } catch {
-      return null;
+    } catch (error) {
+      if (isFileSystemNotFoundError(error)) return null;
+      throw createProviderDataError(this.name, "OpenCode 数据源 signature 读取失败", error);
     }
   }
 
@@ -467,11 +463,10 @@ export class OpenCodeProvider implements ConversationProvider {
     } catch (error) {
       this.readDb = null;
       this.readDbPath = null;
-      throw new ProviderDataError(
+      throw createProviderDataError(
         this.name,
-        classifyOpenCodeDataError(error),
         `OpenCode 数据库无法读取: ${this.getDbPath()}`,
-        { cause: error }
+        error
       );
     }
   }
@@ -550,12 +545,7 @@ export class OpenCodeProvider implements ConversationProvider {
       `).all() as OpenCodeSessionRow[];
       return rows;
     } catch (error) {
-      throw new ProviderDataError(
-        this.name,
-        classifyOpenCodeDataError(error),
-        `OpenCode 会话索引读取失败: ${error instanceof Error ? error.message : String(error)}`,
-        { cause: error }
-      );
+      throw createProviderDataError(this.name, "OpenCode 会话索引读取失败", error);
     }
   }
 
@@ -594,12 +584,7 @@ export class OpenCodeProvider implements ConversationProvider {
         GROUP BY s.id
       `).get(sessionId) as OpenCodeSessionRow | undefined ?? null;
     } catch (error) {
-      throw new ProviderDataError(
-        this.name,
-        classifyOpenCodeDataError(error),
-        `OpenCode 会话读取失败: ${error instanceof Error ? error.message : String(error)}`,
-        { cause: error }
-      );
+      throw createProviderDataError(this.name, "OpenCode 会话读取失败", error);
     }
   }
 

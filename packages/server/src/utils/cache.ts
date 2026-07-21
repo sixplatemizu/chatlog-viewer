@@ -50,6 +50,25 @@ export interface IndexedCacheItem {
   searchChunks?: string[];
 }
 
+export type ConversationIndexSort = "updatedAt" | "createdAt" | "provider";
+
+export interface ConversationIndexQueryOptions {
+  cacheKeys: string[];
+  search?: string;
+  sort?: ConversationIndexSort;
+  modelProviders?: string[];
+  projects?: string[];
+  limit?: number;
+  offset?: number;
+}
+
+export interface ConversationIndexQueryResult {
+  conversations: ConversationMeta[];
+  total: number;
+  providerCounts: Record<string, number>;
+  codexModelProviderCounts: Record<string, number>;
+}
+
 export interface PersistedMessageIdentityEntry {
   mtimeMs: number;
   orderedMessageIds: string[];
@@ -254,6 +273,18 @@ function getDb(): BetterSqlite3.Database {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_index_cache_key
     ON conversation_index (cache_key);
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_index_cache_updated_at
+    ON conversation_index (cache_key, updated_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_index_cache_created_at
+    ON conversation_index (cache_key, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_index_cache_provider_updated_at
+    ON conversation_index (cache_key, provider, updated_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_index_cache_model_provider
+    ON conversation_index (cache_key, model_provider);
 
     CREATE INDEX IF NOT EXISTS idx_conversation_search_chunk_cache_key
     ON conversation_search_chunk (cache_key);
@@ -1272,86 +1303,154 @@ export function deletePersistedCodexMessageIdentity(filePath: string): void {
   }
 }
 
-export function queryConversationIndex(options: {
-  cacheKeys: string[];
-  search?: string;
-  sort?: "updatedAt" | "createdAt" | "provider";
-}): ConversationMeta[] {
-  if (options.cacheKeys.length === 0) return [];
+function buildConversationIndexWhere(
+  options: ConversationIndexQueryOptions,
+  includeModelProviderFilter: boolean
+): { sql: string; params: Array<string | number> } {
+  const whereClauses: string[] = [];
+  const params: Array<string | number> = [];
+
+  const cacheKeyPlaceholders = options.cacheKeys.map(() => "?").join(", ");
+  whereClauses.push(`conversation_index.cache_key IN (${cacheKeyPlaceholders})`);
+  params.push(...options.cacheKeys);
+
+  if (options.projects !== undefined) {
+    if (options.projects.length === 0) {
+      whereClauses.push("0 = 1");
+    } else {
+      const placeholders = options.projects.map(() => "?").join(", ");
+      whereClauses.push(`(
+        conversation_index.project IN (${placeholders})
+        OR conversation_index.project_key IN (${placeholders})
+        OR conversation_index.project_id IN (${placeholders})
+      )`);
+      params.push(...options.projects, ...options.projects, ...options.projects);
+    }
+  }
+
+  if (options.search) {
+    whereClauses.push("conversation_index.search_version = ?");
+    params.push(SEARCH_INDEX_VERSION);
+
+    const ftsQuery = buildFtsSearchQuery(options.search);
+    if (ftsQuery && (supportsConversationFtsSearch || supportsChunkFtsSearch)) {
+      const searchClauses: string[] = [];
+      if (supportsConversationFtsSearch) {
+        searchClauses.push(`
+          EXISTS (
+            SELECT 1
+            FROM conversation_index_fts
+            WHERE conversation_index_fts.rowid = conversation_index.rowid
+              AND conversation_index_fts MATCH ?
+          )
+        `);
+        params.push(ftsQuery);
+      }
+      if (supportsChunkFtsSearch) {
+        searchClauses.push(`
+          EXISTS (
+            SELECT 1
+            FROM conversation_search_chunk_fts
+            JOIN conversation_search_chunk
+              ON conversation_search_chunk.rowid = conversation_search_chunk_fts.rowid
+            WHERE conversation_search_chunk.conversation_id = conversation_index.id
+              AND conversation_search_chunk.cache_key = conversation_index.cache_key
+              AND conversation_search_chunk.search_version = conversation_index.search_version
+              AND conversation_search_chunk_fts MATCH ?
+          )
+        `);
+        params.push(ftsQuery);
+      }
+
+      whereClauses.push(`(${searchClauses.join(" OR ")})`);
+    } else {
+      const lowerPattern = buildLikePattern(options.search);
+      whereClauses.push(`
+        (
+          LOWER(conversation_index.title) LIKE ?
+          OR LOWER(conversation_index.project) LIKE ?
+          OR LOWER(COALESCE(conversation_index.search_text, '')) LIKE ?
+          OR EXISTS (
+            SELECT 1
+            FROM conversation_search_chunk
+            WHERE conversation_search_chunk.conversation_id = conversation_index.id
+              AND conversation_search_chunk.cache_key = conversation_index.cache_key
+              AND conversation_search_chunk.search_version = conversation_index.search_version
+              AND LOWER(conversation_search_chunk.content) LIKE ?
+          )
+        )
+      `);
+      params.push(lowerPattern, lowerPattern, lowerPattern, lowerPattern);
+    }
+  }
+
+  if (includeModelProviderFilter && options.modelProviders !== undefined) {
+    if (options.modelProviders.length === 0) {
+      whereClauses.push(`(
+        conversation_index.provider <> 'codex'
+        OR conversation_index.model_provider IS NULL
+        OR conversation_index.model_provider = ''
+      )`);
+    } else {
+      const placeholders = options.modelProviders.map(() => "?").join(", ");
+      whereClauses.push(`(
+        conversation_index.provider <> 'codex'
+        OR conversation_index.model_provider IS NULL
+        OR conversation_index.model_provider = ''
+        OR conversation_index.model_provider IN (${placeholders})
+      )`);
+      params.push(...options.modelProviders);
+    }
+  }
+
+  return {
+    sql: whereClauses.join(" AND "),
+    params,
+  };
+}
+
+function getConversationIndexOrderBy(sort: ConversationIndexSort | undefined): string {
+  if (sort === "createdAt") {
+    return "conversation_index.created_at DESC";
+  }
+  if (sort === "provider") {
+    return "conversation_index.provider ASC, conversation_index.updated_at DESC";
+  }
+  return "conversation_index.updated_at DESC";
+}
+
+export function queryConversationIndexPage(
+  options: ConversationIndexQueryOptions
+): ConversationIndexQueryResult {
+  if (options.cacheKeys.length === 0) {
+    return {
+      conversations: [],
+      total: 0,
+      providerCounts: {},
+      codexModelProviderCounts: {},
+    };
+  }
 
   try {
     const database = getDb();
-    const whereClauses: string[] = [];
-    const params: Array<string | number> = [];
+    const baseWhere = buildConversationIndexWhere(options, false);
+    const filteredWhere = buildConversationIndexWhere(options, true);
+    const limit = options.limit === undefined
+      ? undefined
+      : Math.max(0, Math.floor(options.limit));
+    const offset = Math.max(0, Math.floor(options.offset ?? 0));
+    const pageParams = [...filteredWhere.params];
+    let pageClause = "";
 
-    const cacheKeyPlaceholders = options.cacheKeys.map(() => "?").join(", ");
-    whereClauses.push(`conversation_index.cache_key IN (${cacheKeyPlaceholders})`);
-    params.push(...options.cacheKeys);
-
-    if (options.search) {
-      whereClauses.push("conversation_index.search_version = ?");
-      params.push(SEARCH_INDEX_VERSION);
-
-      const ftsQuery = buildFtsSearchQuery(options.search);
-      if (ftsQuery && (supportsConversationFtsSearch || supportsChunkFtsSearch)) {
-        const searchClauses: string[] = [];
-        if (supportsConversationFtsSearch) {
-          searchClauses.push(`
-            EXISTS (
-              SELECT 1
-              FROM conversation_index_fts
-              WHERE conversation_index_fts.rowid = conversation_index.rowid
-                AND conversation_index_fts MATCH ?
-            )
-          `);
-          params.push(ftsQuery);
-        }
-        if (supportsChunkFtsSearch) {
-          searchClauses.push(`
-            EXISTS (
-              SELECT 1
-              FROM conversation_search_chunk_fts
-              JOIN conversation_search_chunk
-                ON conversation_search_chunk.rowid = conversation_search_chunk_fts.rowid
-              WHERE conversation_search_chunk.conversation_id = conversation_index.id
-                AND conversation_search_chunk.cache_key = conversation_index.cache_key
-                AND conversation_search_chunk.search_version = conversation_index.search_version
-                AND conversation_search_chunk_fts MATCH ?
-            )
-          `);
-          params.push(ftsQuery);
-        }
-
-        whereClauses.push(`(${searchClauses.join(" OR ")})`);
-      } else {
-        const lowerPattern = buildLikePattern(options.search);
-        whereClauses.push(`
-          (
-            LOWER(conversation_index.title) LIKE ?
-            OR LOWER(conversation_index.project) LIKE ?
-            OR LOWER(COALESCE(conversation_index.search_text, '')) LIKE ?
-            OR EXISTS (
-              SELECT 1
-              FROM conversation_search_chunk
-              WHERE conversation_search_chunk.conversation_id = conversation_index.id
-                AND conversation_search_chunk.cache_key = conversation_index.cache_key
-                AND conversation_search_chunk.search_version = conversation_index.search_version
-                AND LOWER(conversation_search_chunk.content) LIKE ?
-            )
-          )
-        `);
-        params.push(lowerPattern, lowerPattern, lowerPattern, lowerPattern);
-      }
+    if (limit !== undefined) {
+      pageClause = "LIMIT ? OFFSET ?";
+      pageParams.push(limit, offset);
+    } else if (offset > 0) {
+      pageClause = "LIMIT -1 OFFSET ?";
+      pageParams.push(offset);
     }
 
-    let orderBy = "conversation_index.updated_at DESC";
-    if (options.sort === "createdAt") {
-      orderBy = "conversation_index.created_at DESC";
-    } else if (options.sort === "provider") {
-      orderBy = "conversation_index.provider ASC, conversation_index.updated_at DESC";
-    }
-
-    const sql = `
+    const rows = database.prepare(`
       SELECT
         conversation_index.id,
         conversation_index.provider,
@@ -1368,32 +1467,55 @@ export function queryConversationIndex(options: {
         conversation_index.model_provider,
         conversation_index.meta_json
       FROM conversation_index
-      WHERE ${whereClauses.join(" AND ")}
-      ORDER BY ${orderBy}
-    `;
+      WHERE ${filteredWhere.sql}
+      ORDER BY ${getConversationIndexOrderBy(options.sort)}
+      ${pageClause}
+    `).all(...pageParams) as ConversationIndexRow[];
 
-    const rows = database.prepare(sql).all(...params) as Array<{
-      id: string;
-      provider: string;
-      title: string;
-      search_text: string | null;
-      project: string;
-      project_key: string;
-      project_id: string | null;
-      created_at: number;
-      updated_at: number;
-      message_count: number;
-      file_size: number;
-      file_path: string;
-      model_provider: string | null;
-      meta_json: string | null;
-    }>;
+    const providerRows = database.prepare(`
+      SELECT conversation_index.provider, COUNT(*) AS count
+      FROM conversation_index
+      WHERE ${filteredWhere.sql}
+      GROUP BY conversation_index.provider
+    `).all(...filteredWhere.params) as Array<{ provider: string; count: number }>;
+    const providerCounts = Object.fromEntries(
+      providerRows.map((row) => [row.provider, row.count])
+    );
+    const total = providerRows.reduce((sum, row) => sum + row.count, 0);
 
-    return rows.map((row) => buildConversationMetaFromIndexRow(row));
+    const modelProviderRows = database.prepare(`
+      SELECT conversation_index.model_provider, COUNT(*) AS count
+      FROM conversation_index
+      WHERE ${baseWhere.sql}
+        AND conversation_index.provider = 'codex'
+        AND conversation_index.model_provider IS NOT NULL
+        AND conversation_index.model_provider <> ''
+      GROUP BY conversation_index.model_provider
+    `).all(...baseWhere.params) as Array<{ model_provider: string; count: number }>;
+
+    return {
+      conversations: rows.map((row) => buildConversationMetaFromIndexRow(row)),
+      total,
+      providerCounts,
+      codexModelProviderCounts: Object.fromEntries(
+        modelProviderRows.map((row) => [row.model_provider, row.count])
+      ),
+    };
   } catch (error) {
-    console.error(`[cache] queryConversationIndex error:`, error);
-    return [];
+    console.error(`[cache] queryConversationIndexPage error:`, error);
+    return {
+      conversations: [],
+      total: 0,
+      providerCounts: {},
+      codexModelProviderCounts: {},
+    };
   }
+}
+
+export function queryConversationIndex(
+  options: ConversationIndexQueryOptions
+): ConversationMeta[] {
+  return queryConversationIndexPage(options).conversations;
 }
 
 function pruneCacheStorage(database: BetterSqlite3.Database): void {
