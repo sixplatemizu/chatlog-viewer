@@ -516,6 +516,7 @@ export class OpenCodeProvider implements ConversationProvider {
     const db = this.getReadDb();
 
     try {
+      // 列表体积用批量聚合（非 per-session N+1），与 findSessionRow 口径一致：message.data + part.data
       const rows = db.prepare(`
         SELECT
           s.id,
@@ -531,7 +532,7 @@ export class OpenCodeProvider implements ConversationProvider {
           p.worktree AS project_worktree,
           p.name AS project_name,
           COALESCE(m.message_count, 0) AS message_count,
-          0 AS data_size
+          COALESCE(sz.data_size, 0) AS data_size
         FROM session s
         LEFT JOIN project p ON p.id = s.project_id
         LEFT JOIN (
@@ -541,6 +542,19 @@ export class OpenCodeProvider implements ConversationProvider {
           FROM message
           GROUP BY session_id
         ) m ON m.session_id = s.id
+        LEFT JOIN (
+          SELECT
+            session_id,
+            SUM(blob_size) AS data_size
+          FROM (
+            SELECT session_id, length(CAST(data AS BLOB)) AS blob_size
+            FROM message
+            UNION ALL
+            SELECT session_id, length(CAST(data AS BLOB)) AS blob_size
+            FROM part
+          )
+          GROUP BY session_id
+        ) sz ON sz.session_id = s.id
         ORDER BY s.time_updated DESC
       `).all() as OpenCodeSessionRow[];
       return rows;
