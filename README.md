@@ -22,7 +22,7 @@
 | Claude Code | JSONL transcript、`sessions-index.json`、`history.jsonl` | 支持 | 按 `/rename` 语义写回 transcript + index | 支持 | 支持 | `~/.claude/projects` |
 | Codex | JSONL transcript、`state_5.sqlite`、`session_index.jsonl` | 支持 | 通过 app-server 写回原生 title + thread name | 支持 | 支持 | `~/.codex/sessions` |
 | Codex state db | `threads` / `conversation_index` | 支持 metadata-only 回填 | 与 Codex 同步 | 不适用于 metadata-only | 支持残留清理 | `~/.codex/state_5.sqlite` |
-| OpenCode | SQLite `session` / `message` / `part` | 支持 | 原生写回 `session.title` | 暂不支持 | 支持 | `~/.local/share/opencode/opencode.db` |
+| OpenCode | SQLite `session` / `message` / `part` | 支持 | 原生写回 `session.title` | 支持（纯文本 part；保留 tool/reasoning） | 支持 | `~/.local/share/opencode/opencode.db` |
 | iFlow CLI | JSONL transcript | 支持 | 暂禁用，缺少稳定原生标题字段 | 支持 | 支持 | `~/.iflow/projects` |
 
 ### 列表语义
@@ -249,10 +249,11 @@ skills/
 └── chatlog-viewer-title/   # Codex 中调用三 provider 标题 CLI 的 skill
 ```
 
-## TODO
+## 已知限制与后续
 
-- OpenCode 消息编辑 / 删除：先搁置为后续任务。推荐方案是按 SQLite `part` 级别实现可见消息的编辑 / 删除，避免默认删除整条 `message` 时连带影响 tool、reasoning、step-finish 等结构。
-- OpenCode schema 兼容：后续实现消息级操作时，需要同时考虑 legacy `message` / `part` 和新版 `session_message` 投影的长期兼容。
+- OpenCode 消息编辑 / 删除仅作用于可见纯文本 `part`；tool、reasoning 等结构故意不可改，避免破坏回放。
+- OpenCode 新版 `session_message` 投影表尚未适配；当前主路径为 legacy `message` + `part`。
+- 大模块拆分（`claude-code.ts` / `codex.ts` / `cache`）属于可维护性优化，不阻塞日常使用。
 
 ## 开发说明
 
