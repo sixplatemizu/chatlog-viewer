@@ -13,10 +13,12 @@ import {
 } from "../utils/cache.js";
 import { getProviderPaths } from "../utils/provider-paths.js";
 import {
+  MutationConflictError,
   ProviderDataError,
   createProviderDataError,
   isFileSystemNotFoundError,
 } from "../utils/errors.js";
+import { runKeyedMutation } from "../utils/mutation-queue.js";
 import {
   createIndexedListSourceSignature,
   type IndexedSourceFile,
@@ -390,7 +392,7 @@ export class OpenCodeProvider implements ConversationProvider {
     canDeleteMessage: true,
     canMoveConversation: true,
     canDeleteConversation: true,
-    supportsMetadataOnly: false,
+    supportsMetadataOnly: true,
   } as const;
 
   private readDb: BetterSqlite3.Database | null = null;
@@ -625,6 +627,7 @@ export class OpenCodeProvider implements ConversationProvider {
     const project = resolveProjectPath(row);
     const projectKey = canonicalizeProjectPath(project) || row.project_id;
 
+    const messageCount = Number(row.message_count) || 0;
     const meta: ConversationMeta = {
       id: `opencode:${row.id}`,
       provider: this.name,
@@ -634,10 +637,11 @@ export class OpenCodeProvider implements ConversationProvider {
       projectId: projectKey,
       createdAt,
       updatedAt,
-      messageCount: Number(row.message_count) || 0,
+      messageCount,
       fileSize: Number(row.data_size) || 0,
       filePath: buildSessionFilePath(dbPath, row.id),
-      contentStatus: "full",
+      // 无 message 行的会话仅有 session 元数据
+      contentStatus: messageCount > 0 ? "full" : "metadata-only",
       badges: buildOpenCodeBadges(row, updatedAt),
     };
 
@@ -911,6 +915,10 @@ export class OpenCodeProvider implements ConversationProvider {
     invalidateListCache(this.getListCacheKey());
   }
 
+  private mutationKey(sessionId: string): string {
+    return `opencode:session:${sessionId}`;
+  }
+
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
     const sessionId = id.replace("opencode:", "");
     const normalizedContent = normalizeUpdatedMessageContent(content);
@@ -918,22 +926,31 @@ export class OpenCodeProvider implements ConversationProvider {
       throw new Error(`对话不存在: ${id}`);
     }
 
-    const db = this.getWriteDb();
-    try {
-      const now = Date.now();
-      db.transaction(() => {
-        const part = this.resolveEditableTextPart(db, sessionId, messageId);
-        const data = parseJsonObject<OpenCodePartData>(part.data) ?? {};
-        const nextData = setPartText(data, normalizedContent);
-        db.prepare("UPDATE part SET data = ?, time_updated = ? WHERE id = ? AND session_id = ?")
-          .run(JSON.stringify(nextData), now, part.id, sessionId);
-        db.prepare("UPDATE message SET time_updated = ? WHERE id = ? AND session_id = ?")
-          .run(now, part.message_id, sessionId);
-        this.touchSession(db, sessionId, now);
-      })();
-    } finally {
-      db.close();
-    }
+    await runKeyedMutation(this.mutationKey(sessionId), async () => {
+      const db = this.getWriteDb();
+      try {
+        const now = Date.now();
+        db.transaction(() => {
+          const part = this.resolveEditableTextPart(db, sessionId, messageId);
+          const data = parseJsonObject<OpenCodePartData>(part.data) ?? {};
+          const nextData = setPartText(data, normalizedContent);
+          // 条件更新：外部进程改过 time_updated 则 409
+          const result = db.prepare(`
+            UPDATE part
+            SET data = ?, time_updated = ?
+            WHERE id = ? AND session_id = ? AND time_updated = ?
+          `).run(JSON.stringify(nextData), now, part.id, sessionId, part.time_updated);
+          if (result.changes === 0) {
+            throw new MutationConflictError(`消息已被其他进程修改，请刷新后重试: ${messageId}`);
+          }
+          db.prepare("UPDATE message SET time_updated = ? WHERE id = ? AND session_id = ?")
+            .run(now, part.message_id, sessionId);
+          this.touchSession(db, sessionId, now);
+        })();
+      } finally {
+        db.close();
+      }
+    });
 
     this.invalidateSessionCaches(sessionId);
   }
@@ -952,35 +969,43 @@ export class OpenCodeProvider implements ConversationProvider {
       throw new Error(`对话不存在: ${id}`);
     }
 
-    const db = this.getWriteDb();
-    try {
-      const now = Date.now();
-      db.transaction(() => {
-        const parentMessageIds = new Set<string>();
-        for (const messageId of uniqueMessageIds) {
-          const part = this.resolveEditableTextPart(db, sessionId, messageId);
-          parentMessageIds.add(part.message_id);
-          db.prepare("DELETE FROM part WHERE id = ? AND session_id = ?").run(part.id, sessionId);
-        }
-
-        for (const parentMessageId of parentMessageIds) {
-          const remaining = db.prepare(
-            "SELECT COUNT(*) AS count FROM part WHERE message_id = ? AND session_id = ?"
-          ).get(parentMessageId, sessionId) as { count: number };
-          if (remaining.count === 0) {
-            db.prepare("DELETE FROM message WHERE id = ? AND session_id = ?")
-              .run(parentMessageId, sessionId);
-          } else {
-            db.prepare("UPDATE message SET time_updated = ? WHERE id = ? AND session_id = ?")
-              .run(now, parentMessageId, sessionId);
+    await runKeyedMutation(this.mutationKey(sessionId), async () => {
+      const db = this.getWriteDb();
+      try {
+        const now = Date.now();
+        db.transaction(() => {
+          const parentMessageIds = new Set<string>();
+          for (const messageId of uniqueMessageIds) {
+            const part = this.resolveEditableTextPart(db, sessionId, messageId);
+            parentMessageIds.add(part.message_id);
+            const result = db.prepare(`
+              DELETE FROM part
+              WHERE id = ? AND session_id = ? AND time_updated = ?
+            `).run(part.id, sessionId, part.time_updated);
+            if (result.changes === 0) {
+              throw new MutationConflictError(`消息已被其他进程修改，请刷新后重试: ${messageId}`);
+            }
           }
-        }
 
-        this.touchSession(db, sessionId, now);
-      })();
-    } finally {
-      db.close();
-    }
+          for (const parentMessageId of parentMessageIds) {
+            const remaining = db.prepare(
+              "SELECT COUNT(*) AS count FROM part WHERE message_id = ? AND session_id = ?"
+            ).get(parentMessageId, sessionId) as { count: number };
+            if (remaining.count === 0) {
+              db.prepare("DELETE FROM message WHERE id = ? AND session_id = ?")
+                .run(parentMessageId, sessionId);
+            } else {
+              db.prepare("UPDATE message SET time_updated = ? WHERE id = ? AND session_id = ?")
+                .run(now, parentMessageId, sessionId);
+            }
+          }
+
+          this.touchSession(db, sessionId, now);
+        })();
+      } finally {
+        db.close();
+      }
+    });
 
     this.invalidateSessionCaches(sessionId);
   }

@@ -831,6 +831,168 @@ test("OpenCode 会从 SQLite 构建列表、详情和搜索索引", async () => 
   }
 });
 
+test("OpenCode 无 message 的会话标记为 metadata-only", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-metadata-only-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+  const sessionId = "ses_opencode_meta_only";
+  const now = Date.now();
+  let provider: OpenCodeProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      createOpenCodeSchema(db);
+      db.prepare(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?)"
+      ).run("proj-meta", "/", "chatlog-viewer", now, now);
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sessionId,
+        "proj-meta",
+        null,
+        "meta-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 空壳会话",
+        "1.14.30",
+        now,
+        now,
+        null,
+        null
+      );
+    } finally {
+      db.close();
+    }
+
+    provider = new OpenCodeProvider();
+    assert.equal(provider.capabilities.supportsMetadataOnly, true);
+    const conversations = await provider.list();
+    assert.equal(conversations.length, 1);
+    assert.equal(conversations[0]?.contentStatus, "metadata-only");
+    assert.equal(conversations[0]?.messageCount, 0);
+
+    const detail = await provider.read(`opencode:${sessionId}`);
+    assert.equal(detail.contentStatus, "metadata-only");
+    assert.equal(detail.messages.length, 0);
+  } finally {
+    provider?.closeDb();
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      }
+
+      if (previousDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
+      }
+    });
+  }
+});
+
+test("OpenCode 消息并发修改会返回 409", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-message-conflict-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+  const sessionId = "ses_opencode_conflict";
+  const now = Date.now();
+  let provider: OpenCodeProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      createOpenCodeSchema(db);
+      db.prepare(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?)"
+      ).run("proj-conflict", "/", "chatlog-viewer", now, now);
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sessionId,
+        "proj-conflict",
+        null,
+        "conflict-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 冲突会话",
+        "1.14.30",
+        now,
+        now,
+        null,
+        null
+      );
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run("msg_conflict", sessionId, now, now, JSON.stringify({ role: "user" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_conflict", "msg_conflict", sessionId, now, now, JSON.stringify({ type: "text", text: "原始内容" }));
+    } finally {
+      db.close();
+    }
+
+    provider = new OpenCodeProvider();
+    // 注入陈旧 revision，验证条件更新失败时返回 409
+    const resolve = (provider as unknown as {
+      resolveEditableTextPart: (
+        db: BetterSqlite3.Database,
+        sessionId: string,
+        messageId: string
+      ) => { id: string; message_id: string; session_id: string; time_created: number; time_updated: number; data: string };
+    }).resolveEditableTextPart.bind(provider);
+    (provider as unknown as { resolveEditableTextPart: typeof resolve }).resolveEditableTextPart = (
+      db,
+      targetSessionId,
+      messageId
+    ) => {
+      const part = resolve(db, targetSessionId, messageId);
+      return { ...part, time_updated: part.time_updated - 1 };
+    };
+
+    await assert.rejects(
+      () => provider!.updateMessage(`opencode:${sessionId}`, "prt_conflict", "应冲突"),
+      (error: unknown) => {
+        assert.equal((error as { status?: number }).status, 409);
+        assert.match(String((error as Error).message), /已被其他进程修改|刷新后重试/);
+        return true;
+      }
+    );
+  } finally {
+    provider?.closeDb();
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      }
+
+      if (previousDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
+      }
+    });
+  }
+});
+
 test("OpenCode 支持文本 part 编辑/删除且保留 tool part", async () => {
   const fixture = await createBaseFixture("chatlog-viewer-opencode-message-edit-");
   const storagePath = join(fixture.baseDir, "opencode");
