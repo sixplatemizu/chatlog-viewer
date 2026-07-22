@@ -806,10 +806,136 @@ test("OpenCode 会从 SQLite 构建列表、详情和搜索索引", async () => 
     const detail = await provider.read(`opencode:${sessionId}`);
     assert.equal(detail.messages.length, 3);
     assert.equal(detail.messages[0]?.role, "user");
+    assert.equal(detail.messages[0]?.messageId, "prt_user_text");
     assert.equal(detail.messages[0]?.content, `请搜索 ${needle}`);
+    assert.equal(detail.messages[1]?.messageId, "prt_assistant_text");
     assert.equal(detail.messages[2]?.role, "tool");
+    assert.equal(detail.messages[2]?.messageId, "prt_tool");
     assert.equal(detail.messages[2]?.toolName, "read");
     assert.match(detail.messages[2]?.toolInput ?? "", /src\/app\.ts/);
+  } finally {
+    provider?.closeDb();
+    await fixture.cleanup(() => {
+      if (previousStoragePath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_PATH = previousStoragePath;
+      }
+
+      if (previousDbPath === undefined) {
+        delete process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+      } else {
+        process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = previousDbPath;
+      }
+    });
+  }
+});
+
+test("OpenCode 支持文本 part 编辑/删除且保留 tool part", async () => {
+  const fixture = await createBaseFixture("chatlog-viewer-opencode-message-edit-");
+  const storagePath = join(fixture.baseDir, "opencode");
+  const dbPath = join(storagePath, "opencode.db");
+  const previousStoragePath = process.env.CHATLOG_VIEWER_OPENCODE_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH;
+  const sessionId = "ses_opencode_edit";
+  const userMessageId = "msg_user";
+  const assistantMessageId = "msg_assistant";
+  const now = Date.now();
+  let provider: OpenCodeProvider | null = null;
+
+  try {
+    process.env.CHATLOG_VIEWER_OPENCODE_PATH = storagePath;
+    process.env.CHATLOG_VIEWER_OPENCODE_DB_PATH = dbPath;
+    clearProviderPathCache();
+
+    await mkdir(storagePath, { recursive: true });
+    const db = new Database(dbPath);
+    try {
+      createOpenCodeSchema(db);
+      db.prepare(
+        "INSERT INTO project (id, worktree, name, time_created, time_updated) VALUES (?, ?, ?, ?, ?)"
+      ).run("proj-edit", "/", "chatlog-viewer", now, now);
+      db.prepare(
+        `INSERT INTO session (
+          id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        sessionId,
+        "proj-edit",
+        null,
+        "edit-session",
+        "C:/Users/tester/Desktop/code_area/chatlog-viewer",
+        "OpenCode 编辑会话",
+        "1.14.30",
+        now - 10_000,
+        now,
+        null,
+        null
+      );
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run(userMessageId, sessionId, now - 9_000, now - 9_000, JSON.stringify({ role: "user" }));
+      db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)")
+        .run(assistantMessageId, sessionId, now - 8_000, now - 8_000, JSON.stringify({ role: "assistant" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_user", userMessageId, sessionId, now - 9_000, now - 9_000, JSON.stringify({ type: "text", text: "第一条消息" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run("prt_assistant", assistantMessageId, sessionId, now - 8_000, now - 8_000, JSON.stringify({ type: "text", text: "第二条消息" }));
+      db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(
+          "prt_tool_keep",
+          assistantMessageId,
+          sessionId,
+          now - 7_500,
+          now - 7_500,
+          JSON.stringify({
+            type: "tool",
+            tool: "bash",
+            state: { input: { command: "ls" }, output: "ok", status: "completed" },
+          })
+        );
+    } finally {
+      db.close();
+    }
+
+    provider = new OpenCodeProvider();
+    assert.equal(provider.capabilities.canEditMessage, true);
+    assert.equal(provider.capabilities.canDeleteMessage, true);
+
+    const initial = await provider.read(`opencode:${sessionId}`);
+    assert.equal(initial.messages.length, 3);
+    assert.equal(initial.messages[0]?.messageId, "prt_user");
+    assert.equal(initial.messages[1]?.messageId, "prt_assistant");
+    assert.equal(initial.messages[2]?.messageId, "prt_tool_keep");
+
+    await provider.updateMessage(`opencode:${sessionId}`, "prt_assistant", "第二条消息-第一次编辑");
+    await provider.updateMessage(`opencode:${sessionId}`, "prt_assistant", "第二条消息-第二次编辑");
+    await provider.deleteMessages(`opencode:${sessionId}`, ["prt_user"]);
+    await provider.updateMessage(`opencode:${sessionId}`, "prt_assistant", "第二条消息-删除后再次编辑");
+
+    await assert.rejects(
+      () => provider!.updateMessage(`opencode:${sessionId}`, "prt_tool_keep", "不应允许"),
+      /仅支持编辑纯文本消息/
+    );
+
+    const updated = await provider.read(`opencode:${sessionId}`);
+    assert.equal(updated.messages.length, 2);
+    assert.equal(updated.messages[0]?.messageId, "prt_assistant");
+    assert.equal(updated.messages[0]?.content, "第二条消息-删除后再次编辑");
+    assert.equal(updated.messages[1]?.role, "tool");
+    assert.equal(updated.messages[1]?.toolName, "bash");
+
+    // 空 message 行已清理；assistant message 因仍有 tool part 保留
+    const verifyDb = new Database(dbPath, { readonly: true });
+    try {
+      const userMessage = verifyDb.prepare("SELECT id FROM message WHERE id = ?").get(userMessageId);
+      const assistantMessage = verifyDb.prepare("SELECT id FROM message WHERE id = ?").get(assistantMessageId);
+      const toolPart = verifyDb.prepare("SELECT id FROM part WHERE id = ?").get("prt_tool_keep");
+      assert.equal(userMessage, undefined);
+      assert.ok(assistantMessage);
+      assert.ok(toolPart);
+    } finally {
+      verifyDb.close();
+    }
   } finally {
     provider?.closeDb();
     await fixture.cleanup(() => {

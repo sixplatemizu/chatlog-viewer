@@ -25,6 +25,7 @@ import {
   createConversationSearchIndexBuilder,
   type ConversationSearchIndex,
 } from "../utils/search-index.js";
+import { normalizeUpdatedMessageContent } from "../utils/message-actions.js";
 import type {
   Conversation,
   ConversationBadge,
@@ -226,6 +227,23 @@ function isToolPart(data: OpenCodePartData): boolean {
     || data.state?.error !== undefined;
 }
 
+function isEditableTextPart(data: OpenCodePartData): boolean {
+  if (isToolPart(data) || data.type === "reasoning") return false;
+  if (data.type === "text" || data.type === "text-delta") return true;
+  // 无 type 但有文本字段时，按可见文本 part 处理
+  return !data.type && extractPartText(data).length > 0;
+}
+
+function setPartText(data: OpenCodePartData, content: string): OpenCodePartData {
+  if (typeof data.text === "string" || data.text === undefined) {
+    return { ...data, type: data.type ?? "text", text: content };
+  }
+  if (typeof data.content === "string") {
+    return { ...data, type: data.type ?? "text", content };
+  }
+  return { ...data, type: data.type ?? "text", text: content };
+}
+
 function buildToolMessage(part: OpenCodePartRow, data: OpenCodePartData): Message {
   const toolInput = formatUnknown(data.state?.input);
   const toolResult = formatUnknown(data.state?.error ?? data.state?.output);
@@ -259,37 +277,37 @@ function buildMessagesFromRows(
     if (messageData.summary) continue;
 
     const role = normalizeMessageRole(messageData.role);
-    const textParts: string[] = [];
     const toolMessages: Message[] = [];
 
     for (const part of partsByMessageId.get(row.id) ?? []) {
       const partData = parseJsonObject<OpenCodePartData>(part.data) ?? {};
-      const text = extractPartText(partData);
-      if (text.trim() && partData.type !== "reasoning") {
-        textParts.push(text);
-      }
       if (isToolPart(partData)) {
         toolMessages.push(buildToolMessage(part, partData));
+        continue;
       }
-    }
+      if (partData.type === "reasoning") continue;
 
-    const content = textParts.join("\n").trim();
-    if (content && role !== "tool") {
-      messages.push({
-        messageId: row.id,
-        role,
-        content,
-        timestamp: normalizeTimestamp(row.time_updated ?? row.time_created, Date.now()),
-      });
-    } else if (content && role === "tool") {
-      messages.push({
-        messageId: row.id,
-        role: "tool",
-        content,
-        timestamp: normalizeTimestamp(row.time_updated ?? row.time_created, Date.now()),
-        toolName: "tool",
-        toolResult: content,
-      });
+      const text = extractPartText(partData).trim();
+      if (!text) continue;
+
+      // UI messageId 绑定 part 主键，支持 part 级编辑/删除
+      if (role === "tool") {
+        messages.push({
+          messageId: part.id,
+          role: "tool",
+          content: text,
+          timestamp: normalizeTimestamp(part.time_updated ?? part.time_created, Date.now()),
+          toolName: "tool",
+          toolResult: text,
+        });
+      } else {
+        messages.push({
+          messageId: part.id,
+          role,
+          content: text,
+          timestamp: normalizeTimestamp(part.time_updated ?? part.time_created, Date.now()),
+        });
+      }
     }
 
     messages.push(...toolMessages);
@@ -368,13 +386,11 @@ export class OpenCodeProvider implements ConversationProvider {
     titleSyncMode: "native",
     canUpdateTitle: true,
     canGenerateTitle: true,
-    canEditMessage: false,
-    canDeleteMessage: false,
+    canEditMessage: true,
+    canDeleteMessage: true,
     canMoveConversation: true,
     canDeleteConversation: true,
     supportsMetadataOnly: false,
-    editMessageDisabledReason: "OpenCode 消息由 message/part 多表结构组成，当前未开放安全编辑",
-    deleteMessageDisabledReason: "OpenCode 消息由 message/part 多表结构组成，当前未开放安全删除",
   } as const;
 
   private readDb: BetterSqlite3.Database | null = null;
@@ -845,6 +861,128 @@ export class OpenCodeProvider implements ConversationProvider {
     const sessionFilePath = buildSessionFilePath(this.getDbPath(), sessionId);
     invalidateCache(sessionFilePath);
     invalidateListCache(this.getListCacheKey());
+  }
+
+  private resolveEditableTextPart(
+    db: BetterSqlite3.Database,
+    sessionId: string,
+    messageId: string
+  ): OpenCodePartRow {
+    const byPartId = db.prepare(`
+      SELECT id, message_id, session_id, time_created, time_updated, data
+      FROM part
+      WHERE id = ? AND session_id = ?
+    `).get(messageId, sessionId) as OpenCodePartRow | undefined;
+
+    if (byPartId) {
+      const data = parseJsonObject<OpenCodePartData>(byPartId.data) ?? {};
+      if (!isEditableTextPart(data)) {
+        throw new Error(`仅支持编辑纯文本消息: ${messageId}`);
+      }
+      return byPartId;
+    }
+
+    // 兼容旧 UI：messageId 曾绑定 message.id（单 text part 时）
+    const byMessageId = db.prepare(`
+      SELECT id, message_id, session_id, time_created, time_updated, data
+      FROM part
+      WHERE message_id = ? AND session_id = ?
+      ORDER BY time_created ASC, id ASC
+    `).all(messageId, sessionId) as OpenCodePartRow[];
+    const editable = byMessageId.filter((part) => {
+      const data = parseJsonObject<OpenCodePartData>(part.data) ?? {};
+      return isEditableTextPart(data);
+    });
+    if (editable.length === 1) {
+      return editable[0]!;
+    }
+    if (editable.length > 1) {
+      throw new Error(`消息包含多个文本片段，请使用 partId 定位: ${messageId}`);
+    }
+    throw new Error(`消息不存在: ${messageId}`);
+  }
+
+  private touchSession(db: BetterSqlite3.Database, sessionId: string, now: number): void {
+    db.prepare("UPDATE session SET time_updated = ? WHERE id = ?").run(now, sessionId);
+  }
+
+  private invalidateSessionCaches(sessionId: string): void {
+    invalidateCache(buildSessionFilePath(this.getDbPath(), sessionId));
+    invalidateListCache(this.getListCacheKey());
+  }
+
+  async updateMessage(id: string, messageId: string, content: string): Promise<void> {
+    const sessionId = id.replace("opencode:", "");
+    const normalizedContent = normalizeUpdatedMessageContent(content);
+    if (!this.findSessionRow(sessionId)) {
+      throw new Error(`对话不存在: ${id}`);
+    }
+
+    const db = this.getWriteDb();
+    try {
+      const now = Date.now();
+      db.transaction(() => {
+        const part = this.resolveEditableTextPart(db, sessionId, messageId);
+        const data = parseJsonObject<OpenCodePartData>(part.data) ?? {};
+        const nextData = setPartText(data, normalizedContent);
+        db.prepare("UPDATE part SET data = ?, time_updated = ? WHERE id = ? AND session_id = ?")
+          .run(JSON.stringify(nextData), now, part.id, sessionId);
+        db.prepare("UPDATE message SET time_updated = ? WHERE id = ? AND session_id = ?")
+          .run(now, part.message_id, sessionId);
+        this.touchSession(db, sessionId, now);
+      })();
+    } finally {
+      db.close();
+    }
+
+    this.invalidateSessionCaches(sessionId);
+  }
+
+  async deleteMessage(id: string, messageId: string): Promise<void> {
+    await this.deleteMessages(id, [messageId]);
+  }
+
+  async deleteMessages(id: string, messageIds: string[]): Promise<void> {
+    const sessionId = id.replace("opencode:", "");
+    const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
+    if (uniqueMessageIds.length === 0) {
+      throw new Error("待删除消息不能为空");
+    }
+    if (!this.findSessionRow(sessionId)) {
+      throw new Error(`对话不存在: ${id}`);
+    }
+
+    const db = this.getWriteDb();
+    try {
+      const now = Date.now();
+      db.transaction(() => {
+        const parentMessageIds = new Set<string>();
+        for (const messageId of uniqueMessageIds) {
+          const part = this.resolveEditableTextPart(db, sessionId, messageId);
+          parentMessageIds.add(part.message_id);
+          db.prepare("DELETE FROM part WHERE id = ? AND session_id = ?").run(part.id, sessionId);
+        }
+
+        for (const parentMessageId of parentMessageIds) {
+          const remaining = db.prepare(
+            "SELECT COUNT(*) AS count FROM part WHERE message_id = ? AND session_id = ?"
+          ).get(parentMessageId, sessionId) as { count: number };
+          if (remaining.count === 0) {
+            db.prepare("DELETE FROM message WHERE id = ? AND session_id = ?")
+              .run(parentMessageId, sessionId);
+          } else {
+            db.prepare("UPDATE message SET time_updated = ? WHERE id = ? AND session_id = ?")
+              .run(now, parentMessageId, sessionId);
+          }
+        }
+
+        this.touchSession(db, sessionId, now);
+      })();
+    } finally {
+      db.close();
+    }
+
+    this.invalidateSessionCaches(sessionId);
   }
 
   async listProjects(): Promise<string[]> {
