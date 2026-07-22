@@ -46,7 +46,21 @@ async function createBaseFixture(prefix: string) {
 
       clearProviderPathCache();
       setCacheStoreDirForTests();
-      await rm(baseDir, { recursive: true, force: true });
+      // Windows 上 better-sqlite3 句柄释放后目录可能短暂 ENOTEMPTY，重试清理
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        try {
+          await rm(baseDir, { recursive: true, force: true });
+          lastError = undefined;
+          break;
+        } catch (error) {
+          lastError = error;
+          await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+        }
+      }
+      if (lastError) {
+        throw lastError;
+      }
     },
   };
 }

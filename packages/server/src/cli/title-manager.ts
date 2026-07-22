@@ -349,7 +349,12 @@ function matchesScope(conversation: ConversationMeta, options: CliOptions): bool
 
 function resolveProjectPath(options: CliOptions): string {
   if (options.projectPath.trim()) {
-    return resolve(options.projectPath.trim());
+    const projectPath = options.projectPath.trim();
+    // Windows 绝对路径在 Linux CI 上不能 path.resolve，否则会拼进 cwd 导致 exact 匹配失败
+    if (/^[a-zA-Z]:[\\/]/.test(projectPath) || projectPath.startsWith("\\\\")) {
+      return projectPath;
+    }
+    return resolve(projectPath);
   }
   return resolve(process.env.INIT_CWD || process.cwd());
 }
