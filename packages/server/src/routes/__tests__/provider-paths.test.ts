@@ -576,6 +576,8 @@ test("活动 SQLite 被占用时拒绝迁移并保持旧配置和源数据", asy
     sourceDb.pragma("journal_mode = WAL");
     sourceDb.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)");
     sourceDb.prepare("INSERT INTO threads (id, title) VALUES (?, ?)").run("thread-active", "活动标题");
+    // 保持独占事务，跨平台模拟“活动数据库被占用”
+    sourceDb.exec("BEGIN EXCLUSIVE");
     await writeFile(configPath, `${JSON.stringify({
       providers: {
         codex: {
@@ -599,9 +601,14 @@ test("活动 SQLite 被占用时拒绝迁移并保持旧配置和源数据", asy
           baseDir,
           { migrations: { codex: { stateDbPath: true } } }
         ),
-        /busy|locked|占用|EPERM|EBUSY/i
+        /busy|locked|占用|EPERM|EBUSY|SQLITE_BUSY/i
       );
     } finally {
+      try {
+        sourceDb.exec("COMMIT");
+      } catch {
+        // ignore
+      }
       sourceDb.close();
     }
 

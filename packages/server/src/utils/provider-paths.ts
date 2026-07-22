@@ -697,6 +697,20 @@ async function prepareFileMigration(
   await mkdir(dirnameStyledPath(targetFile), { recursive: true });
   try {
     if (sqlite) {
+      // 先探测独占锁（不能在事务内 backup），避免活动 DB 上半迁移
+      const probeDb = new Database(sourceFile, { fileMustExist: true, timeout: 50 });
+      try {
+        try {
+          probeDb.exec("BEGIN EXCLUSIVE");
+          probeDb.exec("ROLLBACK");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new Error(`SQLite 数据库正被占用，无法迁移: ${message}`);
+        }
+      } finally {
+        probeDb.close();
+      }
+
       const sourceDb = new Database(sourceFile, { readonly: true, fileMustExist: true });
       try {
         await sourceDb.backup(temporaryPath);
