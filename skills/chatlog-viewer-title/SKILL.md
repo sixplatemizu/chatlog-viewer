@@ -82,7 +82,7 @@ pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- --provide
 3. `list` excludes internal title-generation sessions by default. Pass `--include-title-sessions` when auditing them.
 4. Use `rename` for manual changes. It writes through the target provider's native title implementation and verifies the persisted value.
 5. Run `generate-batch --dry-run` before a real batch to audit the exact target set.
-6. Use `generate` or `generate-batch` only when AI generation is requested. Report `usedCli`, attempts, duration, cleanup count, failures, and the backup/report path. Context is weighted toward recent messages with small opening and middle samples for orientation.
+6. Use `generate` or `generate-batch` only when AI generation is requested. Report `usedCli`, attempts, duration, cleanup count, failures, and the backup/report path. Context uses only the latest ~10 non-tool messages (no head/middle samples).
 7. Use `rollback --report <path>` when generated titles need to be restored to the report's `oldTitle` values.
 8. When checking synchronization, compare the full conversation ID and provider. Do not infer that an AI engine named `opencode` means the target conversation is an OpenCode conversation.
 

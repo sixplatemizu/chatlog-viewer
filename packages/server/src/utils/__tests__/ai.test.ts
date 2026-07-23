@@ -247,17 +247,20 @@ test("OpenCode session ID 会从 JSON event 中提取", () => {
   assert.equal(extractOpenCodeSessionId("非 JSON 输出"), null);
 });
 
-test("标题上下文会优先保留近期对话", () => {
+test("标题上下文只使用最新消息", () => {
   const messages = Array.from({ length: 24 }, (_, index): Message => ({
     role: index % 2 === 0 ? "user" : "assistant",
-    content: `第${index + 1}轮 ${index < 6 ? "早期背景" : "普通内容"} ${index >= 18 ? "近期核心主题" : ""}`.trim(),
+    content: `第${index + 1}轮 ${index < 6 ? "早期背景" : "普通内容"} ${index >= 14 ? "近期核心主题" : ""}`.trim(),
   }));
 
-  const context = buildTitlePromptContextForTest(messages, 260);
+  const context = buildTitlePromptContextForTest(messages, 5000);
 
   assert.match(context, /近期核心主题/);
   assert.match(context, /第24轮/);
-  assert.doesNotMatch(context, /第3轮/);
+  assert.match(context, /第15轮/);
+  assert.doesNotMatch(context, /第1轮/);
+  assert.doesNotMatch(context, /第14轮/);
+  assert.doesNotMatch(context, /早期背景/);
 });
 
 test("指定的 AI CLI 不可用时不会回退到优先级外工具", async () => {

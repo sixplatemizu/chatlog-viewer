@@ -273,53 +273,33 @@ function orderToolsByPriority(tools: CliTool[], priority?: readonly string[]): C
   });
 }
 
-function pickSampledMessages(messages: Message[]): Message[] {
-  const visibleMessages = messages.filter((message) => message.role !== "tool" && message.content.trim());
-  if (visibleMessages.length <= 14) return visibleMessages;
+const TITLE_CONTEXT_RECENT_MESSAGE_LIMIT = 10;
 
-  const head = visibleMessages.slice(0, 2);
-  const recent = visibleMessages.slice(-10);
-  const middleStart = Math.max(2, Math.floor(visibleMessages.length * 0.65) - 1);
-  const middle = visibleMessages.slice(middleStart, middleStart + 2);
-  const seen = new Set<Message>();
-  const sampled = [...head, ...middle, ...recent].filter((message) => {
-    if (seen.has(message)) return false;
-    seen.add(message);
-    return true;
-  });
-  return sampled.sort((a, b) => visibleMessages.indexOf(a) - visibleMessages.indexOf(b));
+function pickRecentMessages(messages: Message[]): Message[] {
+  return messages
+    .filter((message) => message.role !== "tool" && message.content.trim())
+    .slice(-TITLE_CONTEXT_RECENT_MESSAGE_LIMIT);
 }
 
-function compactContextLinesForRecentPriority(lines: Array<{ line: string; recent: boolean }>, maxChars: number): string[] {
+function compactContextLinesFromNewest(lines: string[], maxChars: number): string[] {
+  // 超长时从旧到新丢弃，优先保留最新消息
   const selected = [...lines];
-  let charCount = selected.reduce((total, item) => total + item.line.length, 0);
-
+  let charCount = selected.reduce((total, line) => total + line.length, 0);
   while (charCount > maxChars && selected.length > 0) {
-    const removableIndex = selected.findIndex((item) => !item.recent);
-    const index = removableIndex >= 0 ? removableIndex : 0;
-    const [removed] = selected.splice(index, 1);
-    charCount -= removed?.line.length ?? 0;
+    const [removed] = selected.splice(0, 1);
+    charCount -= removed?.length ?? 0;
   }
-
-  return selected.map((item) => item.line);
+  return selected;
 }
 
 function buildContext(messages: Message[], maxChars = 5000): string {
-  const visibleMessages = messages.filter((message) => message.role !== "tool" && message.content.trim());
-  const recentMessages = new Set(visibleMessages.slice(-10));
-  const sampledMessages = pickSampledMessages(messages);
-  const lines: Array<{ line: string; recent: boolean }> = [];
-
-  for (const msg of sampledMessages) {
+  const recentMessages = pickRecentMessages(messages);
+  const lines = recentMessages.map((msg) => {
     const roleLabel = msg.role === "user" ? "用户" : "助手";
     const text = msg.content.replace(/\s+/g, " ").trim().slice(0, 700);
-    lines.push({
-      line: `${roleLabel}: ${text}`,
-      recent: recentMessages.has(msg),
-    });
-  }
-
-  return compactContextLinesForRecentPriority(lines, maxChars).join("\n");
+    return `${roleLabel}: ${text}`;
+  });
+  return compactContextLinesFromNewest(lines, maxChars).join("\n");
 }
 
 export function buildTitlePromptContextForTest(messages: Message[], maxChars?: number): string {
