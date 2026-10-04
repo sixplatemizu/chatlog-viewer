@@ -234,12 +234,6 @@ async function collectSubAgentLinks(mainFilePath: string): Promise<SubAgentLink[
   return links;
 }
 
-function buildSubAgentBadge(parentTitle: string, parentSessionId: string): ConversationBadge[] {
-  return [
-    { label: "子会话", tone: "indigo" as const, title: `子会话，父会话：${parentSessionId}${parentTitle ? `（${parentTitle}）` : ""}` },
-  ];
-}
-
 export class CodeBuddyProvider implements ConversationProvider {
   name = "codebuddy";
   displayName = "CodeBuddy";
@@ -392,16 +386,26 @@ export class CodeBuddyProvider implements ConversationProvider {
       this.scheduleBackgroundIndexRefresh();
     }
 
-    const merged = this.sortMetasWithParentsFirst(normalizedResults.map((item) => item.meta));
+    const merged = this.sortConversationMetasForDisplay(normalizedResults.map((item) => item.meta));
     return merged;
   }
 
-  private sortMetasWithParentsFirst(metas: ConversationMeta[]): ConversationMeta[] {
-    // 父子会话通过 projectKey 自然分在一起；此处再保证同一 projectKey 内
-    // 主会话排在子会话之前（树状展示由前端按 projectKey 分组 + badges 完成）。
+  private sortConversationMetasForDisplay(metas: ConversationMeta[]): ConversationMeta[] {
+    // 父子会话通过 projectKey 自然分在一起（子 projectKey = 父 projectKey/父 sessionId）；
+    // 同一分组内主会话在前、子会话随后，其余按更新时间倒序。树状展示由前端按 projectKey 分组 + badges 完成。
+    const groupKey = (meta: ConversationMeta): string => {
+      const key = meta.projectKey || "";
+      const slash = key.indexOf("/");
+      return slash < 0 ? key : key.slice(0, slash);
+    };
     const parentRank = (meta: ConversationMeta): number => (meta.id.startsWith("codebuddy:sub:") ? 1 : 0);
     return [...metas].sort((a, b) => {
-      if (a.projectKey === b.projectKey && parentRank(a) !== parentRank(b)) {
+      const groupA = groupKey(a);
+      const groupB = groupKey(b);
+      if (groupA === groupB && a.projectKey !== b.projectKey) {
+        return a.projectKey < b.projectKey ? -1 : 1;
+      }
+      if (groupA === groupB && parentRank(a) !== parentRank(b)) {
         return parentRank(a) - parentRank(b);
       }
       return b.updatedAt - a.updatedAt;
@@ -439,6 +443,32 @@ export class CodeBuddyProvider implements ConversationProvider {
 
   private isSubAgentFile(filePath: string): boolean {
     return filePath.replace(/\\/g, "/").includes("/subagents/");
+  }
+
+  private async buildSubAgentBadgeFor(
+    subAgentName: string | undefined,
+    parentSessionId: string,
+    projectFolder: string
+  ): Promise<ConversationBadge[]> {
+    const parentTitle = await this.readParentTitle(parentSessionId, projectFolder);
+    const namePart = subAgentName ? `（${subAgentName}）` : "";
+    const parentPart = parentTitle
+      ? `父会话：${parentSessionId}（${parentTitle}）`
+      : `父会话：${parentSessionId}`;
+    return [{ label: "子会话", tone: "indigo" as const, title: `子会话${namePart}，${parentPart}` }];
+  }
+
+  private async buildParentBadgeFor(subLinks: SubAgentLink[]): Promise<ConversationBadge[] | undefined> {
+    const badges: ConversationBadge[] = [];
+    if (subLinks.length > 0) {
+      const names = subLinks.map((link) => link.agentName ?? link.agentId);
+      badges.push({
+        label: `含${subLinks.length}个子会话`,
+        tone: "indigo",
+        title: `子会话：${names.join("、")}`,
+      });
+    }
+    return badges.length > 0 ? badges : undefined;
   }
 
   private async scanConversationFile(
@@ -499,14 +529,7 @@ export class CodeBuddyProvider implements ConversationProvider {
     }
 
     const subLinks = await collectSubAgentLinks(filePath);
-    const badges: ConversationBadge[] = [];
-    if (subLinks.length > 0) {
-      badges.push({
-        label: `含${subLinks.length}个子会话`,
-        tone: "indigo",
-        title: subLinks.map((link) => link.agentId).join("、"),
-      });
-    }
+    const parentBadges = await this.buildParentBadgeFor(subLinks);
 
     const meta: ConversationMeta = {
       id: `codebuddy:${sessionId}`,
@@ -521,7 +544,7 @@ export class CodeBuddyProvider implements ConversationProvider {
       fileSize: fileStat.size,
       filePath,
       contentStatus: "full",
-      badges: badges.length > 0 ? badges : undefined,
+      badges: parentBadges,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
@@ -604,13 +627,13 @@ export class CodeBuddyProvider implements ConversationProvider {
       return null;
     }
 
-    const parentTitle = await this.readParentTitle(parentSessionId, projectFolder);
+    const subBadges = await this.buildSubAgentBadgeFor(subAgentName, parentSessionId, projectFolder);
     const meta: ConversationMeta = {
       id: `codebuddy:sub:${agentId.replace(/^agent-/, "")}`,
       provider: this.name,
       title: (subAgentName ? `${subAgentName}：` : "") + (title.replace(/<[^>]+>/g, "").trim() || "子会话"),
       project,
-      projectKey: projectFolder,
+      projectKey: `${projectFolder}/${parentSessionId}`,
       projectId: canonicalizeProjectPath(project) || projectFolder,
       createdAt: firstTimestamp ?? fileStat.birthtimeMs,
       updatedAt: fileStat.mtimeMs,
@@ -618,7 +641,7 @@ export class CodeBuddyProvider implements ConversationProvider {
       fileSize: fileStat.size,
       filePath,
       contentStatus: "full",
-      badges: buildSubAgentBadge(parentTitle ?? "", parentSessionId),
+      badges: subBadges,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
@@ -715,14 +738,7 @@ export class CodeBuddyProvider implements ConversationProvider {
     );
 
     const subLinks = await collectSubAgentLinks(filePath);
-    const badges: ConversationBadge[] = [];
-    if (subLinks.length > 0) {
-      badges.push({
-        label: `含${subLinks.length}个子会话`,
-        tone: "indigo",
-        title: subLinks.map((link) => link.agentId).join("、"),
-      });
-    }
+    const parentBadges = await this.buildParentBadgeFor(subLinks);
 
     const meta: ConversationMeta = {
       id: `codebuddy:${sessionId}`,
@@ -737,7 +753,7 @@ export class CodeBuddyProvider implements ConversationProvider {
       fileSize: fileStat.size,
       filePath,
       contentStatus: "full",
-      badges: badges.length > 0 ? badges : undefined,
+      badges: parentBadges,
     };
 
     setCache(filePath, fileStat.mtimeMs, meta);
@@ -839,6 +855,13 @@ export class CodeBuddyProvider implements ConversationProvider {
 
   async delete(id: string): Promise<void> {
     const sessionId = id.replace("codebuddy:", "");
+    if (sessionId.startsWith("sub:")) {
+      // 子会话删除仅删除自身文件，通过主会话列表徽标自然消失
+      const filePath = await this.findConversationFilePath(sessionId);
+      await unlink(filePath);
+      this.invalidateConversationCaches(filePath);
+      return;
+    }
     const filePath = await this.findConversationFilePath(sessionId);
     await unlink(filePath);
     // 主会话删除时连带同名子目录（subagents/tool-results）
@@ -934,8 +957,7 @@ export class CodeBuddyProvider implements ConversationProvider {
   }
 
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
-    const sessionId = id.replace("codebuddy:", "");
-    const filePath = await this.findConversationFilePath(sessionId);
+    const filePath = await this.findConversationFilePath(id.replace("codebuddy:", ""));
     const fileStat = await stat(filePath);
     const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
     const normalizedContent = normalizeUpdatedMessageContent(content);
@@ -964,8 +986,7 @@ export class CodeBuddyProvider implements ConversationProvider {
   }
 
   async deleteMessages(id: string, messageIds: string[]): Promise<void> {
-    const sessionId = id.replace("codebuddy:", "");
-    const filePath = await this.findConversationFilePath(sessionId);
+    const filePath = await this.findConversationFilePath(id.replace("codebuddy:", ""));
     const fileStat = await stat(filePath);
     const uniqueMessageIds = [...new Set(messageIds.map((item) => item.trim()).filter(Boolean))];
     if (uniqueMessageIds.length === 0) {

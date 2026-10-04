@@ -313,7 +313,9 @@ export function Sidebar({
       <div className="p-3 border-b border-gray-200 dark:border-gray-700">
         <div className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">工具筛选</div>
         <div className="flex flex-wrap gap-1.5">
-          {providers.map((p) => (
+          {[...providers]
+            .sort((a, b) => Number(a.available) - Number(b.available))
+            .map((p) => (
             <button
               key={p.name}
               onClick={() => p.available && toggleProvider(p.name)}

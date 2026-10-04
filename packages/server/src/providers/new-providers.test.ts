@@ -272,6 +272,9 @@ test("CodeBuddy 会列出主会话与子会话并建立父子关联", async () =
     assert.ok(sub.title.startsWith("statusline-setup"));
     assert.ok(sub.badges?.some((badge) => badge.label === "子会话"));
     assert.ok(sub.badges?.some((badge) => badge.title?.includes(CB_SESSION_ID)));
+    assert.equal(main.badges?.find((badge) => badge.label === "含1个子会话")?.title, "子会话：statusline-setup");
+    assert.equal(sub.projectKey, `${main.projectKey}/${CB_SESSION_ID}`);
+    assert.ok(list.indexOf(main) < list.indexOf(sub));
 
     const conversation = await fixture.provider.read(`codebuddy:${CB_SESSION_ID}`);
     assert.equal(conversation.messages.length, 2);
@@ -318,7 +321,7 @@ test("CodeBuddy 主会话删除连带子目录、移动连带子目录", async (
     assert.equal(moved.find((item) => item.id === `codebuddy:${CB_SESSION_ID}`)!.projectKey, "d-other-project");
     const subAfterMove = moved.find((item) => item.id.startsWith("codebuddy:sub:"))!;
     assert.ok(subAfterMove);
-    assert.equal(subAfterMove.projectKey, "d-other-project");
+    assert.equal(subAfterMove.projectKey, `d-other-project/${CB_SESSION_ID}`);
 
     await fixture.provider.delete(`codebuddy:${CB_SESSION_ID}`);
     const afterDelete = await fixture.provider.list();

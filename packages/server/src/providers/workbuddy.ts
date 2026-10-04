@@ -245,7 +245,7 @@ function buildBadges(row: Pick<WorkBuddySessionRow, "status" | "deleted_at" | "s
       title: "WorkBuddy playground 会话",
     });
   }
-  if (row.source_mode) {
+  if (row.source_mode && row.source_mode !== row.status) {
     badges.push({
       label: row.source_mode,
       tone: "gray",
