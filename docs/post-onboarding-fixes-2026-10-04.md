@@ -28,5 +28,5 @@
 - [x] P2 删除修复（共用 removeEmptyParentDirs；workbuddy 多同名文件报错不吞）
 - [x] P3 标题修复（opencode 事件行判定 + 失败带 mode 诊断）
 - [x] P4 CLI/skill（目标扩 7 家；生成 CLI 保持 3 项；skill 同步）
-- [ ] P5 全量验证提交
-- [ ] P6 更名规划文档
+- [x] P5 全量验证提交（8d00deb；server test 全过，typecheck 双包过，eslint 目标文件过）
+- [x] P6 更名规划文档（docs/chatview-rename-plan.md，仅规划未执行）
