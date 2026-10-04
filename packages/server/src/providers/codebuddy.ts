@@ -408,12 +408,6 @@ export class CodeBuddyProvider implements ConversationProvider {
     });
   }
 
-  private mergeSubAgentMetas(metas: ConversationMeta[]): ConversationMeta[] {
-    // 主会话与子会话通过 projectKey 自然分在一起；子会话 badges 已标注父会话，
-    // 主会话 badges 已标注子会话数量。此处仅透传，不做隐藏或合并。
-    return metas;
-  }
-
   private async buildIndexedCacheItem(
     filePath: string,
     options: {

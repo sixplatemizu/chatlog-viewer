@@ -381,7 +381,11 @@ export class PiProvider implements ConversationProvider {
   ): Promise<IndexedCacheItem | null> {
     const pathParts = filePath.replace(/\\/g, "/").split("/");
     const projectFolder = pathParts[pathParts.length - 2] || "";
-    const sessionId = filePath.split(/[/\\]/).pop()!.replace(/\.jsonl$/, "");
+    const fileName = filePath.split(/[/\\]/).pop()!;
+    // 文件名形如 <timestamp>_<sessionId>.jsonl，取下划线后作为会话 ID（与 extractMeta 同口径）
+    const sessionId = fileName.includes("_")
+      ? fileName.slice(fileName.lastIndexOf("_") + 1).replace(/\.jsonl$/, "")
+      : fileName.replace(/\.jsonl$/, "");
     let project = projectFolder;
     let title = "";
     let namedTitle: string | undefined;
