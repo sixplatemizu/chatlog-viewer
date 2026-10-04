@@ -51,6 +51,9 @@ function getProviderDisplayName(provider: string): string {
   if (provider === "codex") return "Codex";
   if (provider === "claude-code") return "Claude Code";
   if (provider === "iflow") return "iFlow";
+  if (provider === "pi") return "Pi";
+  if (provider === "codebuddy") return "CodeBuddy";
+  if (provider === "workbuddy") return "WorkBuddy";
   return provider;
 }
 

@@ -22,7 +22,7 @@ import {
   type TitleGenerationCliSessionMode,
 } from "../utils/provider-paths.js";
 
-const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "opencode", "iflow"]);
+const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "opencode", "iflow", "pi", "codebuddy", "workbuddy"]);
 const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["codex", "claude", "opencode"]);
 
 function isResolvedProviderName(name: string): name is ResolvedProviderName {
@@ -109,7 +109,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
         }
 
         if ("stateDbPath" in value) {
-          if (providerName !== "codex" && providerName !== "opencode" && value.stateDbPath !== null && value.stateDbPath !== undefined) {
+          if (providerName !== "codex" && providerName !== "opencode" && providerName !== "workbuddy" && value.stateDbPath !== null && value.stateDbPath !== undefined) {
             return c.json({ error: `${providerName} 不支持 state db 路径配置` }, 400);
           }
           nextConfig.stateDbPath = normalizeOptionalPathInput(value.stateDbPath);
@@ -132,7 +132,7 @@ export function createSettingsRoutes(providers: ConversationProvider[]) {
           }
 
           if ("stateDbPath" in value) {
-            if (providerName !== "codex" && providerName !== "opencode") {
+            if (providerName !== "codex" && providerName !== "opencode" && providerName !== "workbuddy") {
               return c.json({ error: `${providerName} 不支持 state db 迁移配置` }, 400);
             }
             if (typeof value.stateDbPath !== "boolean") {

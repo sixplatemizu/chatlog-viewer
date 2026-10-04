@@ -15,6 +15,9 @@ const PROVIDER_BADGE: Record<string, string> = {
   iflow: "bg-blue-500",
   "gemini-cli": "bg-purple-500",
   opencode: "bg-cyan-500",
+  pi: "bg-violet-500",
+  codebuddy: "bg-teal-500",
+  workbuddy: "bg-lime-500",
 };
 
 const FOLDER_COLOR: Record<string, string> = {
@@ -23,6 +26,9 @@ const FOLDER_COLOR: Record<string, string> = {
   iflow: "text-blue-400",
   "gemini-cli": "text-purple-400",
   opencode: "text-cyan-400",
+  pi: "text-violet-400",
+  codebuddy: "text-teal-400",
+  workbuddy: "text-lime-400",
 };
 
 const BADGE_TONE_CLASS: Record<ConversationBadgeTone, string> = {

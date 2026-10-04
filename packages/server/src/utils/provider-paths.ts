@@ -10,7 +10,7 @@ import type BetterSqlite3 from "better-sqlite3";
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
 
-export type ResolvedProviderName = "claude-code" | "codex" | "iflow" | "opencode";
+export type ResolvedProviderName = "claude-code" | "codex" | "iflow" | "opencode" | "pi" | "codebuddy" | "workbuddy";
 export type TitleGenerationCli = "codex" | "claude" | "opencode";
 export type TitleGenerationCliSessionMode = "fixed" | "fresh";
 type PathKind = "file" | "directory";
@@ -308,6 +308,62 @@ export function resolveProviderPaths(
       stateDbPath: stateDb.path,
       stateDbExists: stateDb.exists,
       stateDbSource: stateDb.source,
+    };
+  }
+
+  if (providerName === "pi" || providerName === "codebuddy" || providerName === "workbuddy") {
+    const rules: Record<string, { envKey: string; leaves: string[]; nouns: string[] }> = {
+      pi: { envKey: "CHATLOG_VIEWER_PI_PATH", leaves: ["agent", "sessions"], nouns: [".pi", "pi", "Pi"] },
+      codebuddy: { envKey: "CHATLOG_VIEWER_CODEBUDDY_PATH", leaves: ["projects"], nouns: [".codebuddy", "codebuddy", "CodeBuddy"] },
+      workbuddy: { envKey: "CHATLOG_VIEWER_WORKBUDDY_PATH", leaves: [], nouns: [".workbuddy", "workbuddy", "WorkBuddy"] },
+    };
+    const rule = rules[providerName]!;
+    const sharedCliRoots = getSharedConfigRoots(homeDir, env);
+    const storage = resolvePathWithFallback({
+      envKeys: [rule.envKey],
+      configValue: providerConfig?.storagePath,
+      configDir: loadedConfig.configDir,
+      autoCandidates: [
+        joinStyledPath(homeDir, rule.nouns[0]!, ...rule.leaves),
+        ...namedCandidates(sharedCliRoots, rule.nouns, rule.leaves),
+      ],
+      defaultPath: joinStyledPath(homeDir, rule.nouns[0]!, ...rule.leaves),
+      kind: "directory",
+      env,
+      homeDir,
+      pathExists,
+    });
+
+    if (providerName === "workbuddy") {
+      const stateDb = resolvePathWithFallback({
+        envKeys: ["CHATLOG_VIEWER_WORKBUDDY_DB_PATH"],
+        configValue: providerConfig?.stateDbPath,
+        configDir: loadedConfig.configDir,
+        autoCandidates: [
+          joinStyledPath(storage.path, "workbuddy.db"),
+          joinStyledPath(homeDir, ".workbuddy", "workbuddy.db"),
+          ...namedCandidates(sharedCliRoots, [".workbuddy", "workbuddy", "WorkBuddy"], ["workbuddy.db"]),
+        ],
+        defaultPath: joinStyledPath(homeDir, ".workbuddy", "workbuddy.db"),
+        kind: "file",
+        env,
+        homeDir,
+        pathExists,
+      });
+      return {
+        storagePath: storage.path,
+        storageExists: storage.exists,
+        storageSource: storage.source,
+        stateDbPath: stateDb.path,
+        stateDbExists: stateDb.exists,
+        stateDbSource: stateDb.source,
+      };
+    }
+
+    return {
+      storagePath: storage.path,
+      storageExists: storage.exists,
+      storageSource: storage.source,
     };
   }
 

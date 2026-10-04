@@ -8,6 +8,9 @@ import { createExportRoutes } from "./routes/export.js";
 import { ClaudeCodeProvider } from "./providers/claude-code.js";
 import { CodexProvider } from "./providers/codex.js";
 import { IFlowProvider } from "./providers/iflow.js";
+import { PiProvider } from "./providers/pi.js";
+import { CodeBuddyProvider } from "./providers/codebuddy.js";
+import { WorkBuddyProvider } from "./providers/workbuddy.js";
 import { OpenCodeProvider } from "./providers/opencode.js";
 import type { ConversationProvider } from "./providers/types.js";
 import { API_TOKEN_HEADER } from "./utils/api-token.js";
@@ -89,6 +92,9 @@ export function createDefaultProviders(): ConversationProvider[] {
     new CodexProvider(),
     new OpenCodeProvider(),
     new IFlowProvider(),
+    new PiProvider(),
+    new CodeBuddyProvider(),
+    new WorkBuddyProvider(),
   ];
 }
 
