@@ -329,6 +329,17 @@ function cleanTitleCandidate(text: string): string {
   return isInvalidGeneratedTitle(title) ? "" : title;
 }
 
+function isOpencodeJsonEventLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) return false;
+  try {
+    const event = JSON.parse(trimmed) as { type?: unknown };
+    return typeof event.type === "string" && event.type.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function extractJsonLineTextOutput(stdout: string): string | null {
   const textParts: string[] = [];
   let hasTextEvent = false;
@@ -378,16 +389,17 @@ export function extractCleanOutput(stdout: string): string {
 
   // 当输出以"流式 JSON 事件"为主时（多数行以 { 开头），视为 CLI 走了 JSON
   // 输出模式但未产生 text 事件（典型场景：opencode --format json 只回了
-  // step_start/step_finish）。此时退回到 regex 抽取没意义，直接返回空。
-  // 阈值用半数以上避免误伤偶尔包含一两行 JSON 示例的 claude/codex 输出。
+  // step_start/step_finish）。JSON 事件行优先视为事件载荷而非标题正文：
+  // 只有可解析的事件行才计入该判定，避免含 JSON 示例的纯文本被误判为空。
   const trimmedLines = stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
 
   if (trimmedLines.length > 0) {
-    const jsonLineCount = trimmedLines.filter((line) => line.startsWith("{")).length;
-    if (jsonLineCount * 2 >= trimmedLines.length) {
+    const eventLineCount = trimmedLines.filter((line) => isOpencodeJsonEventLine(line)).length;
+    if (eventLineCount * 2 >= trimmedLines.length) {
+      logAiDiagnostic(`[AI] JSON 事件模式但无 text 事件（事件行 ${eventLineCount}/${trimmedLines.length}），返回空标题`);
       return "";
     }
   }
@@ -749,12 +761,12 @@ export async function generateTitle(
             generatedSessionId: result.generatedSessionId,
           };
         }
-        logAiDiagnostic(`[AI] ${tool.name} 失败: 输出为空或格式无效`);
-        failures.push(`${tool.name}#${attempt}: 输出为空或格式无效`);
+        logAiDiagnostic(`[AI] ${tool.name} 失败: 输出为空或格式无效（mode=${result.mode}）`);
+        failures.push(`${tool.name}#${attempt}: 输出为空或格式无效（mode=${result.mode}）`);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         console.error(`[AI] ${tool.name} 生成标题失败:`, message);
-        failures.push(`${tool.name}#${attempt}: ${message}`);
+        failures.push(`${tool.name}#${attempt}: ${message}（mode=unknown）`);
       }
     }
   }

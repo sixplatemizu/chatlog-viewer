@@ -1,17 +1,20 @@
 ---
 name: chatlog-viewer-title
-description: Manage ChatLog Viewer conversation titles for Codex, Claude Code, and OpenCode with the project title CLI. Use when the user wants to list or search conversations across providers, rename a title with native persistence, generate titles with an AI CLI, run or roll back batch title generation, or verify that UI and local CLI titles stay synchronized.
+description: Manage ChatLog Viewer conversation titles for Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy with the project title CLI. Use when the user wants to list or search conversations across providers, rename a title with native persistence, generate titles with an AI CLI, run or roll back batch title generation, or verify that UI and local CLI titles stay synchronized.
 ---
 
 # ChatLog Viewer Title
 
 ## Overview
 
-Use ChatLog Viewer's local title CLI to manage Codex, Claude Code, and OpenCode conversations. The CLI and Web UI share the same persistence service:
+Use ChatLog Viewer's local title CLI to manage Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy conversations (7 target providers; iFlow is read-only for list, rename/generate are blocked by its capability gate). The CLI and Web UI share the same persistence service:
 
 - Codex uses the native app-server naming path and verifies State DB plus `session_index.jsonl`.
 - Claude Code appends native `/rename` metadata and updates `sessions-index.json`.
 - OpenCode updates SQLite `session.title`.
+- Pi rewrites the `session_info` name row in its session JSONL.
+- CodeBuddy rewrites the `ai-title` row (main sessions only; `codebuddy:sub:*` titles follow the parent).
+- WorkBuddy updates SQLite `sessions.custom_title` (falls back to read-only when the column is missing).
 
 The target conversation provider and the AI title-generation CLI are independent. For example, OpenCode can generate a title for a Codex conversation, then ChatLog Viewer persists it through Codex's native title path.
 
@@ -125,6 +128,6 @@ Fresh mode is the default. Codex runs with `--ephemeral`, Claude Code runs with 
 
 ## Constraints
 
-- The title CLI manages Codex, Claude Code, and OpenCode. It does not manage iFlow titles.
+- The title CLI manages Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy targets. iFlow is list-only: rename and AI generate are blocked with `iFlow 当前没有稳定的原生标题字段，已禁用修改标题`.
 - Do not edit provider JSONL or SQLite files directly unless the CLI fails and the user explicitly approves a repair.
 - Do not generate a title unless the user asks for AI generation; listing and manual rename are safe first steps.

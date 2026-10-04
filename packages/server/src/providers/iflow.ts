@@ -54,6 +54,7 @@ import {
   sliceWindow,
   resolveProjectDirectory,
   applyProjectDisplayPathHints,
+  removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
 
 interface IFlowEntry {
@@ -648,6 +649,7 @@ export class IFlowProvider implements ConversationProvider {
     const filePath = await this.findConversationFilePath(sessionId);
     await unlink(filePath);
     this.invalidateConversationCaches(filePath);
+    await removeEmptyParentDirs(filePath, this.getStoragePath());
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {

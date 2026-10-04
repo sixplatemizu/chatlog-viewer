@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { TitleGenerationCli } from "../utils/provider-paths.js";
 
 export type ProjectMode = "exact" | "recursive";
-export type ManagedProviderName = "codex" | "claude-code" | "opencode";
+export type ManagedProviderName = "codex" | "claude-code" | "opencode" | "iflow" | "pi" | "codebuddy" | "workbuddy";
 export type ProviderSelection = ManagedProviderName | "all";
 export type TitleCliCommand = "list" | "rename" | "generate" | "generate-batch" | "rollback";
 

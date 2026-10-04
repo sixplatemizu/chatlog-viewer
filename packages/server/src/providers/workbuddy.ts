@@ -52,6 +52,7 @@ import {
   sliceWindow,
   resolveProjectDirectory,
   applyProjectDisplayPathHints,
+  removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
 
 interface WorkBuddyContentBlock {
@@ -645,8 +646,8 @@ export class WorkBuddyProvider implements ConversationProvider {
       }
     });
 
-    // 同步删除 transcript 文件（DB 与文件双写保持一致）
-    const transcriptPath = await this.locateTranscriptFile(sessionId).catch(() => null);
+    // 同步删除 transcript 文件（DB 与文件双写保持一致；多同名文件必须报错避免漏删）
+    const transcriptPath = await this.locateTranscriptFile(sessionId);
     if (transcriptPath) {
       try {
         await unlink(transcriptPath);
@@ -655,6 +656,7 @@ export class WorkBuddyProvider implements ConversationProvider {
       } catch (error) {
         if (!isFileSystemNotFoundError(error)) throw error;
       }
+      await removeEmptyParentDirs(transcriptPath, join(this.getStoragePath(), "projects"));
     }
 
     this.invalidateSessionCaches(sessionId);

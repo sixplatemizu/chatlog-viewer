@@ -1,7 +1,24 @@
-import { join } from "path";
+import { dirname, join } from "path";
+import { rmdir } from "fs/promises";
 import { realpathSync } from "fs";
 import type { ConversationMeta, ConversationReadOptions } from "../types.js";
 import { getCached, setCache } from "../../utils/cache.js";
+
+// 删除后向上清理空目录（止于 storage 根，不删除 storage 本身；多 provider 共用）
+export async function removeEmptyParentDirs(startPath: string, stopDir: string): Promise<void> {
+  let dir = dirname(startPath.replace(/\\/g, "/"));
+  const stop = normalizePath(stopDir);
+  for (;;) {
+    const normalized = normalizePath(dir);
+    if (normalized.length <= stop.length || !normalized.startsWith(stop)) return;
+    try {
+      await rmdir(normalized);
+    } catch {
+      return;
+    }
+    dir = dirname(normalized);
+  }
+}
 
 export function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "").trim();

@@ -103,14 +103,22 @@ test("title CLI 会按默认 provider 补全 ID 并保留完整 provider ID", ()
   assert.equal(normalizeConversationId("claude:session-3"), "claude-code:session-3");
   assert.equal(normalizeConversationId("opencode:session-4"), "opencode:session-4");
   assert.throws(() => normalizeConversationId("session-5", "all"), /完整对话 ID/);
-  assert.throws(() => normalizeConversationId("iflow:session-6"), /不支持的对话 ID/);
+  assert.equal(normalizeConversationId("iflow:session-6"), "iflow:session-6");
+  assert.equal(normalizeConversationId("pi:session-7"), "pi:session-7");
+  assert.equal(normalizeConversationId("codebuddy:session-8"), "codebuddy:session-8");
+  assert.equal(normalizeConversationId("workbuddy:session-9"), "workbuddy:session-9");
+  assert.throws(() => normalizeConversationId("unknown:session-10"), /不支持的对话 ID/);
 });
 
 test("title CLI 会解析 Claude Code alias 并拒绝无效 provider", () => {
   assert.equal(parseArgs(["list", "--provider", "claude-code"]).options.provider, "claude-code");
   assert.equal(parseArgs(["list", "--provider", "claude"]).options.provider, "claude-code");
   assert.equal(parseArgs(["list", "--provider", "open-code"]).options.provider, "opencode");
-  assert.throws(() => parseArgs(["list", "--provider", "iflow"]), /provider 只能是/);
+  assert.equal(parseArgs(["list", "--provider", "iflow"]).options.provider, "iflow");
+  assert.equal(parseArgs(["list", "--provider", "pi"]).options.provider, "pi");
+  assert.equal(parseArgs(["list", "--provider", "codebuddy"]).options.provider, "codebuddy");
+  assert.equal(parseArgs(["list", "--provider", "workbuddy"]).options.provider, "workbuddy");
+  assert.throws(() => parseArgs(["list", "--provider", "unknown"]), /provider 只能是/);
 });
 
 test("project exact 只匹配当前项目，recursive 会包含子目录", () => {

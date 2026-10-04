@@ -87,18 +87,20 @@ interface CliContext {
 const DEFAULT_LIMIT = 20;
 const TITLE_GENERATION_BADGE_LABEL = "标题生成";
 const TITLE_GENERATION_CLI_SET = new Set<TitleGenerationCli>(["codex", "claude", "opencode"]);
-const MANAGED_PROVIDER_NAMES: ManagedProviderName[] = ["codex", "claude-code", "opencode"];
+// CLI 目标 provider 覆盖全部 7 家（iflow 只读：list 可见，rename/generate 由能力门控拦截）。
+// 生成用 CLI 保持 codex/claude/opencode 三项（目标与生成解耦）。
+const MANAGED_PROVIDER_NAMES: ManagedProviderName[] = ["codex", "claude-code", "opencode", "iflow", "pi", "codebuddy", "workbuddy"];
 const MANAGED_PROVIDER_SET = new Set<ManagedProviderName>(MANAGED_PROVIDER_NAMES);
 
 function printHelp(): void {
   console.log(`ChatLog Viewer title manager
 
 Usage:
-  clv-title [interactive] [--provider codex|claude-code|opencode|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
-  clv-title list [--provider codex|claude-code|opencode|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
-  clv-title rename <sessionId|provider:sessionId> <title> [--provider codex|claude-code|opencode] [--json]
-  clv-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode] [--cli opencode,codex,claude] [--timeout ms] [--retries n] [--json]
-  clv-title generate-batch [--provider codex|claude-code|opencode|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
+  clv-title [interactive] [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
+  clv-title list [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
+  clv-title rename <sessionId|provider:sessionId> <title> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--json]
+  clv-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--cli opencode,codex,claude] [--timeout ms] [--retries n] [--json]
+  clv-title generate-batch [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
   clv-title rollback --report path [--json] [--continue-on-error] [--dry-run] [--force]
 
 Examples:
@@ -209,7 +211,7 @@ export function parseArgs(args: string[]): { command: string; commandArgs: strin
     if (arg === "--provider") {
       const provider = parseProviderSelection(args[index + 1]);
       if (!provider) {
-        throw new Error("provider 只能是 codex、claude-code、opencode 或 all");
+        throw new Error("provider 只能是 codex、claude-code、opencode、iflow、pi、codebuddy、workbuddy 或 all");
       }
       options.provider = provider;
       index += 1;
@@ -944,7 +946,7 @@ async function runInteractive(context: CliContext, options: CliOptions): Promise
         if (nextProvider) {
           currentOptions = { ...currentOptions, provider: nextProvider };
         } else {
-          console.log("provider 只能是 codex、claude-code、opencode 或 all");
+          console.log("provider 只能是 codex、claude-code、opencode、iflow、pi、codebuddy、workbuddy 或 all");
         }
         continue;
       }

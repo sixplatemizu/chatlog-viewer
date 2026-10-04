@@ -87,7 +87,7 @@ import {
   normalizeCodexDisplayText,
   pickCodexConversationTitle,
 } from "./codex-title.js";
-import { normalizePath, canonicalizeProjectPath, canonicalizeProjectPathResolvingSymlinks, getListCacheKey, sliceWindow } from "./shared/provider-utils.js";
+import { normalizePath, canonicalizeProjectPath, canonicalizeProjectPathResolvingSymlinks, getListCacheKey, sliceWindow, removeEmptyParentDirs } from "./shared/provider-utils.js";
 
 interface CodexEntry {
   timestamp: string;
@@ -1385,6 +1385,9 @@ export class CodexProvider implements ConversationProvider {
       throw new Error(`对话不存在: ${id}`);
     }
 
+    if (filePath) {
+      await removeEmptyParentDirs(dirname(filePath), this.getStoragePath());
+    }
     if (!filePath) {
       invalidateListCache(this.getListCacheKey());
     }

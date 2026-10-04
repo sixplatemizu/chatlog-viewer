@@ -57,6 +57,7 @@ import {
   sliceWindow,
   resolveProjectDirectory,
   applyProjectDisplayPathHints,
+  removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
 
 const CLAUDE_CODE_LIST_SOURCE_VERSION = "claude-code-list-v3-native-title";
@@ -1553,6 +1554,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     }
 
     this.invalidateConversationCaches(source.key);
+    await removeEmptyParentDirs(source.projectDirPath, this.getStoragePath());
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {

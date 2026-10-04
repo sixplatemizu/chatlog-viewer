@@ -55,6 +55,7 @@ import {
   sliceWindow,
   resolveProjectDirectory,
   applyProjectDisplayPathHints,
+  removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
 
 interface CodeBuddyContentBlock {
@@ -860,6 +861,7 @@ export class CodeBuddyProvider implements ConversationProvider {
       const filePath = await this.findConversationFilePath(sessionId);
       await unlink(filePath);
       this.invalidateConversationCaches(filePath);
+      await removeEmptyParentDirs(filePath, this.getStoragePath());
       return;
     }
     const filePath = await this.findConversationFilePath(sessionId);
@@ -872,6 +874,7 @@ export class CodeBuddyProvider implements ConversationProvider {
       // 同名目录不存在时忽略
     }
     this.invalidateConversationCaches(filePath);
+    await removeEmptyParentDirs(siblingDir, this.getStoragePath());
   }
 
   async move(id: string, targetProjectKey: string): Promise<void> {
