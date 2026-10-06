@@ -1,6 +1,6 @@
 import { serve } from "@hono/node-server";
 import { createApp, DEFAULT_SERVER_HOSTNAME } from "./app.js";
-import { compactCacheDb } from "./utils/cache.js";
+import { compactCacheDb } from "./utils/cache/index.js";
 import { initFileLogger } from "./utils/file-logger.js";
 import { getApiTokenPath, getOrCreateApiToken } from "./utils/api-token.js";
 import { closeCodexAppServerClients } from "./providers/codex-app-server.js";

@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { homedir } from "os";
 import type { ConversationProvider } from "../providers/types.js";
 import { CodexProvider } from "../providers/codex.js";
-import { getAvailableClis, resetSession } from "../utils/ai.js";
+import { getAvailableClis, resetSession } from "../utils/ai/index.js";
 import { getServerLog, getDebugLog, clearServerLog, clearDebugLog, clearAllLogs } from "../utils/file-logger.js";
 import { getErrorMessage } from "../utils/errors.js";
 import {
@@ -20,7 +20,7 @@ import {
   type ResolvedProviderName,
   type TitleGenerationCli,
   type TitleGenerationCliSessionMode,
-} from "../utils/provider-paths.js";
+} from "../utils/provider-paths/index.js";
 
 const RESOLVED_PROVIDER_NAMES = new Set<ResolvedProviderName>(["claude-code", "codex", "opencode", "iflow", "pi", "codebuddy", "workbuddy"]);
 const TITLE_GENERATION_CLI_NAMES = new Set<TitleGenerationCli>(["codex", "claude", "opencode"]);

@@ -6,14 +6,14 @@ import type {
   Message,
   TitleSyncMode,
 } from "../providers/types.js";
-import { generateTitle } from "../utils/ai.js";
+import { generateTitle } from "../utils/ai/index.js";
 import { getErrorMessage, isNotFoundError, MutationConflictError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {
   getTitleGenerationCliPriority,
   getTitleGenerationCliSessionReuse,
   type TitleGenerationCli,
-} from "../utils/provider-paths.js";
+} from "../utils/provider-paths/index.js";
 import {
   deleteNativeTitleSnapshot,
   deleteTitle,

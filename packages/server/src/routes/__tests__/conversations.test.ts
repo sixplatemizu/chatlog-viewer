@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+
+// 测试进程独占锁目录，避免与其他测试运行争用共享锁 key（同 providers/claude-code.test.ts 说明）。
+process.env.CHATLOG_VIEWER_LOCK_DIR = join(tmpdir(), `chatlog-viewer-test-locks-${process.pid}`);
 import { createConversationRoutes } from "../conversations.js";
 import {
   buildTitleGenerationMessages,
@@ -12,7 +15,7 @@ import {
   invalidateListCache,
   setIndexedListCache,
   setCacheStoreDirForTests,
-} from "../../utils/cache.js";
+} from "../../utils/cache/index.js";
 import {
   getNativeTitleSnapshot,
   getTitle,

@@ -10,7 +10,7 @@ import {
   hasFreshIndexedListCache,
   queryConversationIndexPage,
   type ConversationIndexSort,
-} from "../utils/cache.js";
+} from "../utils/cache/index.js";
 import { getErrorMessage, getErrorStatus, isNotFoundError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {

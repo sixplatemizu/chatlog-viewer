@@ -15,7 +15,7 @@ import {
   normalizeTitleGenerationCliSessionModes,
   resolveProviderPaths,
   updateProviderConfigs,
-} from "../../utils/provider-paths.js";
+} from "../../utils/provider-paths/index.js";
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;

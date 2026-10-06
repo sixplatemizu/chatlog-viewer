@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { TitleGenerationCli } from "../utils/provider-paths.js";
+import type { TitleGenerationCli } from "../utils/provider-paths/index.js";
 
 export type ProjectMode = "exact" | "recursive";
 export type ManagedProviderName = "codex" | "claude-code" | "opencode" | "iflow" | "pi" | "codebuddy" | "workbuddy";

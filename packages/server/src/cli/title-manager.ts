@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 import { createDefaultProviders } from "../app.js";
 import type { ConversationMeta, ConversationProvider } from "../providers/types.js";
 import { closeCodexAppServerClients } from "../providers/codex-app-server.js";
-import { detectAvailableTitleGenerationClis } from "../utils/ai.js";
-import type { TitleGenerationCli } from "../utils/provider-paths.js";
+import { detectAvailableTitleGenerationClis } from "../utils/ai/index.js";
+import type { TitleGenerationCli } from "../utils/provider-paths/index.js";
 import {
   formatTitleActionError,
   generateAndPersistConversationTitle,

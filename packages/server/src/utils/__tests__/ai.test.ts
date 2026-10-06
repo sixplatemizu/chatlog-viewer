@@ -11,7 +11,7 @@ import {
   generateTitle,
   getAvailableClis,
   resetSession,
-} from "../ai.js";
+} from "../ai/index.js";
 
 const SAMPLE_MESSAGES: Message[] = [
   {

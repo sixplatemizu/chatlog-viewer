@@ -1,6 +1,6 @@
 # ChatLog Viewer
 
-统一浏览、搜索、整理本机 AI CLI 对话记录的桌面本地 Web 工具，当前默认接入 Claude Code、Codex、OpenCode、iFlow CLI。项目以本地原始数据为准：尽量忠实呈现真实存在的记录，同时用 badge 标记不完整、非默认可见或由 ChatLog Viewer 内部产生的会话。
+统一浏览、搜索、整理本机 AI CLI / GUI 对话记录的桌面本地 Web 工具，当前默认接入 Claude Code、Codex、OpenCode、iFlow、Pi、CodeBuddy、WorkBuddy 七家。项目以本地原始数据为准：尽量忠实呈现真实存在的记录，同时用 badge 标记不完整、非默认可见或由 ChatLog Viewer 内部产生的会话。
 
 ## 亮点
 
@@ -24,6 +24,9 @@
 | Codex state db | `threads` / `conversation_index` | 支持 metadata-only 回填 | 与 Codex 同步 | 不适用于 metadata-only | 支持残留清理 | `~/.codex/state_5.sqlite` |
 | OpenCode | SQLite `session` / `message` / `part` | 支持 | 原生写回 `session.title` | 支持（纯文本 part；保留 tool/reasoning） | 支持 | `~/.local/share/opencode/opencode.db` |
 | iFlow CLI | JSONL transcript | 支持 | 暂禁用，缺少稳定原生标题字段 | 支持 | 支持 | `~/.iflow/projects` |
+| Pi | JSONL transcript | 支持 | 写回 `session_info.name` | 支持 | 支持 | `~/.pi/agent/sessions` |
+| CodeBuddy | JSONL transcript、`subagents/`、`tool-results/` | 支持 | 写回 `ai-title` 行 | 支持 | 支持（级联删除附属目录） | `~/.codebuddy/projects` |
+| WorkBuddy | `workbuddy.db`、projects JSONL | 支持 | 写回 DB `custom_title` | 支持 | 支持（DB + 文件双删） | `~/.workbuddy` |
 
 ### 列表语义
 
@@ -31,7 +34,7 @@ ChatLog Viewer 的管理目标是忠于本地原始对话数据，而不是复�
 
 OpenCode 的 `opencode session list`、TUI `/sessions` 和 ChatLog Viewer 的列表语义不同：前两者是 OpenCode 自身的操作视图，ChatLog Viewer 会显示 DB 中所有 `session` 记录，包括 TUI 默认不显示的子会话、归档会话、30 天外会话、`opencode run` / 自动化 one-shot session，以及 ChatLog Viewer AI 标题生成产生的 session。
 
-Claude Code 会对缺少主 transcript 的记录标记 `history 回填`、`索引空壳`、`无 transcript`；Codex 会对仅存在于 `state_5.sqlite` 的记录标记 `state db`、`无 transcript`、`标题回退`；OpenCode 会标记 `子会话`、`已归档`、`30天外`、`run/临时`、`标题生成` 等原始状态。内部 AI 标题生成会话不再过滤隐藏，而是忠实显示并标记 `标题生成`。
+Claude Code 会对缺少主 transcript 的记录标记 `history 回填`、`索引空壳`、`无 transcript`；Codex 会对仅存在于 `state_5.sqlite` 的记录标记 `state db`、`无 transcript`、`标题回退`；OpenCode 会标记 `子会话`、`已归档`、`30天外`、`run/临时`、`标题生成` 等原始状态；CodeBuddy 会对 subagent 会话标记 `子会话` 并与父会话同组排序；WorkBuddy 会标记 `已归档`，以 DB 为准过滤软删除记录。内部 AI 标题生成会话不再过滤隐藏，而是忠实显示并标记 `标题生成`。
 
 ## 技术栈
 
@@ -119,7 +122,7 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 
 #### 多 Provider 标题 CLI / Skill
 
-项目提供 `pnpm title` 和 `$chatlog-viewer-title` skill，用同一套流程管理 Codex、Claude Code 与 OpenCode 标题。默认 provider 为 Codex，以保持旧命令兼容；使用 `--provider all` 可统一列出或批量处理三者。
+项目提供 `pnpm title` 和 `$chatlog-viewer-title` skill，用同一套流程管理七家 provider 的标题：`list` 支持全部七家，标题写入与 AI 生成面向支持原生标题的六家（iFlow 被能力门控拦截）。默认 provider 为 Codex，以保持旧命令兼容；使用 `--provider all` 可统一列出或批量处理全部七家。
 
 ```bash
 pnpm title -- --provider all
@@ -134,7 +137,7 @@ pnpm title -- generate-batch --provider all --cwd "$PWD" --exact --json --contin
 pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/conversation-title-generate-batch-<timestamp>.json
 ```
 
-- `list` 默认查看 Codex；`--provider codex|claude-code|opencode|all` 选择数据源，`--cwd <path> --exact` 精确匹配项目，`--project <path> --recursive` 包含子目录；内部标题生成会话默认排除
+- `list` 默认查看 Codex；`--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all` 选择数据源，`--cwd <path> --exact` 精确匹配项目，`--project <path> --recursive` 包含子目录；内部标题生成会话默认排除
 - `rename` 按目标 provider 原生写回：Codex 使用 app-server 命名语义，Claude Code 使用 `/rename` metadata，OpenCode 更新 `session.title`
 - `--provider` 决定目标对话来源，`--cli` 决定 AI 生成引擎，两者互相独立；可将 OpenCode 配置为首选引擎，为任意受支持 provider 的对话生成标题
 - OpenCode 的完整 AI 会话仍统一存储在 `~/.local/share/opencode/opencode.db`；`~/.chatlog-viewer/ai-title-sessions/opencode` 仅是隔离工作目录和 fixed session marker，Fresh 模式生成的会话会按 `sessionID` 自动删除
@@ -144,11 +147,11 @@ pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/conversat
 - `rename`、`generate`、`generate-batch` 与 `rollback` 支持 `--json`：stdout 只返回一个 `schemaVersion: 1` JSON，使用 `ok`、`summary.total/success/failed/skipped` 和 `entries[].status` 判断结果；AI 诊断日志写入 stderr
 - `--json` 模式下，dry-run、提前停止后未处理的条目和回滚冲突计入 `skipped`；存在失败条目时进程以非零 code 退出，致命错误以版本化 JSON 写入 stderr
 - 通过 pnpm 调用 JSON 模式时使用 `pnpm --silent`，否则 pnpm 自身的 lifecycle banner 会出现在 stdout，影响直接 JSON 解析
-- 仓库内 `skills/chatlog-viewer-title` 可安装到本机 skill 目录，在 Codex 中用 `$chatlog-viewer-title` 触发同样的三 provider CLI 工作流
+- 仓库内 `skills/chatlog-viewer-title` 可安装到本机 skill 目录，在 Codex 中用 `$chatlog-viewer-title` 触发同样的多 provider 标题工作流
 
 ### 5. 消息级操作
 
-- Codex、Claude Code、iFlow 支持消息编辑、单条删除和批量删除
+- Codex、Claude Code、iFlow、Pi、CodeBuddy、WorkBuddy 支持消息编辑、单条删除和批量删除（OpenCode 仅纯文本 part，见下）
 - 消息 ID 基于原始记录稳定字段或 source key 生成，连续编辑 / 删除后仍可继续定位同一消息
 - OpenCode 暂不开放消息级编辑 / 删除：OpenCode 正文存放在 SQLite `part.data`，一条 UI 消息可能对应多个 `part`，直接改删 `message` 行容易破坏 tool / reasoning / step 结构
 - OpenCode 后续更合适的实现方式是按可见 `part` 级别编辑 / 删除，并尽量对齐 OpenCode 官方 `part.update` / `part.delete` 语义
@@ -246,13 +249,14 @@ packages/
         ├── hooks/         # 数据获取与交互状态
         └── lib/           # API 封装与类型
 skills/
-└── chatlog-viewer-title/   # Codex 中调用三 provider 标题 CLI 的 skill
+└── chatlog-viewer-title/   # Codex 中调用多 provider 标题 CLI 的 skill
 ```
 
 ## 已知限制与后续
 
 - OpenCode 消息编辑 / 删除仅作用于可见纯文本 `part`；tool、reasoning 等结构故意不可改，避免破坏回放。
 - OpenCode 新版 `session_message` 投影表尚未适配；当前主路径为 legacy `message` + `part`。
+- CodeBuddy 主会话与子会话以徽标标记 + 同组排序呈现，未做树状缩进。
 - 大模块拆分（`claude-code.ts` / `codex.ts` / `cache`）属于可维护性优化，不阻塞日常使用。
 
 ## 开发说明

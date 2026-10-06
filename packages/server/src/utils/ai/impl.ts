@@ -3,8 +3,8 @@ import { accessSync, constants, readFileSync } from "fs";
 import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
 import { delimiter, dirname, isAbsolute, join } from "path";
 import type { Message } from "../../providers/types.js";
-import type { TitleGenerationCli } from "../provider-paths.js";
-import { getProviderConfigPath } from "../provider-paths.js";
+import type { TitleGenerationCli } from "../provider-paths/index.js";
+import { getProviderConfigPath } from "../provider-paths/index.js";
 
 type CliToolName = TitleGenerationCli;
 type CliRunMode = "fresh" | "resume" | "resume-fallback-fresh";
