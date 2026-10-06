@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Message } from "../providers/types.js";
 import { MutationConflictError } from "./errors.js";
+import { parseJsonlWithMeta, type JsonlLine } from "./jsonl.js";
 import { runKeyedMutation } from "./mutation-queue.js";
 
 export interface MessageRecord<TEntry> {
@@ -134,6 +135,40 @@ export function getMessageActionLineNumbers(
 
 export function invalidateMessageActionIndex(filePath: string): void {
   messageActionIndexCache.delete(filePath);
+}
+
+/**
+ * 解析指定消息在 jsonl transcript 中的物理行号（供行级改写使用）。
+ * 各 provider 的 transcript 均为 jsonl，差异仅在 entry 类型与 records 构建逻辑，
+ * 因此构建步骤以回调注入；先查内存 action index，未命中再解析文件并回填缓存。
+ */
+export async function resolveMessageLineNumbers<TEntry>(
+  filePath: string,
+  mtimeMs: number,
+  messageIds: string[],
+  buildRecords: (entries: JsonlLine<TEntry>[]) => MessageRecord<TEntry>[]
+): Promise<number[]> {
+  const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
+  if (cached) return cached;
+
+  const entries = await parseJsonlWithMeta<TEntry>(filePath);
+  const records = buildRecords(entries);
+  primeMessageActionIndex(filePath, mtimeMs, records);
+
+  const lineByMessageId = new Map<string, number>();
+  for (const record of records) {
+    if (record.message.messageId && record.lineIndex) {
+      lineByMessageId.set(record.message.messageId, record.lineIndex);
+    }
+  }
+
+  return messageIds.map((messageId) => {
+    const lineNumber = lineByMessageId.get(messageId);
+    if (!lineNumber) {
+      throw new Error(`消息不存在: ${messageId}`);
+    }
+    return lineNumber;
+  });
 }
 
 export function rewriteJsonlLine(

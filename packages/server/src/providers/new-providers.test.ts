@@ -3,10 +3,15 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import BetterSqlite3 from "better-sqlite3";
 import { PiProvider } from "./pi.js";
 import { CodeBuddyProvider } from "./codebuddy.js";
-import { clearProviderPathCache } from "../utils/provider-paths.js";
-import { setCacheStoreDirForTests } from "../utils/cache.js";
+import { WorkBuddyProvider } from "./workbuddy.js";
+import { clearProviderPathCache } from "../utils/provider-paths/index.js";
+import { setCacheStoreDirForTests } from "../utils/cache/index.js";
+
+// 测试进程独占锁目录，避免与其他测试运行争用共享锁 key（同 claude-code.test.ts 说明）。
+process.env.CHATLOG_VIEWER_LOCK_DIR = join(tmpdir(), `chatlog-viewer-test-locks-${process.pid}`);
 
 const PI_SESSION_ID = "01a090ea-6257-748d-87c1-9fcd4d4f09df";
 
@@ -326,6 +331,199 @@ test("CodeBuddy 主会话删除连带子目录、移动连带子目录", async (
     await fixture.provider.delete(`codebuddy:${CB_SESSION_ID}`);
     const afterDelete = await fixture.provider.list();
     assert.equal(afterDelete.length, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+const WB_SESSION_ID = "wb-move-session-1";
+
+function workBuddyLines(sessionId: string, cwd: string): string[] {
+  return [
+    JSON.stringify({
+      id: "wb-msg-1",
+      parentId: null,
+      timestamp: 1789128609238,
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "第一条用户问题" }],
+      sessionId,
+      cwd,
+    }),
+    JSON.stringify({
+      id: "wb-msg-2",
+      parentId: "wb-msg-1",
+      timestamp: 1789128660000,
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "助手回复内容" }],
+      sessionId,
+      cwd,
+    }),
+  ];
+}
+
+interface WorkBuddyFixture {
+  baseDir: string;
+  provider: WorkBuddyProvider;
+  cleanup: () => Promise<void>;
+}
+
+async function createWorkBuddyFixture(): Promise<WorkBuddyFixture> {
+  const baseDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-wb-provider-"));
+  const storeDir = join(baseDir, ".chatlog-viewer");
+  const sourceCwd = "D:/src-project";
+
+  const db = new BetterSqlite3(join(baseDir, "workbuddy.db"));
+  db.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      cwd TEXT,
+      title TEXT,
+      custom_title TEXT,
+      status TEXT,
+      created_at INTEGER,
+      updated_at INTEGER,
+      last_activity_at INTEGER,
+      deleted_at INTEGER,
+      source_mode TEXT,
+      model TEXT,
+      permission_mode TEXT,
+      is_playground INTEGER
+    )
+  `);
+  db.prepare(
+    "INSERT INTO sessions (id, cwd, title, custom_title, status, created_at, updated_at, last_activity_at, deleted_at, source_mode, model, permission_mode, is_playground) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(WB_SESSION_ID, sourceCwd, "原始标题", null, "completed", 1789128609000, 1789128660000, null, null, null, null, null, 0);
+  db.close();
+
+  const sourceProjectDir = join(baseDir, "projects", "d-src-project");
+  await mkdir(sourceProjectDir, { recursive: true });
+  await writeFile(
+    join(sourceProjectDir, `${WB_SESSION_ID}.jsonl`),
+    `${workBuddyLines(WB_SESSION_ID, sourceCwd).join("\n")}\n`,
+    "utf-8"
+  );
+
+  const previousPath = process.env.CHATLOG_VIEWER_WORKBUDDY_PATH;
+  const previousDbPath = process.env.CHATLOG_VIEWER_WORKBUDDY_DB_PATH;
+  const previousStoreDir = process.env.CHATLOG_VIEWER_STORE_DIR;
+  const previousConfigPath = process.env.CHATLOG_VIEWER_CONFIG_PATH;
+  process.env.CHATLOG_VIEWER_WORKBUDDY_PATH = baseDir;
+  delete process.env.CHATLOG_VIEWER_WORKBUDDY_DB_PATH;
+  process.env.CHATLOG_VIEWER_STORE_DIR = storeDir;
+  process.env.CHATLOG_VIEWER_CONFIG_PATH = join(storeDir, "config.json");
+  clearProviderPathCache();
+  setCacheStoreDirForTests(storeDir);
+
+  const provider = new WorkBuddyProvider();
+  return {
+    baseDir,
+    provider,
+    async cleanup() {
+      provider.closeDb();
+      if (previousPath === undefined) delete process.env.CHATLOG_VIEWER_WORKBUDDY_PATH;
+      else process.env.CHATLOG_VIEWER_WORKBUDDY_PATH = previousPath;
+      if (previousDbPath === undefined) delete process.env.CHATLOG_VIEWER_WORKBUDDY_DB_PATH;
+      else process.env.CHATLOG_VIEWER_WORKBUDDY_DB_PATH = previousDbPath;
+      if (previousStoreDir === undefined) delete process.env.CHATLOG_VIEWER_STORE_DIR;
+      else process.env.CHATLOG_VIEWER_STORE_DIR = previousStoreDir;
+      if (previousConfigPath === undefined) delete process.env.CHATLOG_VIEWER_CONFIG_PATH;
+      else process.env.CHATLOG_VIEWER_CONFIG_PATH = previousConfigPath;
+      clearProviderPathCache();
+      setCacheStoreDirForTests();
+      await rm(baseDir, { recursive: true, force: true });
+    },
+  };
+}
+
+test("WorkBuddy 移动会话更新 DB cwd 并按编码目录搬移 transcript", async () => {
+  const fixture = await createWorkBuddyFixture();
+  try {
+    await fixture.provider.move(`workbuddy:${WB_SESSION_ID}`, "D:/ProgramData/WorkBuddy/target");
+
+    const db = new BetterSqlite3(join(fixture.baseDir, "workbuddy.db"), { readonly: true });
+    const row = db.prepare("SELECT cwd FROM sessions WHERE id = ?").get(WB_SESSION_ID) as { cwd: string };
+    db.close();
+    assert.equal(row.cwd, "D:/ProgramData/WorkBuddy/target");
+
+    const movedFile = join(fixture.baseDir, "projects", "d-ProgramData-WorkBuddy-target", `${WB_SESSION_ID}.jsonl`);
+    const content = await readFile(movedFile, "utf-8");
+    assert.match(content, /第一条用户问题/);
+
+    const conversation = await fixture.provider.read(`workbuddy:${WB_SESSION_ID}`);
+    assert.equal(conversation.messages.length, 2);
+    assert.equal(conversation.projectKey, "d:/programdata/workbuddy/target");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("WorkBuddy 移动到非法目录被拒绝且 DB 与文件保持原状", async () => {
+  const fixture = await createWorkBuddyFixture();
+  try {
+    await assert.rejects(
+      () => fixture.provider.move(`workbuddy:${WB_SESSION_ID}`, "../../escape"),
+      /目标文件夹不合法/
+    );
+
+    const db = new BetterSqlite3(join(fixture.baseDir, "workbuddy.db"), { readonly: true });
+    const row = db.prepare("SELECT cwd FROM sessions WHERE id = ?").get(WB_SESSION_ID) as { cwd: string };
+    db.close();
+    assert.equal(row.cwd, "D:/src-project");
+
+    const stillThere = await readFile(
+      join(fixture.baseDir, "projects", "d-src-project", `${WB_SESSION_ID}.jsonl`),
+      "utf-8"
+    );
+    assert.match(stillThere, /第一条用户问题/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("WorkBuddy 移动到已有同名 transcript 的目标目录被拒绝且状态不变", async () => {
+  const fixture = await createWorkBuddyFixture();
+  try {
+    const conflictDir = join(fixture.baseDir, "projects", "d-ProgramData-WorkBuddy-target");
+    await mkdir(conflictDir, { recursive: true });
+    await writeFile(join(conflictDir, `${WB_SESSION_ID}.jsonl`), "占位内容\n", "utf-8");
+
+    // 同一 sessionId 出现多副本时定位直接报错，move 拒绝执行而不是静默只改 DB
+    await assert.rejects(
+      () => fixture.provider.move(`workbuddy:${WB_SESSION_ID}`, "D:/ProgramData/WorkBuddy/target"),
+      /定位到多个同名对话文件/
+    );
+
+    const db = new BetterSqlite3(join(fixture.baseDir, "workbuddy.db"), { readonly: true });
+    const row = db.prepare("SELECT cwd FROM sessions WHERE id = ?").get(WB_SESSION_ID) as { cwd: string };
+    db.close();
+    assert.equal(row.cwd, "D:/src-project");
+
+    const stillThere = await readFile(
+      join(fixture.baseDir, "projects", "d-src-project", `${WB_SESSION_ID}.jsonl`),
+      "utf-8"
+    );
+    assert.match(stillThere, /第一条用户问题/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("CodeBuddy 移动到已有同名 transcript 的目标目录被拒绝且源文件不动", async () => {
+  const fixture = await createCodeBuddyFixture();
+  try {
+    const conflictDir = join(fixture.baseDir, "projects", "d-other-project");
+    await mkdir(conflictDir, { recursive: true });
+    await writeFile(join(conflictDir, `${CB_SESSION_ID}.jsonl`), "占位内容\n", "utf-8");
+
+    await assert.rejects(
+      () => fixture.provider.move(`codebuddy:${CB_SESSION_ID}`, "d-other-project"),
+      /定位到多个同名对话文件/
+    );
+
+    const stillThere = await readFile(fixture.filePath, "utf-8");
+    assert.match(stillThere, /第一条用户问题/);
   } finally {
     await fixture.cleanup();
   }

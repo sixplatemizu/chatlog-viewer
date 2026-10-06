@@ -1,8 +1,8 @@
 import { dirname, join } from "path";
-import { rmdir } from "fs/promises";
+import { mkdir, rename, rmdir, stat } from "fs/promises";
 import { realpathSync } from "fs";
 import type { ConversationMeta, ConversationReadOptions } from "../types.js";
-import { getCached, setCache } from "../../utils/cache.js";
+import { getCached, setCache } from "../../utils/cache/index.js";
 
 // 删除后向上清理空目录（止于 storage 根，不删除 storage 本身；多 provider 共用）
 export async function removeEmptyParentDirs(startPath: string, stopDir: string): Promise<void> {
@@ -124,6 +124,28 @@ export function resolveProjectDirectory(basePath: string, targetProjectKey: stri
     normalizedProjectKey,
     targetProjectDir,
   };
+}
+
+// 单文件 transcript 类 provider（iflow/pi 等）的 move 公共实现：
+// 解析目标目录（单级目录名）→ 建目录 → 目标同名拒绝 → 源目标同路径短路 → 原子 rename。
+// 返回 null 表示源目标同路径无需搬移；否则返回源/目标路径供调用方做缓存失效。
+export async function moveTranscriptFileToProject(options: {
+  basePath: string;
+  targetProjectKey: string;
+  findSourceFile: () => Promise<string>;
+}): Promise<{ srcFile: string; destFile: string } | null> {
+  const srcFile = await options.findSourceFile();
+  const fileName = srcFile.split(/[/\\]/).pop()!;
+  const { targetProjectDir } = resolveProjectDirectory(options.basePath, options.targetProjectKey);
+  await mkdir(targetProjectDir, { recursive: true });
+  const destFile = join(targetProjectDir, fileName);
+  if (await stat(destFile).then(() => true, () => false)) {
+    throw new Error(`目标目录已存在同名 transcript: ${destFile}`);
+  }
+
+  if (srcFile.replace(/\\/g, "/") === destFile.replace(/\\/g, "/")) return null;
+  await rename(srcFile, destFile);
+  return { srcFile, destFile };
 }
 
 export function applyProjectDisplayPathHints(

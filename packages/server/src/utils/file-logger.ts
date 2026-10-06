@@ -1,6 +1,6 @@
 import { appendFile, mkdir, readdir, rm, readFile, stat, writeFile } from "fs/promises";
 import { dirname, join } from "path";
-import { getProviderConfigPath } from "./provider-paths.js";
+import { getProviderConfigPath } from "./provider-paths/index.js";
 
 const LOG_DIR = join(dirname(getProviderConfigPath()), "logs");
 // 单文件超过此行数后整体保留尾部 MAX_LOG_LINES 行，避免无限增长。

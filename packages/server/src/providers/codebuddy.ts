@@ -9,9 +9,9 @@ import {
   visitJsonl,
   type JsonlLine,
 } from "../utils/jsonl.js";
-import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache/index.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderPaths } from "../utils/provider-paths/index.js";
 import {
   createProviderDataError,
   isFileSystemNotFoundError,
@@ -30,10 +30,10 @@ import {
   assignStableMessageIds,
   createMessageSourceKey,
   createStableMessageSourceKey,
-  getMessageActionLineNumbers,
   invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
   primeMessageActionIndex,
+  resolveMessageLineNumbers,
   rewriteJsonlFileLine,
   rewriteJsonlFileLines,
   type MessageRecord,
@@ -793,34 +793,6 @@ export class CodeBuddyProvider implements ConversationProvider {
     invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
   }
 
-  private async resolveMessageLineNumbers(
-    filePath: string,
-    mtimeMs: number,
-    messageIds: string[]
-  ): Promise<number[]> {
-    const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
-    if (cached) return cached;
-
-    const entries = await parseJsonlWithMeta<CodeBuddyEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    primeMessageActionIndex(filePath, mtimeMs, records);
-
-    const lineByMessageId = new Map<string, number>();
-    for (const record of records) {
-      if (record.message.messageId && record.lineIndex) {
-        lineByMessageId.set(record.message.messageId, record.lineIndex);
-      }
-    }
-
-    return messageIds.map((messageId) => {
-      const lineNumber = lineByMessageId.get(messageId);
-      if (!lineNumber) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      return lineNumber;
-    });
-  }
-
   async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
     const sessionId = id.replace("codebuddy:", "");
     const filePath = await this.findConversationFilePath(sessionId);
@@ -888,19 +860,25 @@ export class CodeBuddyProvider implements ConversationProvider {
     const { targetProjectDir } = resolveProjectDirectory(basePath, targetProjectKey);
     await mkdir(targetProjectDir, { recursive: true });
     const destFile = join(targetProjectDir, fileName);
+    if (await stat(destFile).then(() => true, () => false)) {
+      throw new Error(`目标目录已存在同名 transcript: ${destFile}`);
+    }
 
     if (srcFile.replace(/\\/g, "/") === destFile.replace(/\\/g, "/")) return;
     await rename(srcFile, destFile);
-    // 连带移动同名子目录
+    // 连带移动同名子目录；搬移失败时回滚主文件，避免会话与附属数据分裂
     const srcDir = srcFile.replace(/\.jsonl$/, "");
     const destDir = destFile.replace(/\.jsonl$/, "");
-    try {
-      const dirStat = await stat(srcDir);
-      if (dirStat.isDirectory()) {
+    const hasSideDir = await stat(srcDir).then((entry) => entry.isDirectory(), () => false);
+    if (hasSideDir) {
+      try {
         await rename(srcDir, destDir);
+      } catch (error) {
+        await rename(destFile, srcFile).catch(() => {
+          // 回滚失败时仍抛出搬移错误，由用户重试恢复
+        });
+        throw error;
       }
-    } catch {
-      // 无同名目录时忽略
     }
     this.invalidateConversationCaches(srcFile);
   }
@@ -962,7 +940,7 @@ export class CodeBuddyProvider implements ConversationProvider {
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
     const filePath = await this.findConversationFilePath(id.replace("codebuddy:", ""));
     const fileStat = await stat(filePath);
-    const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
+    const [lineNumber] = await resolveMessageLineNumbers<CodeBuddyEntry>(filePath, fileStat.mtimeMs, [messageId], buildMessageRecords);
     const normalizedContent = normalizeUpdatedMessageContent(content);
     await rewriteJsonlFileLine(
       filePath,
@@ -995,7 +973,7 @@ export class CodeBuddyProvider implements ConversationProvider {
     if (uniqueMessageIds.length === 0) {
       throw new Error("待删除消息不能为空");
     }
-    const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
+    const lineNumbers = await resolveMessageLineNumbers<CodeBuddyEntry>(filePath, fileStat.mtimeMs, uniqueMessageIds, buildMessageRecords);
     await rewriteJsonlFileLines(
       filePath,
       lineNumbers,

@@ -1,5 +1,5 @@
 import { dirname, join } from "path";
-import { getProviderConfigPath } from "../utils/provider-paths.js";
+import { getProviderConfigPath } from "../utils/provider-paths/index.js";
 import type { ConversationBadge, ConversationMeta } from "./types.js";
 import type { CodexThreadMetadata, CodexThreadRow } from "./codex-sqlite-client.js";
 import { normalizePath } from "./shared/provider-utils.js";

@@ -4,9 +4,14 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeCodeProvider } from "./claude-code.js";
-import { clearProviderPathCache } from "../utils/provider-paths.js";
-import { getIndexedCacheSnapshot, getIndexedListCacheKey, setCacheStoreDirForTests } from "../utils/cache.js";
+import { clearProviderPathCache } from "../utils/provider-paths/index.js";
+import { getIndexedCacheSnapshot, getIndexedListCacheKey, setCacheStoreDirForTests } from "../utils/cache/index.js";
 import { setNativeTitleSnapshot } from "../utils/title-store.js";
+
+// 测试进程独占锁目录：跨运行的锁 key（如 claude-move:<sessionId>）是共享的，
+// 若共用 ~/.chatlog-viewer/locks，背靠背连跑会命中上一轮残留的锁文件（120 秒
+// 新鲜窗口内不可接管，等待 30 秒即超时）。隔离到本进程专属目录以根除瞬态失败。
+process.env.CHATLOG_VIEWER_LOCK_DIR = join(tmpdir(), `chatlog-viewer-test-locks-${process.pid}`);
 
 function createHistoryLine(input: {
   display: string;

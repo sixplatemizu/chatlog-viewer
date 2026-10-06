@@ -7,9 +7,9 @@ import {
   parseJsonlTailWithMeta,
   type JsonlLine,
 } from "../utils/jsonl.js";
-import { getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
+import { getIndexedListCache, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache/index.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderPaths } from "../utils/provider-paths/index.js";
 import {
   createProviderDataError,
   isFileSystemNotFoundError,
@@ -27,10 +27,10 @@ import {
   assignStableMessageIds,
   createMessageSourceKey,
   createStableMessageSourceKey,
-  getMessageActionLineNumbers,
   invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
   primeMessageActionIndex,
+  resolveMessageLineNumbers,
   rewriteJsonlFileLine,
   rewriteJsonlFileLines,
   type MessageRecord,
@@ -50,7 +50,6 @@ import {
   getProjectSpecificity,
   getListCacheKey,
   sliceWindow,
-  resolveProjectDirectory,
   applyProjectDisplayPathHints,
   removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
@@ -261,6 +260,18 @@ function buildBadges(row: Pick<WorkBuddySessionRow, "status" | "deleted_at" | "s
     });
   }
   return badges.length > 0 ? badges : undefined;
+}
+
+// projects 子目录名编码：按 / 与 \ 分段，盘符段去冒号转小写，段间以 - 连接。
+// 与 WorkBuddy 产品的存储布局一致（如 D:/a/b → d-a-b）。
+function encodeWorkBuddyProjectDir(cwd: string): string {
+  const segments = cwd.split(/[\\/]+/).filter((segment) => segment.length > 0);
+  if (segments.length === 0 || segments.some((segment) => segment === "." || segment === "..")) {
+    throw new Error("目标文件夹不合法");
+  }
+  const [first, ...rest] = segments;
+  const head = first && /^[A-Za-z]:$/.test(first) ? first.slice(0, 1).toLowerCase() : first!;
+  return [head, ...rest].join("-");
 }
 
 export class WorkBuddyProvider implements ConversationProvider {
@@ -671,36 +682,51 @@ export class WorkBuddyProvider implements ConversationProvider {
     if (!this.findSessionRow(sessionId)) {
       throw new Error(`对话不存在: ${id}`);
     }
+    const targetDirName = encodeWorkBuddyProjectDir(targetCwd);
 
-    await runKeyedMutation(this.mutationKey(sessionId), async () => {
-      const db = this.getWriteDb();
-      try {
-        const result = db.prepare("UPDATE sessions SET cwd = ?, updated_at = ? WHERE id = ?")
-          .run(targetCwd, Date.now(), sessionId);
-        if (result.changes === 0) {
-          throw new Error(`对话不存在: ${id}`);
-        }
-      } finally {
-        db.close();
-      }
-    });
-
-    // transcript 文件随 project key 目录一起搬移
-    const transcriptPath = await this.locateTranscriptFile(sessionId).catch(() => null);
+    // 先搬移 transcript 文件，成功后再更新 DB cwd；文件搬移失败时 DB 保持原状。
+    // 多副本等定位异常直接向上传播，不允许静默降级为仅更新 DB。
+    const transcriptPath = await this.locateTranscriptFile(sessionId);
+    let movedTranscript: { from: string; to: string } | null = null;
     if (transcriptPath) {
-      const { targetProjectDir } = resolveProjectDirectory(
-        join(this.getStoragePath(), "projects"),
-        targetProjectKey
-      );
+      const targetProjectDir = join(this.getStoragePath(), "projects", targetDirName);
       await mkdir(targetProjectDir, { recursive: true });
       const destFile = join(targetProjectDir, `${sessionId}.jsonl`);
+      if (await stat(destFile).then(() => true, () => false)) {
+        throw new Error(`目标目录已存在同名 transcript: ${destFile}`);
+      }
       if (transcriptPath.replace(/\\/g, "/") !== destFile.replace(/\\/g, "/")) {
         await rename(transcriptPath, destFile);
-        invalidateCache(transcriptPath);
-        invalidateMessageActionIndex(transcriptPath);
+        movedTranscript = { from: transcriptPath, to: destFile };
       }
     }
 
+    try {
+      await runKeyedMutation(this.mutationKey(sessionId), async () => {
+        const db = this.getWriteDb();
+        try {
+          const result = db.prepare("UPDATE sessions SET cwd = ?, updated_at = ? WHERE id = ?")
+            .run(targetCwd, Date.now(), sessionId);
+          if (result.changes === 0) {
+            throw new Error(`对话不存在: ${id}`);
+          }
+        } finally {
+          db.close();
+        }
+      });
+    } catch (error) {
+      if (movedTranscript) {
+        await rename(movedTranscript.to, movedTranscript.from).catch((rollbackError) => {
+          logProviderError("conversations.move", this.name, rollbackError);
+        });
+      }
+      throw error;
+    }
+
+    if (movedTranscript) {
+      invalidateCache(movedTranscript.from);
+      invalidateMessageActionIndex(movedTranscript.from);
+    }
     this.invalidateSessionCaches(sessionId);
   }
 
@@ -731,34 +757,6 @@ export class WorkBuddyProvider implements ConversationProvider {
     this.invalidateSessionCaches(sessionId);
   }
 
-  private async resolveTranscriptMessageLineNumbers(
-    transcriptPath: string,
-    mtimeMs: number,
-    messageIds: string[]
-  ): Promise<number[]> {
-    const cached = getMessageActionLineNumbers(transcriptPath, mtimeMs, messageIds);
-    if (cached) return cached;
-
-    const entries = await parseJsonlWithMeta<WorkBuddyEntry>(transcriptPath);
-    const records = buildMessageRecords(entries);
-    primeMessageActionIndex(transcriptPath, mtimeMs, records);
-
-    const lineByMessageId = new Map<string, number>();
-    for (const record of records) {
-      if (record.message.messageId && record.lineIndex) {
-        lineByMessageId.set(record.message.messageId, record.lineIndex);
-      }
-    }
-
-    return messageIds.map((messageId) => {
-      const lineNumber = lineByMessageId.get(messageId);
-      if (!lineNumber) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      return lineNumber;
-    });
-  }
-
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
     const sessionId = id.replace("workbuddy:", "");
     const normalizedContent = normalizeUpdatedMessageContent(content);
@@ -767,7 +765,7 @@ export class WorkBuddyProvider implements ConversationProvider {
       throw new Error(`该对话仅有元数据，无可编辑的消息: ${id}`);
     }
     const fileStat = await stat(transcriptPath);
-    const [lineNumber] = await this.resolveTranscriptMessageLineNumbers(transcriptPath, fileStat.mtimeMs, [messageId]);
+    const [lineNumber] = await resolveMessageLineNumbers<WorkBuddyEntry>(transcriptPath, fileStat.mtimeMs, [messageId], buildMessageRecords);
     await rewriteJsonlFileLine(
       transcriptPath,
       lineNumber,
@@ -801,7 +799,7 @@ export class WorkBuddyProvider implements ConversationProvider {
       throw new Error(`该对话仅有元数据，无可删除的消息: ${id}`);
     }
     const fileStat = await stat(transcriptPath);
-    const lineNumbers = await this.resolveTranscriptMessageLineNumbers(transcriptPath, fileStat.mtimeMs, uniqueMessageIds);
+    const lineNumbers = await resolveMessageLineNumbers<WorkBuddyEntry>(transcriptPath, fileStat.mtimeMs, uniqueMessageIds, buildMessageRecords);
     await rewriteJsonlFileLines(
       transcriptPath,
       lineNumbers,

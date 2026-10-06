@@ -1,5 +1,5 @@
 import { join } from "path";
-import { stat, unlink, rename, mkdir, readdir } from "fs/promises";
+import { stat, unlink, readdir } from "fs/promises";
 import { glob } from "glob";
 import {
   parseJsonlWithMeta,
@@ -9,9 +9,9 @@ import {
   visitJsonl,
   type JsonlLine,
 } from "../utils/jsonl.js";
-import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache/index.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderPaths } from "../utils/provider-paths/index.js";
 import {
   createProviderDataError,
   isFileSystemNotFoundError,
@@ -31,10 +31,10 @@ import {
   assignStableMessageIds,
   createMessageSourceKey,
   createStableMessageSourceKey,
-  getMessageActionLineNumbers,
   invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
   primeMessageActionIndex,
+  resolveMessageLineNumbers,
   rewriteJsonlFileLine,
   rewriteJsonlFileLines,
   type MessageRecord,
@@ -52,7 +52,7 @@ import {
   getProjectSpecificity,
   getListCacheKey,
   sliceWindow,
-  resolveProjectDirectory,
+  moveTranscriptFileToProject,
   applyProjectDisplayPathHints,
   removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
@@ -583,34 +583,6 @@ export class IFlowProvider implements ConversationProvider {
     invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
   }
 
-  private async resolveMessageLineNumbers(
-    filePath: string,
-    mtimeMs: number,
-    messageIds: string[]
-  ): Promise<number[]> {
-    const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
-    if (cached) return cached;
-
-    const entries = await parseJsonlWithMeta<IFlowEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    primeMessageActionIndex(filePath, mtimeMs, records);
-
-    const lineByMessageId = new Map<string, number>();
-    for (const record of records) {
-      if (record.message.messageId && record.lineIndex) {
-        lineByMessageId.set(record.message.messageId, record.lineIndex);
-      }
-    }
-
-    return messageIds.map((messageId) => {
-      const lineNumber = lineByMessageId.get(messageId);
-      if (!lineNumber) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      return lineNumber;
-    });
-  }
-
   async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
     const sessionId = id.replace("iflow:", "");
     const filePath = await this.findConversationFilePath(sessionId);
@@ -654,23 +626,21 @@ export class IFlowProvider implements ConversationProvider {
 
   async move(id: string, targetProjectKey: string): Promise<void> {
     const sessionId = id.replace("iflow:", "");
-    const basePath = this.getStoragePath();
-    const srcFile = await this.findConversationFilePath(sessionId);
-    const fileName = srcFile.split(/[/\\]/).pop()!;
-    const { targetProjectDir } = resolveProjectDirectory(basePath, targetProjectKey);
-    await mkdir(targetProjectDir, { recursive: true });
-    const destFile = join(targetProjectDir, fileName);
-
-    if (srcFile.replace(/\\/g, "/") === destFile.replace(/\\/g, "/")) return;
-    await rename(srcFile, destFile);
-    this.invalidateConversationCaches(srcFile);
+    const moved = await moveTranscriptFileToProject({
+      basePath: this.getStoragePath(),
+      targetProjectKey,
+      findSourceFile: () => this.findConversationFilePath(sessionId),
+    });
+    if (moved) {
+      this.invalidateConversationCaches(moved.srcFile);
+    }
   }
 
   async updateMessage(id: string, messageId: string, content: string): Promise<void> {
     const sessionId = id.replace("iflow:", "");
     const filePath = await this.findConversationFilePath(sessionId);
     const fileStat = await stat(filePath);
-    const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
+    const [lineNumber] = await resolveMessageLineNumbers<IFlowEntry>(filePath, fileStat.mtimeMs, [messageId], buildMessageRecords);
     const normalizedContent = normalizeUpdatedMessageContent(content);
     await rewriteJsonlFileLine(
       filePath,
@@ -709,7 +679,7 @@ export class IFlowProvider implements ConversationProvider {
     if (uniqueMessageIds.length === 0) {
       throw new Error("待删除消息不能为空");
     }
-    const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
+    const lineNumbers = await resolveMessageLineNumbers<IFlowEntry>(filePath, fileStat.mtimeMs, uniqueMessageIds, buildMessageRecords);
     await rewriteJsonlFileLines(
       filePath,
       lineNumbers,

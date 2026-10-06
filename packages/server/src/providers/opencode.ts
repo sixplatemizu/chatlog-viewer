@@ -10,8 +10,8 @@ import {
   setCache,
   setIndexedListCache,
   type IndexedCacheItem,
-} from "../utils/cache.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+} from "../utils/cache/index.js";
+import { getProviderPaths } from "../utils/provider-paths/index.js";
 import {
   MutationConflictError,
   ProviderDataError,

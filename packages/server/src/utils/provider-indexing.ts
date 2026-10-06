@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { stat } from "fs/promises";
 import { glob } from "glob";
-import type { IndexedCacheItem } from "./cache.js";
+import type { IndexedCacheItem } from "./cache/index.js";
 import { isFileSystemNotFoundError } from "./errors.js";
 
 const FILE_STATE_STAT_BATCH_SIZE = 128;

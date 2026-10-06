@@ -9,9 +9,12 @@ import { ClaudeCodeProvider } from "./claude-code.js";
 import { clearCodexMessageIdentityCacheForTests, CodexProvider } from "./codex.js";
 import { IFlowProvider } from "./iflow.js";
 import { OpenCodeProvider } from "./opencode.js";
-import { clearProviderPathCache } from "../utils/provider-paths.js";
-import { getIndexedCacheSnapshot, getIndexedListCacheKey, queryConversationIndex, setCacheStoreDirForTests } from "../utils/cache.js";
+import { clearProviderPathCache } from "../utils/provider-paths/index.js";
+import { getIndexedCacheSnapshot, getIndexedListCacheKey, queryConversationIndex, setCacheStoreDirForTests } from "../utils/cache/index.js";
 import { getNativeTitleSnapshot, setNativeTitleSnapshot } from "../utils/title-store.js";
+
+// 测试进程独占锁目录，避免与其他测试运行争用共享锁 key（同 claude-code.test.ts 说明）。
+process.env.CHATLOG_VIEWER_LOCK_DIR = join(tmpdir(), `chatlog-viewer-test-locks-${process.pid}`);
 
 const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;

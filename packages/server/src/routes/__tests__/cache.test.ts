@@ -12,7 +12,7 @@ import {
   setIndexedListCache,
   invalidateListCache,
   setCacheStoreDirForTests,
-} from "../../utils/cache.js";
+} from "../../utils/cache/index.js";
 import { SEARCH_INDEX_VERSION } from "../../utils/search-index.js";
 import type { ConversationMeta } from "../../providers/types.js";
 

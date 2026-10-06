@@ -116,6 +116,46 @@ function pickBetterDisplayPath(current: string, candidate: string, projectKey: s
   return current;
 }
 
+function isCodeBuddySubConversation(conv: ConversationMeta): boolean {
+  return conv.provider === "codebuddy" && conv.id.startsWith("codebuddy:sub:");
+}
+
+function getCodeBuddySubParentId(conv: ConversationMeta): string {
+  const parentSessionId = (conv.projectKey || "").split("/").pop() ?? "";
+  return parentSessionId ? `codebuddy:${parentSessionId}` : "";
+}
+
+// CodeBuddy 树状展示：让每个子会话紧随其父会话之后（父前子后、其余保持原相对顺序，孤儿子会话沉底）
+function orderByParentFirst(conversations: ConversationMeta[]): ConversationMeta[] {
+  if (!conversations.some(isCodeBuddySubConversation)) return conversations;
+  const subsByParent = new Map<string, ConversationMeta[]>();
+  for (const conv of conversations) {
+    if (!isCodeBuddySubConversation(conv)) continue;
+    const parentId = getCodeBuddySubParentId(conv);
+    if (!parentId) continue;
+    const bucket = subsByParent.get(parentId);
+    if (bucket) bucket.push(conv);
+    else subsByParent.set(parentId, [conv]);
+  }
+  if (subsByParent.size === 0) return conversations;
+
+  const ordered: ConversationMeta[] = [];
+  const emitted = new Set<ConversationMeta>();
+  for (const conv of conversations) {
+    if (isCodeBuddySubConversation(conv)) continue;
+    ordered.push(conv);
+    const subs = subsByParent.get(conv.id);
+    if (subs) {
+      ordered.push(...subs);
+      subs.forEach((sub) => emitted.add(sub));
+    }
+  }
+  for (const conv of conversations) {
+    if (isCodeBuddySubConversation(conv) && !emitted.has(conv)) ordered.push(conv);
+  }
+  return ordered;
+}
+
 function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] {
   const groups = new Map<string, ConversationGroup>();
 
@@ -144,6 +184,13 @@ function groupByProject(conversations: ConversationMeta[]): ConversationGroup[] 
 
     group.conversations.push(conv);
     group.ids.push(conv.id);
+  }
+
+  for (const group of groups.values()) {
+    if (group.provider === "codebuddy") {
+      group.conversations = orderByParentFirst(group.conversations);
+      group.ids = group.conversations.map((conv) => conv.id);
+    }
   }
 
   return [...groups.values()];
@@ -196,11 +243,15 @@ const ConversationRow = memo(function ConversationRow({
     e.dataTransfer.effectAllowed = "move";
   };
 
+  const isSub = isCodeBuddySubConversation(conv);
+
   return (
     <div
       draggable={conv.capabilities?.canMoveConversation !== false}
       onDragStart={handleDragStart}
-      className={`flex items-start gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${
+      className={`relative flex items-start gap-2 py-2 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${
+        isSub ? "pl-12 pr-3" : "px-3"
+      } ${
         conv.capabilities?.canMoveConversation === false ? "cursor-pointer" : "cursor-grab active:cursor-grabbing"
       } ${
         selected
@@ -209,6 +260,18 @@ const ConversationRow = memo(function ConversationRow({
       } ${checked && !selected ? "bg-blue-50/50 dark:bg-blue-900/10" : ""}`}
       onClick={() => onSelect(conv.id)}
     >
+      {isSub && (
+        <>
+          <span
+            aria-hidden
+            className="absolute left-6 top-0 bottom-0 border-l border-gray-200 dark:border-gray-600"
+          />
+          <span
+            aria-hidden
+            className="absolute left-6 top-1/2 w-3 border-t border-gray-200 dark:border-gray-600"
+          />
+        </>
+      )}
       <input
         type="checkbox"
         checked={checked}

@@ -1,536 +1,77 @@
-import { randomUUID } from "crypto";
-import { dirname, join } from "path";
-import { mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from "fs/promises";
+import { readFile, readdir, stat, unlink, rm, mkdir, rename, writeFile } from "fs/promises";
+import { join } from "path";
 import {
   parseJsonlWithMeta,
   parseJsonlHead,
   parseJsonlTailWithMeta,
   countLines,
   visitJsonl,
-  type JsonlLine,
 } from "../utils/jsonl.js";
-import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache.js";
+import { getCached, getIndexedCacheSnapshot, getIndexedListCache, hasIndexedSearchData, setCache, setIndexedListCache, invalidateCache, invalidateListCache, type IndexedCacheItem } from "../utils/cache/index.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderConfigPath, getProviderPaths } from "../utils/provider-paths.js";
-import {
-  ProviderDataError,
-  createProviderDataError,
-  isFileSystemNotFoundError,
-} from "../utils/errors.js";
+import { getProviderPaths } from "../utils/provider-paths/index.js";
+import { createProviderDataError, isFileSystemNotFoundError } from "../utils/errors.js";
 import { runKeyedMutation, runKeyedMutations } from "../utils/mutation-queue.js";
+import { collectIndexedCacheItemsInBatches } from "../utils/provider-indexing.js";
+import { createConversationSearchIndexBuilder, type ConversationSearchIndex } from "../utils/search-index.js";
 import {
-  collectIndexedCacheItemsInBatches,
-  createIndexedListSourceSignature,
-  type IndexedSourceFile,
-} from "../utils/provider-indexing.js";
-import {
-  createConversationSearchIndexBuilder,
-  type ConversationSearchIndex,
-  type ConversationSearchIndexBuilder,
-} from "../utils/search-index.js";
-import {
-  assignStableMessageIds,
-  createMessageSourceKey,
-  createStableMessageSourceKey,
-  getMessageActionLineNumbers,
   invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
   primeMessageActionIndex,
+  resolveMessageLineNumbers,
   rewriteJsonlFileLine,
   rewriteJsonlFileLines,
-  type MessageRecord,
 } from "../utils/message-actions.js";
 import type {
   ConversationProvider,
   ConversationMeta,
   Conversation,
-  Message,
-  ConversationBadge,
   ConversationReadOptions,
   ConversationListOptions,
 } from "./types.js";
 import {
   normalizePath,
   canonicalizeProjectPath,
-  getProjectSpecificity,
   getListCacheKey,
   sliceWindow,
   resolveProjectDirectory,
   applyProjectDisplayPathHints,
   removeEmptyParentDirs,
 } from "./shared/provider-utils.js";
-
-const CLAUDE_CODE_LIST_SOURCE_VERSION = "claude-code-list-v3-native-title";
-const CLAUDE_TITLE_GENERATION_BADGE_LABEL = "标题生成";
-
-interface ClaudeCodeEntry {
-  type: string;
-  subtype?: string;
-  uuid?: string;
-  messageId?: string;
-  parentUuid?: string | null;
-  sessionId?: string;
-  isSidechain?: boolean;
-  isMeta?: boolean;
-  message?: {
-    role: string;
-    content: string | Array<{ type: string; text?: string; id?: string; name?: string; input?: unknown }>;
-    id?: string;
-    model?: string;
-  };
-  cwd?: string;
-  timestamp?: string;
-  // 仅在 type==="custom-title" / "agent-name" / "summary" 等元数据条目上出现，
-  // Claude /resume 的"会话名"主要来源；UI 也应优先用这个。
-  customTitle?: string;
-  agentName?: string;
-  summary?: string;
-}
-
-interface ClaudeCodeSessionIndexEntry {
-  sessionId?: string;
-  fullPath?: string;
-  fileMtime?: number;
-  firstPrompt?: string;
-  summary?: string;
-  customTitle?: string;
-  messageCount?: number;
-  created?: string;
-  modified?: string;
-  gitBranch?: string;
-  projectPath?: string;
-  isSidechain?: boolean;
-  agentName?: string;
-}
-
-interface ClaudeCodeSessionIndexFile {
-  version?: number;
-  entries?: ClaudeCodeSessionIndexEntry[];
-  originalPath?: string;
-}
-
-interface ClaudeCodeHistoryEntry {
-  display?: string;
-  timestamp?: number;
-  project?: string;
-  sessionId?: string;
-}
-
-interface ClaudeHistorySession {
-  projectPath?: string;
-  firstPrompt?: string;
-  createdAt?: number;
-  updatedAt?: number;
-  messageCount: number;
-  messages: Message[];
-}
-
-interface ClaudeCodeSessionSource {
-  key: string;
-  sessionId: string;
-  projectKey: string;
-  projectDirPath: string;
-  indexPath: string;
-  transcriptPath?: string;
-  sessionDirPath?: string;
-  fullPathHint?: string;
-  projectPathHint?: string;
-  displayTitleHint?: string;
-  firstPromptHint?: string;
-  createdAtHint?: number;
-  updatedAtHint: number;
-  fileSizeHint: number;
-  messageCountHint?: number;
-  historySession?: ClaudeHistorySession;
-}
-
-type ClaudeCodeContentBlock = {
-  type: string;
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-};
-
-function extractTextContent(
-  content: string | ClaudeCodeContentBlock[]
-): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b) => b.type === "text" && b.text)
-    .map((b) => b.text!)
-    .join("\n");
-}
-
-function extractToolCalls(
-  content: ClaudeCodeContentBlock[]
-): Message[] {
-  if (!Array.isArray(content)) return [];
-  return content
-    .filter((b) => b.type === "tool_use")
-    .map((b) => ({
-      role: "tool" as const,
-      content: "",
-      toolName: b.name || "unknown",
-      toolInput: typeof b.input === "string" ? b.input : JSON.stringify(b.input, null, 2),
-    }));
-}
-
-function isPureTextContent(content: string | ClaudeCodeContentBlock[]): boolean {
-  return typeof content === "string"
-    || (Array.isArray(content) && content.every((block) => block.type === "text"));
-}
-
-function normalizeTitleCandidate(value?: string | null): string | undefined {
-  if (!value) return undefined;
-  const normalized = value
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return normalized || undefined;
-}
-
-function buildConversationTitle(...candidates: Array<string | undefined>): string {
-  for (const candidate of candidates) {
-    const normalized = normalizeTitleCandidate(candidate);
-    if (normalized) {
-      return normalized.slice(0, 100);
-    }
-  }
-  return "未知对话";
-}
-
-function normalizeClaudePathForCompare(value?: string | null): string {
-  return normalizePath(value ?? "").replace(/^\/\/\?\//, "").toLowerCase();
-}
-
-function getClaudeTitleSessionProjectPath(): string {
-  return join(dirname(getProviderConfigPath()), "ai-title-sessions", "claude");
-}
-
-function isClaudeTitleGenerationProject(value?: string | null): boolean {
-  const normalized = normalizeClaudePathForCompare(value);
-  return !!normalized && normalized === normalizeClaudePathForCompare(getClaudeTitleSessionProjectPath());
-}
-
-function buildClaudeTitleGenerationBadges(): ConversationBadge[] {
-  return [{
-    label: CLAUDE_TITLE_GENERATION_BADGE_LABEL,
-    tone: "cyan",
-    title: "ChatLog Viewer AI 标题生成产生的 Claude Code session",
-  }];
-}
-
-function mergeClaudeBadges(...groups: Array<ConversationBadge[] | undefined>): ConversationBadge[] | undefined {
-  const badges = groups.flatMap((group) => group ?? []);
-  return badges.length > 0 ? badges : undefined;
-}
-
-function toTimestamp(value?: string | number): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value !== "string") return undefined;
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? timestamp : undefined;
-}
-
-function isClaudeSessionId(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
-}
-
-function formatClaudeStoredPath(value?: string): string | undefined {
-  if (!value) return undefined;
-  const normalized = normalizePath(value);
-  if (/^[A-Za-z]:\//.test(normalized)) {
-    return normalized.replace(/\//g, "\\");
-  }
-  return normalized;
-}
-
-function pickMoreSpecificProject(
-  current: string | undefined,
-  candidate: string | undefined,
-  projectKey: string
-): string | undefined {
-  if (!candidate) return current;
-  if (!current) return candidate;
-
-  const currentScore = getProjectSpecificity(current, projectKey);
-  const candidateScore = getProjectSpecificity(candidate, projectKey);
-  if (candidateScore > currentScore) return candidate;
-  if (candidateScore < currentScore) return current;
-  return candidate.length > current.length ? candidate : current;
-}
-
-function getPreferredSessionKey(source: ClaudeCodeSessionSource): string {
-  return source.transcriptPath
-    || source.sessionDirPath
-    || source.key;
-}
-
-function isClaudeCleanupCandidate(source: ClaudeCodeSessionSource): boolean {
-  if (source.transcriptPath) {
-    return false;
-  }
-
-  const historyMessageCount = source.historySession?.messages.length ?? 0;
-  return historyMessageCount === 0;
-}
-
-function buildClaudeHintBadges(source: ClaudeCodeSessionSource, historyMessageCount: number): ConversationBadge[] {
-  const badges: ConversationBadge[] = [];
-
-  if (historyMessageCount > 0) {
-    badges.push({
-      label: "history 回填",
-      tone: "indigo",
-      title: "Claude Code 未保留主 transcript，当前记录由 history.jsonl 中的用户输入回填",
-    });
-  } else {
-    badges.push({
-      label: "索引空壳",
-      tone: "amber",
-      title: "Claude Code 仅保留 sessions-index / session 目录元数据，未找到主 transcript 或 history 内容",
-    });
-  }
-
-  if (!source.transcriptPath) {
-    badges.push({
-      label: "无 transcript",
-      tone: "gray",
-      title: "本地未找到 Claude Code 主 transcript，详情无法展示完整消息",
-    });
-  }
-
-  return badges;
-}
-
-function pickHistorySession(
-  current: ClaudeHistorySession | undefined,
-  candidate: ClaudeHistorySession | undefined
-): ClaudeHistorySession | undefined {
-  if (!current) return candidate;
-  if (!candidate) return current;
-  return candidate.messages.length > current.messages.length ? candidate : current;
-}
-
-function parseJsonObjectPrefix<T>(content: string): T | null {
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  let startIndex = -1;
-
-  for (let index = 0; index < content.length; index += 1) {
-    const char = content[index];
-
-    if (startIndex < 0) {
-      if (/\s/.test(char ?? "")) continue;
-      if (char !== "{") return null;
-      startIndex = index;
-      depth = 1;
-      continue;
-    }
-
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-
-    if (char === "\\") {
-      escaped = inString;
-      continue;
-    }
-
-    if (char === "\"") {
-      inString = !inString;
-      continue;
-    }
-
-    if (inString) continue;
-
-    if (char === "{") {
-      depth += 1;
-      continue;
-    }
-
-    if (char === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        try {
-          return JSON.parse(content.slice(startIndex, index + 1)) as T;
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-function mergeClaudeSessionSource(
-  current: ClaudeCodeSessionSource | undefined,
-  candidate: ClaudeCodeSessionSource
-): ClaudeCodeSessionSource {
-  if (!current) {
-    return {
-      ...candidate,
-      key: getPreferredSessionKey(candidate),
-    };
-  }
-
-  const merged: ClaudeCodeSessionSource = {
-    ...current,
-    transcriptPath: current.transcriptPath || candidate.transcriptPath,
-    sessionDirPath: current.sessionDirPath || candidate.sessionDirPath,
-    fullPathHint: current.fullPathHint || candidate.fullPathHint,
-    projectPathHint: pickMoreSpecificProject(
-      current.projectPathHint,
-      candidate.projectPathHint,
-      current.projectKey || candidate.projectKey
-    ),
-    displayTitleHint: current.displayTitleHint || candidate.displayTitleHint,
-    firstPromptHint: current.firstPromptHint || candidate.firstPromptHint,
-    createdAtHint: current.createdAtHint === undefined
-      ? candidate.createdAtHint
-      : (candidate.createdAtHint === undefined
-        ? current.createdAtHint
-        : Math.min(current.createdAtHint, candidate.createdAtHint)),
-    updatedAtHint: Math.max(current.updatedAtHint, candidate.updatedAtHint),
-    fileSizeHint: Math.max(current.fileSizeHint, candidate.fileSizeHint),
-    messageCountHint: Math.max(current.messageCountHint ?? 0, candidate.messageCountHint ?? 0) || undefined,
-    historySession: pickHistorySession(current.historySession, candidate.historySession),
-  };
-
-  merged.key = getPreferredSessionKey(merged);
-  return merged;
-}
-
-function buildMessageRecords(entries: JsonlLine<ClaudeCodeEntry>[]): MessageRecord<ClaudeCodeEntry>[] {
-  const records: MessageRecord<ClaudeCodeEntry>[] = [];
-  for (const entry of entries) {
-    const value = entry.value;
-    if (value.isSidechain || value.isMeta) continue;
-    if (!value.message) continue;
-    if (value.type === "system") continue;
-
-    if (value.type === "user") {
-      const text = extractTextContent(value.message.content);
-      if (!text.trim() || text.includes("<local-command-") || text.includes("<command-name>") || text.includes("<local-command-stdout>")) continue;
-      const cleanText = text.replace(/<[^>]+>/g, "").trim();
-      if (!cleanText) continue;
-      records.push({
-        entry: value,
-        sourceKey: isPureTextContent(value.message.content)
-          ? createStableMessageSourceKey(
-            "claude-code",
-            [
-              value.uuid,
-              value.message.id,
-              value.messageId,
-              value.sessionId,
-              value.timestamp,
-              value.type,
-              Array.isArray(value.message.content)
-                ? value.message.content.map((block) => block.type).join(",")
-                : "text",
-            ],
-            entry.rawLine
-          ) ?? createMessageSourceKey(entry.rawLine, "claude-code")
-          : undefined,
-        lineIndex: entry.lineNumber,
-        message: {
-          role: "user",
-          content: cleanText,
-          timestamp: value.timestamp ? new Date(value.timestamp).getTime() : undefined,
-        },
-      });
-    } else if (value.type === "assistant") {
-      const text = extractTextContent(value.message.content);
-      if (text.trim() && !text.startsWith("No response requested")) {
-        records.push({
-          entry: value,
-          sourceKey: isPureTextContent(value.message.content)
-            ? createStableMessageSourceKey(
-              "claude-code",
-              [
-                value.uuid,
-                value.message.id,
-                value.messageId,
-                value.sessionId,
-                value.timestamp,
-                value.type,
-                Array.isArray(value.message.content)
-                  ? value.message.content.map((block) => block.type).join(",")
-                  : "text",
-              ],
-              entry.rawLine
-            ) ?? createMessageSourceKey(entry.rawLine, "claude-code")
-            : undefined,
-          lineIndex: entry.lineNumber,
-          message: {
-            role: "assistant",
-            content: text,
-            timestamp: value.timestamp ? new Date(value.timestamp).getTime() : undefined,
-          },
-        });
-      }
-      if (Array.isArray(value.message.content)) {
-        const tools = extractToolCalls(value.message.content);
-        for (const tool of tools) {
-          records.push({
-            entry: value,
-            message: tool,
-          });
-        }
-      }
-    }
-  }
-
-  return assignStableMessageIds(records);
-}
-
-function appendSearchIndexEntry(
-  builder: ConversationSearchIndexBuilder,
-  entry: ClaudeCodeEntry
-): void {
-  if (entry.isSidechain || entry.isMeta) return;
-  if (!entry.message) return;
-  if (entry.type === "system") return;
-
-  if (entry.type === "user") {
-    const text = extractTextContent(entry.message.content);
-    if (
-      !text.trim()
-      || text.includes("<local-command-")
-      || text.includes("<command-name>")
-      || text.includes("<local-command-stdout>")
-    ) {
-      return;
-    }
-
-    const cleanText = text.replace(/<[^>]+>/g, "").trim();
-    if (!cleanText) return;
-
-    builder.addMessage({
-      role: "user",
-      content: cleanText,
-      timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
-    });
-    return;
-  }
-
-  if (entry.type === "assistant") {
-    const text = extractTextContent(entry.message.content);
-    if (text.trim() && !text.startsWith("No response requested")) {
-      builder.addMessage({
-        role: "assistant",
-        content: text,
-        timestamp: entry.timestamp ? new Date(entry.timestamp).getTime() : undefined,
-      });
-    }
-  }
-}
+import {
+  appendTranscriptNativeTitle,
+  buildClaudeTitleGenerationBadges,
+  buildConversationTitle,
+  isClaudeTitleGenerationProject,
+  mergeClaudeBadges,
+  normalizeTitleCandidate,
+  readTranscriptNativeTitle,
+} from "./claude-code-title.js";
+import {
+  appendSearchIndexEntry,
+  buildHistoryFallbackMessages,
+  buildMessageRecords,
+  extractTextContent,
+} from "./claude-code-messages.js";
+import {
+  readClaudeSessionIndexFile,
+  removeClaudeSessionIndexEntry,
+  removeClaudeSessionIndexEntryUnlocked,
+  upsertClaudeSessionIndexEntry,
+  upsertClaudeSessionIndexEntryUnlocked,
+  writeClaudeSessionIndexFile,
+} from "./claude-code-session-index.js";
+import {
+  buildClaudeHintBadges,
+  collectClaudeSessionSources,
+  CLAUDE_CODE_LIST_SOURCE_VERSION,
+  isClaudeCleanupCandidate,
+} from "./claude-code-source.js";
+import type {
+  ClaudeCodeEntry,
+  ClaudeCodeSessionIndexFile,
+  ClaudeCodeSessionSource,
+} from "./claude-code-types.js";
 
 export class ClaudeCodeProvider implements ConversationProvider {
   name = "claude-code";
@@ -607,55 +148,6 @@ export class ClaudeCodeProvider implements ConversationProvider {
     });
 
     this.backgroundRefreshes.set(refreshKey, task);
-  }
-
-  private async appendTranscriptNativeTitle(
-    filePath: string,
-    sessionId: string,
-    title: string
-  ): Promise<void> {
-    await runKeyedMutation(`claude-transcript:${filePath}`, async () => {
-      const file = await open(filePath, "a+");
-      try {
-        const fileStat = await file.stat();
-        let prefix = "";
-        if (fileStat.size > 0) {
-          const lastByte = Buffer.alloc(1);
-          await file.read(lastByte, 0, 1, fileStat.size - 1);
-          if (lastByte[0] !== 0x0a && lastByte[0] !== 0x0d) {
-            prefix = "\n";
-          }
-        }
-
-        const entries: ClaudeCodeEntry[] = [
-          {
-            type: "custom-title",
-            customTitle: title,
-            sessionId,
-          },
-          {
-            type: "agent-name",
-            agentName: title,
-            sessionId,
-          },
-        ];
-        await file.write(`${prefix}${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-      } finally {
-        await file.close();
-      }
-    });
-  }
-
-  private async readTranscriptNativeTitle(filePath: string): Promise<string | null> {
-    let title: string | null = null;
-    await visitJsonl<ClaudeCodeEntry>(filePath, (entry) => {
-      if (entry.type === "custom-title") {
-        title = normalizeTitleCandidate(entry.customTitle) ?? title;
-      } else if (entry.type === "agent-name") {
-        title = normalizeTitleCandidate(entry.agentName) ?? title;
-      }
-    });
-    return title;
   }
 
   private async listInternal(options: {
@@ -903,274 +395,11 @@ export class ClaudeCodeProvider implements ConversationProvider {
     };
   }
 
-  private async readHistorySessions(signatureFiles: IndexedSourceFile[]): Promise<Map<string, ClaudeHistorySession>> {
-    const historyPath = normalizePath(join(this.getStoragePath(), "..", "history.jsonl"));
-    try {
-      const historyStat = await stat(historyPath);
-      signatureFiles.push({
-        path: historyPath,
-        mtimeMs: historyStat.mtimeMs,
-        size: historyStat.size,
-      });
-    } catch (error) {
-      if (isFileSystemNotFoundError(error)) return new Map();
-      throw createProviderDataError(this.name, `Claude Code history 无法读取: ${historyPath}`, error);
-    }
-
-    const sessions = new Map<string, ClaudeHistorySession>();
-    try {
-      await visitJsonl<ClaudeCodeHistoryEntry>(historyPath, (entry) => {
-        const sessionId = entry.sessionId?.trim();
-        const display = entry.display?.trim();
-        if (!sessionId || !display) {
-          return;
-        }
-
-        const current = sessions.get(sessionId) ?? {
-          messageCount: 0,
-          messages: [],
-        };
-        const timestamp = typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp)
-          ? entry.timestamp
-          : undefined;
-
-        current.projectPath = entry.project ? normalizePath(entry.project) : current.projectPath;
-        current.createdAt = current.createdAt === undefined
-          ? timestamp
-          : (timestamp === undefined ? current.createdAt : Math.min(current.createdAt, timestamp));
-        current.updatedAt = current.updatedAt === undefined
-          ? timestamp
-          : (timestamp === undefined ? current.updatedAt : Math.max(current.updatedAt, timestamp));
-        current.messageCount += 1;
-        current.messages.push({
-          role: "user",
-          content: display,
-          timestamp,
-        });
-
-        if (!display.startsWith("/") && !current.firstPrompt) {
-          current.firstPrompt = display;
-        }
-
-        sessions.set(sessionId, current);
-      });
-    } catch (error) {
-      throw createProviderDataError(this.name, `Claude Code history 解析失败: ${historyPath}`, error);
-    }
-
-    return sessions;
-  }
-
-  private async readSessionIndexFile(indexPath: string): Promise<ClaudeCodeSessionIndexFile> {
-    try {
-      const content = await readFile(indexPath, "utf-8");
-      let parsed: ClaudeCodeSessionIndexFile | null = null;
-      try {
-        parsed = JSON.parse(content) as ClaudeCodeSessionIndexFile;
-      } catch {
-        parsed = parseJsonObjectPrefix<ClaudeCodeSessionIndexFile>(content);
-      }
-
-      if (parsed) {
-        return {
-          version: parsed.version ?? 1,
-          entries: Array.isArray(parsed.entries) ? parsed.entries : [],
-          originalPath: parsed.originalPath,
-        };
-      }
-    } catch (error) {
-      if (!isFileSystemNotFoundError(error)) {
-        throw createProviderDataError(this.name, `Claude Code session index 无法读取: ${indexPath}`, error);
-      }
-
-      return {
-        version: 1,
-        entries: [],
-      };
-    }
-
-    throw new ProviderDataError(
-      this.name,
-      "corrupt",
-      `Claude Code session index 已损坏且无法恢复: ${indexPath}`
-    );
-  }
-
-  private async collectSessionSources(): Promise<{ sources: ClaudeCodeSessionSource[]; sourceSignature: string }> {
-    const basePath = normalizePath(this.getStoragePath());
-    const signatureFiles: IndexedSourceFile[] = [];
-    const historyBySessionId = await this.readHistorySessions(signatureFiles);
-    const sourceBySessionId = new Map<string, ClaudeCodeSessionSource>();
-
-    let projectEntries;
-    try {
-      projectEntries = await readdir(basePath, { withFileTypes: true });
-    } catch (error) {
-      throw createProviderDataError(this.name, `Claude Code 项目目录无法读取: ${basePath}`, error);
-    }
-    for (const projectEntry of projectEntries) {
-      if (!projectEntry.isDirectory()) continue;
-
-      const projectKey = projectEntry.name;
-      const projectDirPath = normalizePath(join(basePath, projectKey));
-      const indexPath = normalizePath(join(projectDirPath, "sessions-index.json"));
-      const transcriptBySessionId = new Map<string, IndexedSourceFile>();
-      const sessionDirBySessionId = new Map<string, IndexedSourceFile>();
-
-      let projectDirEntries;
-      try {
-        projectDirEntries = await readdir(projectDirPath, { withFileTypes: true });
-      } catch (error) {
-        throw createProviderDataError(this.name, `Claude Code 项目目录无法读取: ${projectDirPath}`, error);
-      }
-      for (const entry of projectDirEntries) {
-        const fullPath = normalizePath(join(projectDirPath, entry.name));
-        if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-          const fileStat = await stat(fullPath);
-          const fileState = {
-            path: fullPath,
-            mtimeMs: fileStat.mtimeMs,
-            size: fileStat.size,
-          };
-          signatureFiles.push(fileState);
-
-          const sessionId = entry.name.replace(/\.jsonl$/i, "");
-          if (sessionId !== "sessions-index" && isClaudeSessionId(sessionId)) {
-            transcriptBySessionId.set(sessionId, fileState);
-          }
-          continue;
-        }
-
-        if (entry.isDirectory() && isClaudeSessionId(entry.name)) {
-          const dirStat = await stat(fullPath);
-          const dirState = {
-            path: fullPath,
-            mtimeMs: dirStat.mtimeMs,
-            size: 0,
-          };
-          signatureFiles.push(dirState);
-          sessionDirBySessionId.set(entry.name, dirState);
-        }
-      }
-
-      let sessionIndex: ClaudeCodeSessionIndexFile | null = null;
-      try {
-        const indexStat = await stat(indexPath);
-        signatureFiles.push({
-          path: indexPath,
-          mtimeMs: indexStat.mtimeMs,
-          size: indexStat.size,
-        });
-        sessionIndex = await this.readSessionIndexFile(indexPath);
-      } catch (error) {
-        if (isFileSystemNotFoundError(error)) {
-          sessionIndex = null;
-        } else {
-          throw createProviderDataError(this.name, `Claude Code session index 检测失败: ${indexPath}`, error);
-        }
-      }
-
-      for (const entry of sessionIndex?.entries ?? []) {
-        const sessionId = entry.sessionId?.trim();
-        if (!sessionId || !isClaudeSessionId(sessionId) || entry.isSidechain) continue;
-
-        const transcript = transcriptBySessionId.get(sessionId);
-        const sessionDir = sessionDirBySessionId.get(sessionId);
-        const historySession = historyBySessionId.get(sessionId);
-        const updatedAtHint = Math.max(
-          toTimestamp(entry.modified) ?? 0,
-          entry.fileMtime ?? 0,
-          transcript?.mtimeMs ?? 0,
-          sessionDir?.mtimeMs ?? 0
-        ) || Date.now();
-
-        sourceBySessionId.set(
-          sessionId,
-          mergeClaudeSessionSource(sourceBySessionId.get(sessionId), {
-            key: transcript?.path || sessionDir?.path || normalizePath(join(projectDirPath, `${sessionId}.session`)),
-            sessionId,
-            projectKey,
-            projectDirPath,
-            indexPath,
-            transcriptPath: transcript?.path,
-            sessionDirPath: sessionDir?.path,
-            fullPathHint: entry.fullPath ? normalizePath(entry.fullPath) : undefined,
-            projectPathHint: entry.projectPath
-              ? normalizePath(entry.projectPath)
-              : (sessionIndex?.originalPath ? normalizePath(sessionIndex.originalPath) : historySession?.projectPath),
-            displayTitleHint: normalizeTitleCandidate(entry.customTitle || entry.summary || entry.agentName),
-            firstPromptHint: normalizeTitleCandidate(entry.firstPrompt),
-            createdAtHint: toTimestamp(entry.created) ?? historySession?.createdAt,
-            updatedAtHint,
-            fileSizeHint: transcript?.size ?? 0,
-            messageCountHint: entry.messageCount ?? historySession?.messageCount,
-            historySession,
-          })
-        );
-      }
-
-      for (const [sessionId, transcript] of transcriptBySessionId) {
-        const historySession = historyBySessionId.get(sessionId);
-        sourceBySessionId.set(
-          sessionId,
-          mergeClaudeSessionSource(sourceBySessionId.get(sessionId), {
-            key: transcript.path,
-            sessionId,
-            projectKey,
-            projectDirPath,
-            indexPath,
-            transcriptPath: transcript.path,
-            fullPathHint: transcript.path,
-            projectPathHint: historySession?.projectPath || sessionIndex?.originalPath,
-            firstPromptHint: historySession?.firstPrompt,
-            createdAtHint: historySession?.createdAt,
-            updatedAtHint: Math.max(transcript.mtimeMs, historySession?.updatedAt ?? 0),
-            fileSizeHint: transcript.size,
-            messageCountHint: historySession?.messageCount,
-            historySession,
-          })
-        );
-      }
-
-      for (const [sessionId, sessionDir] of sessionDirBySessionId) {
-        const historySession = historyBySessionId.get(sessionId);
-        if (!historySession) continue;
-
-        sourceBySessionId.set(
-          sessionId,
-          mergeClaudeSessionSource(sourceBySessionId.get(sessionId), {
-            key: sessionDir.path,
-            sessionId,
-            projectKey,
-            projectDirPath,
-            indexPath,
-            sessionDirPath: sessionDir.path,
-            projectPathHint: historySession.projectPath || sessionIndex?.originalPath,
-            firstPromptHint: historySession.firstPrompt,
-            createdAtHint: historySession.createdAt,
-            updatedAtHint: Math.max(sessionDir.mtimeMs, historySession.updatedAt ?? 0),
-            fileSizeHint: 0,
-            messageCountHint: historySession.messageCount,
-            historySession,
-          })
-        );
-      }
-    }
-
-    const sources = [...sourceBySessionId.values()].sort((a, b) => b.updatedAtHint - a.updatedAtHint);
-    const sourceSignature = `${CLAUDE_CODE_LIST_SOURCE_VERSION}:${
-      createIndexedListSourceSignature(
-        signatureFiles
-          .map((item) => ({
-            path: normalizePath(item.path),
-            mtimeMs: item.mtimeMs,
-            size: item.size,
-          }))
-          .sort((a, b) => a.path.localeCompare(b.path))
-      )
-    }`;
-
-    return { sources, sourceSignature };
+  private collectSessionSources(): Promise<{ sources: ClaudeCodeSessionSource[]; sourceSignature: string }> {
+    return collectClaudeSessionSources({
+      storagePath: this.getStoragePath(),
+      providerName: this.name,
+    });
   }
 
   private async extractSearchIndex(source: ClaudeCodeSessionSource): Promise<ConversationSearchIndex> {
@@ -1234,7 +463,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const fileStat = await stat(source.transcriptPath);
     const cached = getCached(source.key, source.updatedAtHint);
     if (cached) return cached;
-    const transcriptNativeTitle = await this.readTranscriptNativeTitle(source.transcriptPath);
+    const transcriptNativeTitle = await readTranscriptNativeTitle(source.transcriptPath);
 
     const headEntries = await parseJsonlHead<ClaudeCodeEntry>(source.transcriptPath, 40);
     const headMessages = headEntries.filter(
@@ -1333,101 +562,14 @@ export class ClaudeCodeProvider implements ConversationProvider {
     return meta;
   }
 
-  private async removeSessionIndexEntry(indexPath: string, sessionId: string): Promise<void> {
-    await runKeyedMutation(`claude-index:${indexPath}`, async () => {
-      await this.removeSessionIndexEntryUnlocked(indexPath, sessionId);
-    });
-  }
-
-  private async removeSessionIndexEntryUnlocked(indexPath: string, sessionId: string): Promise<void> {
-    const indexFile = await this.readSessionIndexFile(indexPath);
-    const entries = (indexFile.entries ?? []).filter((entry) => entry.sessionId !== sessionId);
-    if ((indexFile.entries ?? []).length === entries.length) return;
-    indexFile.entries = entries;
-    await this.writeSessionIndexFile(indexPath, indexFile);
-  }
-
-  private async writeSessionIndexFile(
-    indexPath: string,
-    indexFile: ClaudeCodeSessionIndexFile
-  ): Promise<void> {
-    const temporaryPath = `${indexPath}.${process.pid}.${randomUUID()}.tmp`;
-    await mkdir(dirname(indexPath), { recursive: true });
-    try {
-      await writeFile(temporaryPath, JSON.stringify(indexFile, null, 2), "utf-8");
-      await rename(temporaryPath, indexPath);
-    } finally {
-      await rm(temporaryPath, { force: true }).catch(() => undefined);
-    }
-  }
-
-  private async upsertSessionIndexEntry(
-    source: ClaudeCodeSessionSource,
-    overrides: Partial<ClaudeCodeSessionIndexEntry> = {}
-  ): Promise<void> {
-    await runKeyedMutation(`claude-index:${source.indexPath}`, async () => {
-      await this.upsertSessionIndexEntryUnlocked(source, overrides);
-    });
-  }
-
-  private async upsertSessionIndexEntryUnlocked(
-    source: ClaudeCodeSessionSource,
-    overrides: Partial<ClaudeCodeSessionIndexEntry> = {}
-  ): Promise<void> {
-    const indexFile = await this.readSessionIndexFile(source.indexPath);
-    const entries = Array.isArray(indexFile.entries) ? indexFile.entries : [];
-    const entryIndex = entries.findIndex((entry) => entry.sessionId === source.sessionId);
-    const existing = entryIndex >= 0 ? entries[entryIndex] : undefined;
-
-    const defaultProjectPath = source.projectPathHint || indexFile.originalPath;
-    const defaultFullPath = source.transcriptPath
-      || source.fullPathHint
-      || join(source.projectDirPath, `${source.sessionId}.jsonl`);
-    const fallbackSummary = source.displayTitleHint
-      || source.firstPromptHint
-      || existing?.summary
-      || existing?.firstPrompt
-      || "New Conversation";
-
-    const nextEntry: ClaudeCodeSessionIndexEntry = {
-        ...existing,
-        sessionId: source.sessionId,
-        fullPath: formatClaudeStoredPath(existing?.fullPath || defaultFullPath),
-        fileMtime: Math.round(source.updatedAtHint),
-        firstPrompt: existing?.firstPrompt || source.firstPromptHint,
-        summary: existing?.summary || fallbackSummary,
-        messageCount: existing?.messageCount ?? source.messageCountHint ?? source.historySession?.messageCount ?? 0,
-        created: existing?.created || new Date(source.createdAtHint ?? source.updatedAtHint).toISOString(),
-        modified: new Date().toISOString(),
-        gitBranch: existing?.gitBranch ?? "",
-        projectPath: formatClaudeStoredPath(existing?.projectPath || defaultProjectPath),
-        isSidechain: false,
-        ...overrides,
-    };
-
-    if (!nextEntry.firstPrompt && source.firstPromptHint) {
-      nextEntry.firstPrompt = source.firstPromptHint;
-    }
-
-    if (!indexFile.originalPath && nextEntry.projectPath) {
-      indexFile.originalPath = nextEntry.projectPath;
-    }
-
-    if (entryIndex >= 0) {
-      entries[entryIndex] = nextEntry;
-    } else {
-      entries.unshift(nextEntry);
-    }
-
-    indexFile.version = indexFile.version ?? 1;
-    indexFile.entries = entries;
-    await this.writeSessionIndexFile(source.indexPath, indexFile);
-  }
-
   private invalidateConversationCaches(filePath: string): void {
     invalidateCache(filePath);
     invalidateMessageActionIndex(filePath);
     invalidateListCache(getListCacheKey(this.name, this.getStoragePath()));
+  }
+
+  private async writeSessionIndexFile(indexPath: string, indexFile: ClaudeCodeSessionIndexFile): Promise<void> {
+    return writeClaudeSessionIndexFile(indexPath, indexFile);
   }
 
   private async findConversationSource(sessionId: string): Promise<ClaudeCodeSessionSource> {
@@ -1447,48 +589,6 @@ export class ClaudeCodeProvider implements ConversationProvider {
     return source.transcriptPath;
   }
 
-  private async resolveMessageLineNumbers(
-    filePath: string,
-    mtimeMs: number,
-    messageIds: string[]
-  ): Promise<number[]> {
-    const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
-    if (cached) return cached;
-
-    const entries = await parseJsonlWithMeta<ClaudeCodeEntry>(filePath);
-    const records = buildMessageRecords(entries);
-    primeMessageActionIndex(filePath, mtimeMs, records);
-
-    const lineByMessageId = new Map<string, number>();
-    for (const record of records) {
-      if (record.message.messageId && record.lineIndex) {
-        lineByMessageId.set(record.message.messageId, record.lineIndex);
-      }
-    }
-
-    return messageIds.map((messageId) => {
-      const lineNumber = lineByMessageId.get(messageId);
-      if (!lineNumber) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      return lineNumber;
-    });
-  }
-
-  private buildHistoryFallbackMessages(source: ClaudeCodeSessionSource): Message[] {
-    const messages = source.historySession?.messages ?? [];
-    const notice: Message = {
-      role: "system",
-      content: "当前 Claude Code 会话未在本地保留完整 transcript，以下仅显示 history.jsonl 中记录的用户输入。",
-    };
-
-    if (messages.length === 0) {
-      return [notice];
-    }
-
-    return [notice, ...messages];
-  }
-
   async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
     const sessionId = id.replace("claude-code:", "");
     const source = await this.findConversationSource(sessionId);
@@ -1496,7 +596,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     if (!source.transcriptPath) {
       const meta = await this.extractMeta(source);
       if (!meta) throw new Error(`无法解析对话元数据: ${id}`);
-      const { items, hasMore } = sliceWindow(this.buildHistoryFallbackMessages(source), options);
+      const { items, hasMore } = sliceWindow(buildHistoryFallbackMessages(source), options);
       return { ...meta, messages: items, hasMore };
     }
 
@@ -1541,7 +641,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
       changed = true;
     }
 
-    await this.removeSessionIndexEntry(source.indexPath, sessionId);
+    await removeClaudeSessionIndexEntry(source.indexPath, sessionId);
 
     if (
       !changed
@@ -1607,8 +707,8 @@ export class ClaudeCodeProvider implements ConversationProvider {
           sessionDirMoved = true;
         }
 
-        await this.removeSessionIndexEntryUnlocked(source.indexPath, sessionId);
-        await this.upsertSessionIndexEntryUnlocked({
+        await removeClaudeSessionIndexEntryUnlocked(source.indexPath, sessionId);
+        await upsertClaudeSessionIndexEntryUnlocked({
           ...source,
           key: targetTranscriptPath || targetSessionDirPath || normalizePath(join(targetProjectDir, `${sessionId}.session`)),
           projectKey: normalizedProjectKey,
@@ -1617,6 +717,9 @@ export class ClaudeCodeProvider implements ConversationProvider {
           transcriptPath: targetTranscriptPath,
           sessionDirPath: targetSessionDirPath,
           fullPathHint: targetTranscriptPath || source.fullPathHint,
+        }, {}, {
+          // 经实例方法路由，保留故障注入测试接缝（patch writeSessionIndexFile）
+          writeIndexFile: (indexPath, indexFile) => this.writeSessionIndexFile(indexPath, indexFile),
         });
       } catch (error) {
         const rollbackErrors: string[] = [];
@@ -1671,18 +774,18 @@ export class ClaudeCodeProvider implements ConversationProvider {
     await runKeyedMutation(`claude-title:${sessionId}`, async () => {
       const source = await this.findConversationSource(sessionId);
       if (source.transcriptPath) {
-        await this.appendTranscriptNativeTitle(source.transcriptPath, sessionId, normalizedTitle);
+        await appendTranscriptNativeTitle(source.transcriptPath, sessionId, normalizedTitle);
       }
-      await this.upsertSessionIndexEntry(source, {
+      await upsertClaudeSessionIndexEntry(source, {
         customTitle: normalizedTitle,
         summary: normalizedTitle,
         agentName: normalizedTitle,
       });
 
-      const indexFile = await this.readSessionIndexFile(source.indexPath);
+      const indexFile = await readClaudeSessionIndexFile(this.name, source.indexPath);
       const indexed = indexFile.entries?.find((entry) => entry.sessionId === sessionId);
       const transcriptTitle = source.transcriptPath
-        ? await this.readTranscriptNativeTitle(source.transcriptPath)
+        ? await readTranscriptNativeTitle(source.transcriptPath)
         : normalizedTitle;
       if (
         transcriptTitle !== normalizedTitle
@@ -1706,7 +809,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     const sessionId = id.replace("claude-code:", "");
     const filePath = await this.findConversationFilePath(sessionId, "编辑消息");
     const fileStat = await stat(filePath);
-    const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
+    const [lineNumber] = await resolveMessageLineNumbers<ClaudeCodeEntry>(filePath, fileStat.mtimeMs, [messageId], buildMessageRecords);
     const normalizedContent = normalizeUpdatedMessageContent(content);
     await rewriteJsonlFileLine(
       filePath,
@@ -1745,7 +848,7 @@ export class ClaudeCodeProvider implements ConversationProvider {
     if (uniqueMessageIds.length === 0) {
       throw new Error("待删除消息不能为空");
     }
-    const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
+    const lineNumbers = await resolveMessageLineNumbers<ClaudeCodeEntry>(filePath, fileStat.mtimeMs, uniqueMessageIds, buildMessageRecords);
     await rewriteJsonlFileLines(
       filePath,
       lineNumbers,

@@ -1,8 +1,5 @@
 export {
   type IndexedCacheItem,
-  type ConversationIndexSort,
-  type ConversationIndexQueryOptions,
-  type ConversationIndexQueryResult,
   type PersistedMessageIdentityEntry,
   setCacheStoreDirForTests,
   getIndexedListCacheKey,
@@ -19,9 +16,14 @@ export {
   getPersistedCodexMessageIdentity,
   setPersistedCodexMessageIdentity,
   deletePersistedCodexMessageIdentity,
-  queryConversationIndexPage,
-  queryConversationIndex,
   invalidateCache,
   invalidateListCache,
-  compactCacheDb,
 } from "./impl.js";
+export {
+  type ConversationIndexSort,
+  type ConversationIndexQueryOptions,
+  type ConversationIndexQueryResult,
+  queryConversationIndexPage,
+  queryConversationIndex,
+} from "./cache-query.js";
+export { compactCacheDb } from "./cache-db.js";

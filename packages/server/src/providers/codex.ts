@@ -22,9 +22,9 @@ import {
   invalidateCache,
   invalidateListCache,
   type IndexedCacheItem,
-} from "../utils/cache.js";
+} from "../utils/cache/index.js";
 import { logProviderError } from "../utils/logger.js";
-import { getProviderPaths } from "../utils/provider-paths.js";
+import { getProviderPaths } from "../utils/provider-paths/index.js";
 import {
   createProviderDataError,
   getErrorMessage,
@@ -45,10 +45,10 @@ import {
   assignStableMessageIds,
   createMessageSourceKey,
   createStableMessageSourceKey,
-  getMessageActionLineNumbers,
   invalidateMessageActionIndex,
   normalizeUpdatedMessageContent,
   primeMessageActionIndex,
+  resolveMessageLineNumbers,
   rewriteJsonlFileLine,
   rewriteJsonlFileLines,
   type MessageRecord,
@@ -1280,34 +1280,6 @@ export class CodexProvider implements ConversationProvider {
     invalidateListCache(this.getListCacheKey());
   }
 
-  private async resolveMessageLineNumbers(
-    filePath: string,
-    mtimeMs: number,
-    messageIds: string[]
-  ): Promise<number[]> {
-    const cached = getMessageActionLineNumbers(filePath, mtimeMs, messageIds);
-    if (cached) return cached;
-
-    const entries = await parseJsonlWithMeta<CodexEntry>(filePath);
-    const records = buildMessageRecords(entries, { filePath, mtimeMs });
-    primeMessageActionIndex(filePath, mtimeMs, records);
-
-    const lineByMessageId = new Map<string, number>();
-    for (const record of records) {
-      if (record.message.messageId && record.lineIndex) {
-        lineByMessageId.set(record.message.messageId, record.lineIndex);
-      }
-    }
-
-    return messageIds.map((messageId) => {
-      const lineNumber = lineByMessageId.get(messageId);
-      if (!lineNumber) {
-        throw new Error(`消息不存在: ${messageId}`);
-      }
-      return lineNumber;
-    });
-  }
-
   async read(id: string, options?: ConversationReadOptions): Promise<Conversation> {
     const sessionId = id.replace("codex:", "");
 
@@ -1425,6 +1397,9 @@ export class CodexProvider implements ConversationProvider {
     const createdAtMs = existingThread?.createdAt ?? originalFileStat.birthtimeMs;
     const targetFilePath = buildCodexTranscriptPath(this.getStoragePath(), sessionId, createdAtMs);
     const movedToTarget = normalizePath(originalFilePath) !== targetFilePath;
+    if (movedToTarget && await stat(targetFilePath).then(() => true, () => false)) {
+      throw new Error(`目标目录已存在同名 transcript: ${targetFilePath}`);
+    }
     const originalContent = await readFile(originalFilePath, "utf-8");
     const newCwd = formatCodexStoredPath(normalizedTargetProject) ?? normalizedTargetProject;
     const rewrittenContent = originalContent
@@ -1543,7 +1518,12 @@ export class CodexProvider implements ConversationProvider {
     const sessionId = id.replace("codex:", "");
     const filePath = await this.findConversationFilePath(sessionId);
     const fileStat = await stat(filePath);
-    const [lineNumber] = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, [messageId]);
+    const [lineNumber] = await resolveMessageLineNumbers<CodexEntry>(
+      filePath,
+      fileStat.mtimeMs,
+      [messageId],
+      (entries) => buildMessageRecords(entries, { filePath, mtimeMs: fileStat.mtimeMs })
+    );
     const normalizedContent = normalizeUpdatedMessageContent(content);
     await rewriteJsonlFileLine(
       filePath,
@@ -1588,7 +1568,12 @@ export class CodexProvider implements ConversationProvider {
     if (uniqueMessageIds.length === 0) {
       throw new Error("待删除消息不能为空");
     }
-    const lineNumbers = await this.resolveMessageLineNumbers(filePath, fileStat.mtimeMs, uniqueMessageIds);
+    const lineNumbers = await resolveMessageLineNumbers<CodexEntry>(
+      filePath,
+      fileStat.mtimeMs,
+      uniqueMessageIds,
+      (entries) => buildMessageRecords(entries, { filePath, mtimeMs: fileStat.mtimeMs })
+    );
     await rewriteJsonlFileLines(
       filePath,
       lineNumbers,
