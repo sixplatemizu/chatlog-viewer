@@ -85,14 +85,19 @@ export default function App() {
   const [deleteConfirmIds, setDeleteConfirmIds] = useState<string[]>([]);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     if (typeof window === "undefined") return 320;
-    const stored = Number.parseInt(window.localStorage.getItem("chatlog-viewer:sidebar-width") ?? "", 10);
+    const stored = Number.parseInt(
+      window.localStorage.getItem("chatview:sidebar-width")
+        ?? window.localStorage.getItem("chatlog-viewer:sidebar-width") // 旧键兼容一版
+        ?? "",
+      10,
+    );
     return Number.isFinite(stored) && stored >= 240 && stored <= 640 ? stored : 320;
   });
 
   const handleSidebarWidthChange = useCallback((next: number) => {
     setSidebarWidth(next);
     try {
-      window.localStorage.setItem("chatlog-viewer:sidebar-width", String(next));
+      window.localStorage.setItem("chatview:sidebar-width", String(next));
     } catch {
       // localStorage 不可用时忽略
     }
@@ -341,7 +346,7 @@ export default function App() {
       {/* 顶部标题栏 */}
       <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-2.5 flex items-center justify-between flex-shrink-0">
         <h1 className="text-sm font-bold text-gray-800 dark:text-gray-100 tracking-wide">
-          ChatLog Viewer
+            ChatView
         </h1>
         <div className="flex items-center gap-3">
           <span className="text-xs text-gray-400 dark:text-gray-500">AI CLI 对话记录管理器</span>

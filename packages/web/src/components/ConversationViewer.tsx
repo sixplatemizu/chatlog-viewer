@@ -87,8 +87,8 @@ function getTitleSyncInfo(
     badgeLabel: "仅 viewer 覆盖",
     badgeClassName:
       "rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
-    description: `${providerLabel} 当前没有稳定标题字段，修改只保存在 chatlog-viewer，不会写回原始 CLI。`,
-    saveTitle: "标题仅保存在 chatlog-viewer",
+    description: `${providerLabel} 当前没有稳定标题字段，修改只保存在 chatview，不会写回原始 CLI。`,
+    saveTitle: "标题仅保存在 chatview",
     statusSuffix: "仅保存在 viewer",
     variant: "warning",
   };

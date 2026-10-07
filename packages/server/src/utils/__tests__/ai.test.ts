@@ -298,7 +298,7 @@ test("OpenCode 生成标题时始终使用专用 session 目录", async () => {
       "--dir",
       env.sessionDir,
       "--title",
-      "ChatLog Viewer AI Title",
+      "ChatView AI Title",
     ]);
     assert.ok(calls[0]?.args.includes("--"));
     assert.equal(calls[0]?.cwd, env.sessionDir);

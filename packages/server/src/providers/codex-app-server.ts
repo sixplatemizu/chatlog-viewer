@@ -155,8 +155,8 @@ class CodexAppServerClient {
   async initialize(): Promise<void> {
     await this.request("initialize", {
       clientInfo: {
-        name: "chatlog-viewer",
-        title: "ChatLog Viewer",
+        name: "chatview",
+        title: "ChatView",
         version: "0.0.0",
       },
       capabilities: {
@@ -239,7 +239,9 @@ class CodexAppServerClient {
 }
 
 export function shouldUseCodexAppServerRename(): boolean {
-  if (process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME === "0") return false;
+  if (process.env.CHATVIEW_CODEX_APP_SERVER_RENAME === "0") return false;
+  if (process.env.CHATVIEW_CODEX_APP_SERVER_RENAME === "0") return false;
+  if (process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_RENAME === "0") return false; // 旧变量兼容一版
   if (process.env.NODE_ENV === "test") return false;
   return true;
 }
@@ -385,7 +387,9 @@ export class CodexAppServerManager {
 
 function getAppServerIdleTimeoutMs(): number {
   const configured = Number.parseInt(
-    process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_IDLE_MS ?? "",
+    process.env.CHATVIEW_CODEX_APP_SERVER_IDLE_MS
+      ??     process.env.CHATVIEW_CODEX_APP_SERVER_IDLE_MS
+      ?? process.env.CHATLOG_VIEWER_CODEX_APP_SERVER_IDLE_MS ?? "", // 旧变量兼容一版
     10
   );
   return Number.isFinite(configured) && configured >= 0

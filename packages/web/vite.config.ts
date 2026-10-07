@@ -8,12 +8,14 @@ import { homedir } from "node:os";
 const API_TOKEN_HEADER = "X-Chatlog-Viewer-Token";
 
 function getApiTokenPath(): string {
-  return process.env.CHATLOG_VIEWER_API_TOKEN_PATH?.trim()
-    || join(homedir(), ".chatlog-viewer", "session-token");
+  return process.env.CHATVIEW_API_TOKEN_PATH?.trim()
+    || process.env.CHATLOG_VIEWER_API_TOKEN_PATH?.trim() // 旧变量兼容一版
+    || join(homedir(), ".chatview", "session-token");
 }
 
 function loadApiToken(): string {
-  const envToken = process.env.CHATLOG_VIEWER_API_TOKEN?.trim();
+  const envToken = process.env.CHATVIEW_API_TOKEN?.trim()
+    || process.env.CHATLOG_VIEWER_API_TOKEN?.trim(); // 旧变量兼容一版
   if (envToken) return envToken;
 
   const tokenPath = getApiTokenPath();

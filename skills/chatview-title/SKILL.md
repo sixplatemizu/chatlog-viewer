@@ -1,13 +1,13 @@
 ---
-name: chatlog-viewer-title
-description: Manage ChatLog Viewer conversation titles for Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy with the project title CLI. Use when the user wants to list or search conversations across providers, rename a title with native persistence, generate titles with an AI CLI, run or roll back batch title generation, or verify that UI and local CLI titles stay synchronized.
+name: chatview-title
+description: Manage ChatView conversation titles for Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy with the project title CLI. Use when the user wants to list or search conversations across providers, rename a title with native persistence, generate titles with an AI CLI, run or roll back batch title generation, or verify that UI and local CLI titles stay synchronized.
 ---
 
-# ChatLog Viewer Title
+# ChatView Title
 
 ## Overview
 
-Use ChatLog Viewer's local title CLI to manage Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy conversations (7 target providers; iFlow is read-only for list, rename/generate are blocked by its capability gate). The CLI and Web UI share the same persistence service:
+Use ChatView's local title CLI to manage Codex, Claude Code, OpenCode, Pi, CodeBuddy, and WorkBuddy conversations (7 target providers; iFlow is read-only for list, rename/generate are blocked by its capability gate). The CLI and Web UI share the same persistence service:
 
 - Codex uses the native app-server naming path and verifies State DB plus `session_index.jsonl`.
 - Claude Code appends native `/rename` metadata and updates `sessions-index.json`.
@@ -16,12 +16,12 @@ Use ChatLog Viewer's local title CLI to manage Codex, Claude Code, OpenCode, Pi,
 - CodeBuddy rewrites the `ai-title` row (main sessions only; `codebuddy:sub:*` titles follow the parent).
 - WorkBuddy updates SQLite `sessions.custom_title` (falls back to read-only when the column is missing).
 
-The target conversation provider and the AI title-generation CLI are independent. For example, OpenCode can generate a title for a Codex conversation, then ChatLog Viewer persists it through Codex's native title path.
+The target conversation provider and the AI title-generation CLI are independent. For example, OpenCode can generate a title for a Codex conversation, then ChatView persists it through Codex's native title path.
 
 Project path:
 
 ```bash
-D:/DownloadFiles/code_area/chatlog-viewer
+D:/DownloadFiles/code_area/chatview
 ```
 
 ## Quick Commands
@@ -29,53 +29,53 @@ D:/DownloadFiles/code_area/chatlog-viewer
 List recent conversations across all managed providers:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- list --provider all --scope all --limit 30
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- list --provider all --scope all --limit 30
 ```
 
 List one provider for the current shell directory exactly. Prefer `--cwd "$PWD"` when using `pnpm --dir`, because the shell expands `$PWD` before pnpm changes directory:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- list --provider claude-code --cwd "$PWD" --exact --limit 30
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- list --provider opencode --project "$PWD" --recursive --limit 30
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- list --provider claude-code --cwd "$PWD" --exact --limit 30
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- list --provider opencode --project "$PWD" --recursive --limit 30
 ```
 
 Search by title, ID, project, provider, model provider, or badge:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- list --provider all --scope all --search "关键词" --limit 20
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- list --provider all --scope all --search "关键词" --limit 20
 ```
 
 Rename conversations with native persistence:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- rename codex:<session-id> "新标题"
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- rename claude-code:<session-id> "新标题"
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- rename opencode:<session-id> "新标题"
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- rename codex:<session-id> "新标题"
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- rename claude-code:<session-id> "新标题"
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- rename opencode:<session-id> "新标题"
 ```
 
 Generate and persist a title. `--cli` chooses AI engines, not the target provider:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- generate claude-code:<session-id> --cli opencode,codex,claude --json
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- generate claude-code:<session-id> --cli opencode,codex,claude --json
 ```
 
 Generate titles in batch for one project:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- generate-batch --provider all --cwd "$PWD" --exact --dry-run
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- generate-batch --provider all --cwd "$PWD" --exact --json --continue-on-error
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- generate-batch --provider all --cwd "$PWD" --exact --dry-run
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- generate-batch --provider all --cwd "$PWD" --exact --json --continue-on-error
 ```
 
 Rollback a batch report:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/conversation-title-generate-batch-<timestamp>.json
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- rollback --report ~/.backups/chatview-title/<date>/conversation-title-generate-batch-<timestamp>.json
 ```
 
 Open interactive mode across all providers:
 
 ```bash
-pnpm --silent --dir D:/DownloadFiles/code_area/chatlog-viewer title -- --provider all
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- --provider all
 ```
 
 ## Workflow
@@ -116,7 +116,7 @@ Use `--json` for `rename`, `generate`, `generate-batch`, and `rollback`. stdout 
       "durationMs": 1234
     }
   ],
-  "reportPath": "C:/Users/<user>/.backups/chatlog-viewer-title/<date>/conversation-title-generate-batch-<timestamp>.json"
+  "reportPath": "C:/Users/<user>/.backups/chatview-title/<date>/conversation-title-generate-batch-<timestamp>.json"
 }
 ```
 
@@ -124,7 +124,7 @@ Judge the result from `ok` and `summary`, then inspect each `entries[].status`. 
 
 ## AI Session Storage
 
-Fresh mode is the default. Codex runs with `--ephemeral`, Claude Code runs with `--no-session-persistence`, and OpenCode deletes the generated session by exact `sessionID` after the title is persisted. OpenCode stores real session, message, and part data globally in `~/.local/share/opencode/opencode.db`; `~/.chatlog-viewer/ai-title-sessions/opencode` is only the isolated working directory and fixed-session marker location.
+Fresh mode is the default. Codex runs with `--ephemeral`, Claude Code runs with `--no-session-persistence`, and OpenCode deletes the generated session by exact `sessionID` after the title is persisted. OpenCode stores real session, message, and part data globally in `~/.local/share/opencode/opencode.db`; `~/.chatview/ai-title-sessions/opencode` is only the isolated working directory and fixed-session marker location.
 
 ## Constraints
 

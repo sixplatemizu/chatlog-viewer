@@ -726,7 +726,7 @@ test("OpenCode 会从 SQLite 构建列表、详情和搜索索引", async () => 
         null,
         "title-generation-session",
         "C:/Users/tester/Desktop/code_area/chatlog-viewer",
-        "ChatLog Viewer AI Title - 2026-05-03T15:42:07.067Z",
+        "ChatView AI Title - 2026-05-03T15:42:07.067Z",
         "1.14.30",
         now - 4_500,
         now - 4_000,

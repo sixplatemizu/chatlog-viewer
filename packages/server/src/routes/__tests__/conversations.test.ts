@@ -773,7 +773,7 @@ test("AI 标题生成路由会自动删除 OpenCode fresh 模式内部标题生�
   const titleSession = createConversationMeta({
     id: "opencode:internal-title-session",
     provider: "opencode",
-    title: "ChatLog Viewer AI Title",
+    title: "ChatView AI Title",
     badges: [{ label: "标题生成", tone: "cyan" }],
   });
   const sourceConversations = [targetConversation, titleSession];

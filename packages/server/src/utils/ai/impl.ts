@@ -48,7 +48,7 @@ const CLI_TOOLS: CliTool[] = [
   {
     name: "opencode",
     command: "opencode",
-    freshArgs: ["run", "--title", "ChatLog Viewer AI Title", "--format", "json", "--", "__PROMPT__"],
+    freshArgs: ["run", "--title", "ChatView AI Title", "--format", "json", "--", "__PROMPT__"],
     resumeArgs: ["run", "--session", "__SESSION_ID__", "--format", "json", "--", "__PROMPT__"],
     healthcheckArgs: ["--version"],
     timeoutMs: 45_000,

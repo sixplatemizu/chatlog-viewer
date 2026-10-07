@@ -48,7 +48,7 @@ export function buildClaudeTitleGenerationBadges(): ConversationBadge[] {
   return [{
     label: CLAUDE_TITLE_GENERATION_BADGE_LABEL,
     tone: "cyan",
-    title: "ChatLog Viewer AI 标题生成产生的 Claude Code session",
+    title: "ChatView AI 标题生成产生的 Claude Code session",
   }];
 }
 

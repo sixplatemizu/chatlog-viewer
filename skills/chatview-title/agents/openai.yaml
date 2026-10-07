@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatView Title"
+  short_description: "管理 Codex、Claude Code 与 OpenCode 对话标题"
+  default_prompt: "Use $chatview-title to list conversations across Codex, Claude Code, and OpenCode and update their titles."

@@ -42,7 +42,8 @@ const require = createRequire(import.meta.url);
 const Database = require("better-sqlite3") as typeof BetterSqlite3;
 
 const OPENCODE_RECENT_SESSION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
-const OPENCODE_INTERNAL_TITLE_PREFIX = "ChatLog Viewer AI Title";
+const OPENCODE_INTERNAL_TITLE_PREFIX = "ChatView AI Title";
+const OPENCODE_LEGACY_INTERNAL_TITLE_PREFIX = "ChatLog Viewer AI Title";
 const OPENCODE_ONE_SHOT_DENY_PERMISSIONS = new Set(["question", "plan_enter", "plan_exit"]);
 
 interface OpenCodeSessionRow {
@@ -181,11 +182,15 @@ function buildOpenCodeBadges(row: OpenCodeSessionRow, updatedAt: number): Conver
     });
   }
 
-  if (title.startsWith(OPENCODE_INTERNAL_TITLE_PREFIX)) {
+  // 新旧前缀双认：更名前已产生的内部标题会话仍需识别清理
+  if (
+    title.startsWith(OPENCODE_INTERNAL_TITLE_PREFIX)
+    || title.startsWith(OPENCODE_LEGACY_INTERNAL_TITLE_PREFIX)
+  ) {
     badges.push({
       label: "标题生成",
       tone: "cyan",
-      title: "ChatLog Viewer AI 标题生成产生的 OpenCode session",
+      title: "ChatView AI 标题生成产生的 OpenCode session",
     });
   }
 
