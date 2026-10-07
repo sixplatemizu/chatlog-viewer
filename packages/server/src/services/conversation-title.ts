@@ -142,7 +142,7 @@ export async function persistConversationTitle(
   options: PersistConversationTitleOptions = {}
 ): Promise<void> {
   const normalizedTitle = normalizeTitle(title);
-  const historySource = options.historySource ?? "chatlog-viewer";
+  const historySource = options.historySource ?? "chatview";
 
   if (provider.updateTitle) {
     await runKeyedMutation(`conversation-title:${id}`, async () => {

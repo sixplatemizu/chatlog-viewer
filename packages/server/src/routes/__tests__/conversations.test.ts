@@ -310,7 +310,7 @@ test("支持原生标题持久化的 provider 会调用 updateTitle 并记录 UI
   assert.equal(await getTitle("codex:native-1"), null);
   assert.equal(await getNativeTitleSnapshot("codex:native-1"), "同步到原生存储");
   const history = await getTitleHistory("codex:native-1");
-  assert.equal(history.at(-1)?.source, "chatlog-viewer");
+  assert.equal(history.at(-1)?.source, "chatview");
   assert.equal(history.at(-1)?.action, "set-native-title");
   assert.equal(history.at(-1)?.newTitle, "同步到原生存储");
 

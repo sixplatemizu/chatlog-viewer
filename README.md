@@ -122,7 +122,7 @@ CI 默认执行 `lint -> typecheck -> test -> build`。
 
 #### 多 Provider 标题 CLI / Skill
 
-项目提供 `pnpm title` 和 `$chatlog-viewer-title` skill，用同一套流程管理七家 provider 的标题：`list` 支持全部七家，标题写入与 AI 生成面向支持原生标题的六家（iFlow 被能力门控拦截）。默认 provider 为 Codex，以保持旧命令兼容；使用 `--provider all` 可统一列出或批量处理全部七家。
+项目提供 `pnpm title` 和 `$chatview-title` skill，用同一套流程管理七家 provider 的标题：`list` 支持全部七家，标题写入与 AI 生成面向支持原生标题的六家（iFlow 被能力门控拦截）。默认 provider 为 Codex，以保持旧命令兼容；使用 `--provider all` 可统一列出或批量处理全部七家。
 
 ```bash
 pnpm title -- --provider all
@@ -134,20 +134,20 @@ pnpm title -- rename opencode:<session-id> "新标题"
 pnpm title -- generate claude-code:<session-id> --cli opencode,codex,claude --timeout 90000 --retries 2
 pnpm title -- generate-batch --provider all --cwd "$PWD" --exact --dry-run
 pnpm title -- generate-batch --provider all --cwd "$PWD" --exact --json --continue-on-error
-pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/conversation-title-generate-batch-<timestamp>.json
+pnpm title -- rollback --report ~/.backups/chatview-title/<date>/conversation-title-generate-batch-<timestamp>.json
 ```
 
 - `list` 默认查看 Codex；`--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all` 选择数据源，`--cwd <path> --exact` 精确匹配项目，`--project <path> --recursive` 包含子目录；内部标题生成会话默认排除
 - `rename` 按目标 provider 原生写回：Codex 使用 app-server 命名语义，Claude Code 使用 `/rename` metadata，OpenCode 更新 `session.title`
 - `--provider` 决定目标对话来源，`--cli` 决定 AI 生成引擎，两者互相独立；可将 OpenCode 配置为首选引擎，为任意受支持 provider 的对话生成标题
-- OpenCode 的完整 AI 会话仍统一存储在 `~/.local/share/opencode/opencode.db`；`~/.chatlog-viewer/ai-title-sessions/opencode` 仅是隔离工作目录和 fixed session marker，Fresh 模式生成的会话会按 `sessionID` 自动删除
+- OpenCode 的完整 AI 会话仍统一存储在 `~/.local/share/opencode/opencode.db`；`~/.chatview/ai-title-sessions/opencode` 仅是隔离工作目录和 fixed session marker，Fresh 模式生成的会话会按 `sessionID` 自动删除
 - `generate` / `generate-batch` 支持 `--cli`、`--timeout`、`--retries`，按本次实际使用的 CLI 复用或清理内部会话；标题上下文以近期消息为主，辅以少量开头/中段信息
-- `generate-batch` 会在 `~/.backups/chatlog-viewer-title/<date>/` 写入包含 `id / oldTitle / newTitle / filePath / usedCli / attempts / error` 的 JSON 报告，方便审计和回滚
+- `generate-batch` 会在 `~/.backups/chatview-title/<date>/` 写入包含 `id / oldTitle / newTitle / filePath / usedCli / attempts / error` 的 JSON 报告，方便审计和回滚
 - `generate-batch --dry-run` 只生成目标列表和报告，不调用 AI CLI、不写回标题；`rollback --report <path>` 会按报告中的 `oldTitle` 回滚成功生成过的记录
 - `rename`、`generate`、`generate-batch` 与 `rollback` 支持 `--json`：stdout 只返回一个 `schemaVersion: 1` JSON，使用 `ok`、`summary.total/success/failed/skipped` 和 `entries[].status` 判断结果；AI 诊断日志写入 stderr
 - `--json` 模式下，dry-run、提前停止后未处理的条目和回滚冲突计入 `skipped`；存在失败条目时进程以非零 code 退出，致命错误以版本化 JSON 写入 stderr
 - 通过 pnpm 调用 JSON 模式时使用 `pnpm --silent`，否则 pnpm 自身的 lifecycle banner 会出现在 stdout，影响直接 JSON 解析
-- 仓库内 `skills/chatlog-viewer-title` 可安装到本机 skill 目录，在 Codex 中用 `$chatlog-viewer-title` 触发同样的多 provider 标题工作流
+- 仓库内 `skills/chatview-title` 可安装到本机 skill 目录，在 Codex 中用 `$chatview-title` 触发同样的多 provider 标题工作流
 
 ### 5. 消息级操作
 
@@ -191,10 +191,10 @@ pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/<date>/conversat
 默认配置文件路径：
 
 ```text
-~/.chatlog-viewer/config.json
+~/.chatview/config.json
 ```
 
-也可以通过环境变量 `CHATLOG_VIEWER_CONFIG_PATH` 指定其他位置。
+也可以通过环境变量 `CHATVIEW_CONFIG_PATH`（兼容旧 `CHATLOG_VIEWER_CONFIG_PATH`）指定其他位置。
 
 配置示例：
 
@@ -249,7 +249,7 @@ packages/
         ├── hooks/         # 数据获取与交互状态
         └── lib/           # API 封装与类型
 skills/
-└── chatlog-viewer-title/   # Codex 中调用多 provider 标题 CLI 的 skill
+└── chatview-title/   # Codex 中调用多 provider 标题 CLI 的 skill
 ```
 
 ## 已知限制与后续

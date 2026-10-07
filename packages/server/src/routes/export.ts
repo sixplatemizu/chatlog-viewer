@@ -116,7 +116,7 @@ async function prepareExportFile(options: {
   mode: "full" | "partial";
 }): Promise<PreparedExportFile> {
   const { providers, ids, format, mode } = options;
-  const tempDir = await mkdtemp(join(tmpdir(), "chatlog-viewer-export-"));
+  const tempDir = await mkdtemp(join(tmpdir(), "chatview-export-"));
   const filePath = join(
     tempDir,
     format === "markdown" ? "chatlog-export.md" : "chatlog-export.json"

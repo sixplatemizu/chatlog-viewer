@@ -164,7 +164,7 @@ async function prepareDirectoryMigration(
 
   const targetCreated = !targetStats;
   const copiedTargets: string[] = [];
-  const stagedSource = `${sourceDir}.chatlog-viewer-migration-${process.pid}-${randomUUID()}`;
+  const stagedSource = `${sourceDir}.chatview-migration-${process.pid}-${randomUUID()}`;
   await mkdir(targetDir, { recursive: true });
   try {
     for (const entry of entriesToCopy) {
@@ -273,7 +273,7 @@ async function prepareFileMigration(
         if (!(await statPath(sourcePath))) continue;
         const stagedPath = joinStyledPath(
           dirnameStyledPath(sourceFile),
-          `.chatlog-viewer-migration-${process.pid}-${randomUUID()}-${sourcePath.split(/[/\\]/).pop()}`
+          `.chatview-migration-${process.pid}-${randomUUID()}-${sourcePath.split(/[/\\]/).pop()}`
         );
         await rename(sourcePath, stagedPath);
         stagedSources.push({ sourcePath, stagedPath });

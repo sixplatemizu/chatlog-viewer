@@ -5,7 +5,7 @@ import { appendFile, mkdir, readFile, rename, rm, writeFile } from "fs/promises"
 import { runKeyedMutation } from "./mutation-queue.js";
 
 type TitleMap = Record<string, string>;
-export type TitleHistorySource = "chatlog-viewer" | "ai" | "cleanup";
+export type TitleHistorySource = "chatview" | "chatlog-viewer" | "ai" | "cleanup";
 export type TitleHistoryAction =
   | "set-overlay-title"
   | "set-native-title"
@@ -132,7 +132,7 @@ export async function setTitle(id: string, title: string, options: TitleMutation
     await appendTitleHistory({
       id,
       action: "set-overlay-title",
-      source: options.historySource ?? "chatlog-viewer",
+      source: options.historySource ?? "chatview",
       oldTitle,
       newTitle: title,
     });
@@ -184,7 +184,7 @@ export async function setNativeTitleSnapshot(
     await appendTitleHistory({
       id,
       action: "set-native-title",
-      source: options.historySource ?? "chatlog-viewer",
+      source: options.historySource ?? "chatview",
       oldTitle,
       newTitle: title,
     });
