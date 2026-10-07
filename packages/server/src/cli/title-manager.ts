@@ -93,15 +93,15 @@ const MANAGED_PROVIDER_NAMES: ManagedProviderName[] = ["codex", "claude-code", "
 const MANAGED_PROVIDER_SET = new Set<ManagedProviderName>(MANAGED_PROVIDER_NAMES);
 
 function printHelp(): void {
-  console.log(`ChatLog Viewer title manager
+  console.log(`ChatView title manager
 
 Usage:
-  clv-title [interactive] [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
-  clv-title list [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
-  clv-title rename <sessionId|provider:sessionId> <title> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--json]
-  clv-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--cli opencode,codex,claude] [--timeout ms] [--retries n] [--json]
-  clv-title generate-batch [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
-  clv-title rollback --report path [--json] [--continue-on-error] [--dry-run] [--force]
+  chatview-title [interactive] [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
+  chatview-title list [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
+  chatview-title rename <sessionId|provider:sessionId> <title> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--json]
+  chatview-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--cli opencode,codex,claude] [--timeout ms] [--retries n] [--json]
+  chatview-title generate-batch [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
+  chatview-title rollback --report path [--json] [--continue-on-error] [--dry-run] [--force]
 
 Examples:
   pnpm title
@@ -111,7 +111,7 @@ Examples:
   pnpm title -- rename claude-code:<sessionId> "新的标题"
   pnpm title -- generate opencode:<sessionId> --cli opencode,codex
   pnpm title -- generate-batch --provider all --project C:/Users/mortis097 --exact --json --continue-on-error
-  pnpm title -- rollback --report ~/.backups/chatlog-viewer-title/2026-06-05/conversation-title-generate-batch-2026-06-05-120000.json
+  pnpm title -- rollback --report ~/.backups/chatview-title/2026-06-05/conversation-title-generate-batch-2026-06-05-120000.json
 `);
 }
 
@@ -797,7 +797,7 @@ function markPendingRollbackEntriesSkipped(report: RollbackReport, reason: strin
 
 async function rollbackFromReport(context: CliContext, options: CliOptions): Promise<RollbackReport> {
   if (!options.reportPath.trim()) {
-    throw new Error("用法：clv-title rollback --report <generate-batch-report.json>");
+    throw new Error("用法：chatview-title rollback --report <generate-batch-report.json>");
   }
 
   const sourceReportPath = resolveUserPath(options.reportPath);
@@ -991,7 +991,7 @@ async function main(): Promise<void> {
   if (command === "rename") {
     const [id, ...titleParts] = commandArgs;
     if (!id || titleParts.length === 0) {
-      throw new Error("用法：clv-title rename <sessionId|provider:sessionId> <title>");
+      throw new Error("用法：chatview-title rename <sessionId|provider:sessionId> <title>");
     }
     const result = await renameConversation(context, id, titleParts.join(" "), options.provider);
     printSingleTitleResult("rename", result, options);
@@ -1000,7 +1000,7 @@ async function main(): Promise<void> {
   if (command === "generate") {
     const [id] = commandArgs;
     if (!id) {
-      throw new Error("用法：clv-title generate <sessionId|provider:sessionId>");
+      throw new Error("用法：chatview-title generate <sessionId|provider:sessionId>");
     }
     const result = await generateConversationTitle(context, id, options);
     printSingleTitleResult("generate", result, options);

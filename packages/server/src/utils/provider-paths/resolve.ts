@@ -37,14 +37,14 @@ export function resolveProviderPaths(
   const loadedConfig = options.config
     ? {
         config: options.config,
-        configDir: options.configDir ?? joinStyledPath(homeDir, ".chatlog-viewer"),
+        configDir: options.configDir ?? joinStyledPath(homeDir, ".chatview"),
       }
     : loadAppConfig(env, homeDir);
   const providerConfig = loadedConfig.config.providers?.[providerName];
 
   if (providerName === "claude-code") {
     const storage = resolvePathWithFallback({
-      envKeys: ["CHATLOG_VIEWER_CLAUDE_CODE_PATH"],
+      envKeys: ["CHATVIEW_CLAUDE_CODE_PATH", "CHATLOG_VIEWER_CLAUDE_CODE_PATH"],
       configValue: providerConfig?.storagePath,
       configDir: loadedConfig.configDir,
       autoCandidates: buildClaudeStorageCandidates(homeDir, env),
@@ -64,7 +64,7 @@ export function resolveProviderPaths(
 
   if (providerName === "iflow") {
     const storage = resolvePathWithFallback({
-      envKeys: ["CHATLOG_VIEWER_IFLOW_PATH"],
+      envKeys: ["CHATVIEW_IFLOW_PATH", "CHATLOG_VIEWER_IFLOW_PATH"],
       configValue: providerConfig?.storagePath,
       configDir: loadedConfig.configDir,
       autoCandidates: buildIFlowStorageCandidates(homeDir, env),
@@ -83,13 +83,13 @@ export function resolveProviderPaths(
   }
 
   if (providerName === "opencode") {
-    const hasStorageOverride = !!env.CHATLOG_VIEWER_OPENCODE_PATH?.trim() || !!providerConfig?.storagePath?.trim();
-    const hasStateDbOverride = !!env.CHATLOG_VIEWER_OPENCODE_DB_PATH?.trim() || !!providerConfig?.stateDbPath?.trim();
+    const hasStorageOverride = !!(env.CHATVIEW_OPENCODE_PATH?.trim() || env.CHATLOG_VIEWER_OPENCODE_PATH?.trim()) || !!providerConfig?.storagePath?.trim();
+    const hasStateDbOverride = !!(env.CHATVIEW_OPENCODE_DB_PATH?.trim() || env.CHATLOG_VIEWER_OPENCODE_DB_PATH?.trim()) || !!providerConfig?.stateDbPath?.trim();
     const openCodeDbPath = options.openCodeDbPath === undefined && (!hasStorageOverride || !hasStateDbOverride)
       ? resolveOpenCodeCliDbPath(env, homeDir)
       : options.openCodeDbPath ?? null;
     const storage = resolvePathWithFallback({
-      envKeys: ["CHATLOG_VIEWER_OPENCODE_PATH"],
+      envKeys: ["CHATVIEW_OPENCODE_PATH", "CHATLOG_VIEWER_OPENCODE_PATH"],
       configValue: providerConfig?.storagePath,
       configDir: loadedConfig.configDir,
       autoCandidates: buildOpenCodeStorageCandidates(homeDir, env, openCodeDbPath),
@@ -101,7 +101,7 @@ export function resolveProviderPaths(
     });
 
     const stateDb = resolvePathWithFallback({
-      envKeys: ["CHATLOG_VIEWER_OPENCODE_DB_PATH"],
+      envKeys: ["CHATVIEW_OPENCODE_DB_PATH", "CHATLOG_VIEWER_OPENCODE_DB_PATH"],
       configValue: providerConfig?.stateDbPath,
       configDir: loadedConfig.configDir,
       autoCandidates: buildOpenCodeStateDbCandidates(homeDir, env, storage.path, openCodeDbPath),
@@ -123,15 +123,15 @@ export function resolveProviderPaths(
   }
 
   if (providerName === "pi" || providerName === "codebuddy" || providerName === "workbuddy") {
-    const rules: Record<string, { envKey: string; leaves: string[]; nouns: string[] }> = {
-      pi: { envKey: "CHATLOG_VIEWER_PI_PATH", leaves: ["agent", "sessions"], nouns: [".pi", "pi", "Pi"] },
-      codebuddy: { envKey: "CHATLOG_VIEWER_CODEBUDDY_PATH", leaves: ["projects"], nouns: [".codebuddy", "codebuddy", "CodeBuddy"] },
-      workbuddy: { envKey: "CHATLOG_VIEWER_WORKBUDDY_PATH", leaves: [], nouns: [".workbuddy", "workbuddy", "WorkBuddy"] },
+    const rules: Record<string, { envKeys: string[]; leaves: string[]; nouns: string[] }> = {
+      pi: { envKeys: ["CHATVIEW_PI_PATH", "CHATLOG_VIEWER_PI_PATH"], leaves: ["agent", "sessions"], nouns: [".pi", "pi", "Pi"] },
+      codebuddy: { envKeys: ["CHATVIEW_CODEBUDDY_PATH", "CHATLOG_VIEWER_CODEBUDDY_PATH"], leaves: ["projects"], nouns: [".codebuddy", "codebuddy", "CodeBuddy"] },
+      workbuddy: { envKeys: ["CHATVIEW_WORKBUDDY_PATH", "CHATLOG_VIEWER_WORKBUDDY_PATH"], leaves: [], nouns: [".workbuddy", "workbuddy", "WorkBuddy"] },
     };
     const rule = rules[providerName]!;
     const sharedCliRoots = getSharedConfigRoots(homeDir, env);
     const storage = resolvePathWithFallback({
-      envKeys: [rule.envKey],
+      envKeys: rule.envKeys,
       configValue: providerConfig?.storagePath,
       configDir: loadedConfig.configDir,
       autoCandidates: [
@@ -147,7 +147,7 @@ export function resolveProviderPaths(
 
     if (providerName === "workbuddy") {
       const stateDb = resolvePathWithFallback({
-        envKeys: ["CHATLOG_VIEWER_WORKBUDDY_DB_PATH"],
+        envKeys: ["CHATVIEW_WORKBUDDY_DB_PATH", "CHATLOG_VIEWER_WORKBUDDY_DB_PATH"],
         configValue: providerConfig?.stateDbPath,
         configDir: loadedConfig.configDir,
         autoCandidates: [
@@ -179,7 +179,7 @@ export function resolveProviderPaths(
   }
 
   const storage = resolvePathWithFallback({
-    envKeys: ["CHATLOG_VIEWER_CODEX_SESSIONS_PATH"],
+    envKeys: ["CHATVIEW_CODEX_SESSIONS_PATH", "CHATLOG_VIEWER_CODEX_SESSIONS_PATH"],
     configValue: providerConfig?.storagePath,
     configDir: loadedConfig.configDir,
     autoCandidates: buildCodexStorageCandidates(homeDir, env),
@@ -191,7 +191,7 @@ export function resolveProviderPaths(
   });
 
   const stateDb = resolvePathWithFallback({
-    envKeys: ["CHATLOG_VIEWER_CODEX_STATE_DB_PATH"],
+    envKeys: ["CHATVIEW_CODEX_STATE_DB_PATH", "CHATLOG_VIEWER_CODEX_STATE_DB_PATH"],
     configValue: providerConfig?.stateDbPath,
     configDir: loadedConfig.configDir,
     autoCandidates: buildCodexStateDbCandidates(homeDir, env, storage.path),
@@ -326,7 +326,7 @@ function buildOpenCodeStateDbCandidates(
 }
 
 function resolveOpenCodeCliDbPath(env: EnvLike, homeDir: string): string | null {
-  const command = env.CHATLOG_VIEWER_OPENCODE_BIN?.trim() || "opencode";
+  const command = env.CHATVIEW_OPENCODE_BIN?.trim() || env.CHATLOG_VIEWER_OPENCODE_BIN?.trim() || "opencode";
   try {
     const output = execFileSync(command, ["db", "path"], {
       encoding: "utf-8",

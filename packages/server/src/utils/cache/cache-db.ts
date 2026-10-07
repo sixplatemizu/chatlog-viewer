@@ -51,8 +51,8 @@ export function setStoreDirOverride(storeDir: string | null): void {
 }
 
 function getStoreDir(): string {
-  const envOverride = process.env.CHATLOG_VIEWER_STORE_DIR?.trim();
-  return storeDirOverride || envOverride || join(homedir(), ".chatlog-viewer");
+  const envOverride = process.env.CHATVIEW_STORE_DIR?.trim() || process.env.CHATLOG_VIEWER_STORE_DIR?.trim();
+  return storeDirOverride || envOverride || join(homedir(), ".chatview");
 }
 
 function getDbPath(): string {

@@ -25,7 +25,9 @@ let isWritingDebug = false;
 const LOG_LEVELS = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 } as const;
 type LogLevel = keyof typeof LOG_LEVELS;
 
-let currentLogLevel: LogLevel = (process.env.CHATLOG_VIEWER_LOG_LEVEL as LogLevel) ?? "INFO";
+let currentLogLevel: LogLevel = (process.env.CHATVIEW_LOG_LEVEL as LogLevel)
+  ?? (process.env.CHATLOG_VIEWER_LOG_LEVEL as LogLevel) // 旧变量兼容一版
+  ?? "INFO";
 
 function getToday(): string {
   return new Date().toISOString().slice(0, 10);

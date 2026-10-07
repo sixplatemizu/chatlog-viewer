@@ -12,8 +12,9 @@ export function clearConfigLoadCache(): void {
 }
 
 export function getProviderConfigPath(env: EnvLike = process.env, homeDir = homedir()): string {
-  const configuredPath = env.CHATLOG_VIEWER_CONFIG_PATH?.trim();
-  if (!configuredPath) return joinStyledPath(homeDir, ".chatlog-viewer", "config.json");
+  // 新变量优先，旧变量兼容一版：CHATVIEW_CONFIG_PATH > CHATLOG_VIEWER_CONFIG_PATH > ~/.chatview/config.json
+  const configuredPath = env.CHATVIEW_CONFIG_PATH?.trim() || env.CHATLOG_VIEWER_CONFIG_PATH?.trim();
+  if (!configuredPath) return joinStyledPath(homeDir, ".chatview", "config.json");
   return resolvePathValue(configuredPath, homeDir, env);
 }
 

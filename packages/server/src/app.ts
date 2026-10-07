@@ -60,7 +60,7 @@ function normalizeOrigin(origin: string): string | null {
 }
 
 function getAllowedOriginsFromEnv(): string[] {
-  const configured = process.env.CHATLOG_VIEWER_ALLOWED_ORIGINS?.trim();
+  const configured = (process.env.CHATVIEW_ALLOWED_ORIGINS ?? process.env.CHATLOG_VIEWER_ALLOWED_ORIGINS)?.trim();
   if (!configured) return DEFAULT_ALLOWED_ORIGINS;
   return configured
     .split(",")

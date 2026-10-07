@@ -15,15 +15,16 @@ export function getApiTokenPath(
   env: Record<string, string | undefined> = process.env,
   homeDir = homedir()
 ): string {
-  return env.CHATLOG_VIEWER_API_TOKEN_PATH?.trim()
-    || join(homeDir, ".chatlog-viewer", "session-token");
+  return env.CHATVIEW_API_TOKEN_PATH?.trim()
+    || env.CHATLOG_VIEWER_API_TOKEN_PATH?.trim() // 旧变量兼容一版
+    || join(homeDir, ".chatview", "session-token");
 }
 
 export function getOrCreateApiToken(
   env: Record<string, string | undefined> = process.env,
   homeDir = homedir()
 ): string {
-  const envToken = env.CHATLOG_VIEWER_API_TOKEN?.trim();
+  const envToken = env.CHATVIEW_API_TOKEN?.trim() || env.CHATLOG_VIEWER_API_TOKEN?.trim();
   if (envToken) return envToken;
 
   const tokenPath = getApiTokenPath(env, homeDir);

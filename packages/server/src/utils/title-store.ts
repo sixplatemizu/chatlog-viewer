@@ -30,8 +30,8 @@ export interface TitleMutationOptions {
 let storeDirOverride: string | null = null;
 
 function getStoreDir(): string {
-  const envOverride = process.env.CHATLOG_VIEWER_STORE_DIR?.trim();
-  return storeDirOverride || envOverride || join(homedir(), ".chatlog-viewer");
+  const envOverride = process.env.CHATVIEW_STORE_DIR?.trim() || process.env.CHATLOG_VIEWER_STORE_DIR?.trim();
+  return storeDirOverride || envOverride || join(homedir(), ".chatview");
 }
 
 function getStoreFile(fileName = "titles.json"): string {

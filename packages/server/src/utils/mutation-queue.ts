@@ -20,8 +20,9 @@ interface MutationLockRecord {
 }
 
 function getLockDirectory(): string {
-  return process.env.CHATLOG_VIEWER_LOCK_DIR?.trim()
-    || join(homedir(), ".chatlog-viewer", "locks");
+  return process.env.CHATVIEW_LOCK_DIR?.trim()
+    || process.env.CHATLOG_VIEWER_LOCK_DIR?.trim() // 旧变量兼容一版
+    || join(homedir(), ".chatview", "locks");
 }
 
 function getLockPath(key: string): string {

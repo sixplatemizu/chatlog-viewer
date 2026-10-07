@@ -154,7 +154,7 @@ function formatBackupDate(date: Date): { day: string; stamp: string } {
 
 export async function createTitleReportPath(prefix: string): Promise<string> {
   const { day, stamp } = formatBackupDate(new Date());
-  const dir = join(homedir(), ".backups", "chatlog-viewer-title", day);
+  const dir = join(homedir(), ".backups", "chatview-title", day);
   await mkdir(dir, { recursive: true });
   return join(dir, `conversation-title-${prefix}-${stamp}.json`);
 }
