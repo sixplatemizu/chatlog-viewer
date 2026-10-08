@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.33.0",
   "engines": {
-    "node": "20 || 22"
+    "node": "22 || 26"
   },
   "scripts": {
     "dev": "concurrently \"pnpm --filter server dev\" \"pnpm --filter web dev\"",
