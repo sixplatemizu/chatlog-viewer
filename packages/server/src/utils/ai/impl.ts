@@ -19,6 +19,15 @@ interface CliTool {
   timeoutMs?: number;
   promptMode?: "stdin" | "args";
   projectDirArg?: string;
+  modelArg?: string;
+  agentArg?: string;
+  variantArg?: string;
+}
+
+export interface TitleToolOptions {
+  model?: string;
+  agent?: string;
+  variant?: string;
 }
 
 interface TitleSessionMarker {
@@ -35,6 +44,7 @@ const CLI_TOOLS: CliTool[] = [
     resumeArgs: ["exec", "resume", "--last", "--skip-git-repo-check", "-"],
     healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
+    modelArg: "-m",
   },
   {
     name: "claude",
@@ -44,6 +54,9 @@ const CLI_TOOLS: CliTool[] = [
     resumeArgs: ["-c", "-p", ""],
     healthcheckArgs: ["--version"],
     timeoutMs: 30_000,
+    modelArg: "--model",
+    agentArg: "--agent",
+    variantArg: "--effort",
   },
   {
     name: "opencode",
@@ -54,6 +67,9 @@ const CLI_TOOLS: CliTool[] = [
     timeoutMs: 45_000,
     promptMode: "args",
     projectDirArg: "--dir",
+    modelArg: "-m",
+    agentArg: "--agent",
+    variantArg: "--variant",
   },
 ];
 
@@ -81,6 +97,7 @@ export interface GenerateTitleOptions {
   timeoutMs?: number;
   retries?: number;
   availableCliNames?: CliToolName[];
+  toolOptions?: TitleToolOptions;
   beforeToolRun?: (
     toolName: CliToolName,
     run: { sessionWillPersist: boolean }
@@ -520,6 +537,14 @@ export function extractOpenCodeSessionId(stdout: string): string | null {
   return null;
 }
 
+export function addToolOptionsArgsForTest(
+  tool: Pick<CliTool, "name"> & Partial<Pick<CliTool, "modelArg" | "agentArg" | "variantArg">>,
+  args: string[],
+  toolOptions?: TitleToolOptions
+): string[] {
+  return addToolOptionsArgs(tool as CliTool, args, toolOptions);
+}
+
 function addProjectDirArg(tool: CliTool, args: string[], projectDir?: string): string[] {
   const normalizedProjectDir = projectDir?.trim();
   if (!tool.projectDirArg || !normalizedProjectDir || args.includes(tool.projectDirArg)) {
@@ -531,6 +556,28 @@ function addProjectDirArg(tool: CliTool, args: string[], projectDir?: string): s
     return [tool.projectDirArg, normalizedProjectDir];
   }
   return [command, tool.projectDirArg, normalizedProjectDir, ...rest];
+}
+
+// 生成方 agent/模型/思考强度透传：按各 CLI 实际参数位拼装，
+// 不支持的 tool 直接忽略对应项（codex 无 agent/variant 位）。
+function addToolOptionsArgs(tool: CliTool, args: string[], toolOptions?: TitleToolOptions): string[] {
+  if (!toolOptions) return args;
+  const pairs: Array<[string | undefined, string | undefined]> = [
+    [tool.modelArg, toolOptions.model?.trim() || undefined],
+    [tool.agentArg, toolOptions.agent?.trim() || undefined],
+    [tool.variantArg, toolOptions.variant?.trim() || undefined],
+  ];
+  const extra: string[] = [];
+  for (const [flag, value] of pairs) {
+    if (!flag || !value || args.includes(flag)) continue;
+    extra.push(flag, value);
+  }
+  if (extra.length === 0) return args;
+
+  // prompt 占位符保持末尾：opencode 的 __PROMPT__ 必须留在 -- 之后
+  const promptIndex = args.indexOf("__PROMPT__");
+  if (promptIndex < 0) return [...args, ...extra];
+  return [...args.slice(0, promptIndex), ...extra, ...args.slice(promptIndex)];
 }
 
 async function resolveCliProjectDir(projectDir?: string): Promise<string | undefined> {
@@ -640,7 +687,7 @@ async function executeCli(
 async function runCliTool(
   tool: CliTool,
   prompt: string,
-  options?: { reuseSession?: boolean; projectDir?: string; timeoutMs?: number }
+  options?: { reuseSession?: boolean; projectDir?: string; timeoutMs?: number; toolOptions?: TitleToolOptions }
 ): Promise<{
   stdout: string;
   mode: CliRunMode;
@@ -658,7 +705,8 @@ async function runCliTool(
   const projectDir = await resolveCliProjectDir(requestedProjectDir) ?? (tool.projectDirArg ? process.cwd() : undefined);
 
   const run = async (args: string[], mode: CliRunMode) => {
-    const stdout = await executeCli(tool, args, prompt, workDir, {
+    const withOptions = addToolOptionsArgs(tool, args, options?.toolOptions);
+    const stdout = await executeCli(tool, withOptions, prompt, workDir, {
       projectDir,
       timeoutMs: options?.timeoutMs,
     });
@@ -741,6 +789,7 @@ export async function generateTitle(
           reuseSession,
           projectDir: options?.projectDir,
           timeoutMs: options?.timeoutMs,
+          toolOptions: options?.toolOptions,
         });
         await options?.afterToolRun?.(tool.name, {
           sessionRetained: result.sessionRetained,

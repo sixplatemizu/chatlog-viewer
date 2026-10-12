@@ -6,7 +6,7 @@ import type {
   Message,
   TitleSyncMode,
 } from "../providers/types.js";
-import { generateTitle } from "../utils/ai/index.js";
+import { generateTitle, type TitleToolOptions } from "../utils/ai/index.js";
 import { getErrorMessage, isNotFoundError, MutationConflictError } from "../utils/errors.js";
 import { logProviderError } from "../utils/logger.js";
 import {
@@ -50,6 +50,7 @@ export interface GenerateConversationTitleOptions {
   timeoutMs?: number;
   retries?: number;
   availableCliNames?: TitleGenerationCli[];
+  toolOptions?: TitleToolOptions;
 }
 
 export interface PersistConversationTitleOptions {
@@ -331,6 +332,7 @@ export async function generateAndPersistConversationTitle(
       timeoutMs: options.timeoutMs,
       retries: options.retries,
       availableCliNames: options.availableCliNames,
+      toolOptions: options.toolOptions,
       beforeToolRun: async (toolName, run) => {
         const toolReusesSession = typeof reuseSession === "object"
           ? reuseSession[toolName] ?? false

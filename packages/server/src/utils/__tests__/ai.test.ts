@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import type { Message } from "../../providers/types.js";
 import {
+  addToolOptionsArgsForTest,
   buildTitlePromptContextForTest,
   extractCleanOutput,
   extractOpenCodeSessionId,
@@ -479,6 +480,29 @@ test("首次固定模式生成会创建可复用会话并写入 session 状态",
     env.restoreEnv();
     await rm(env.baseDir, { recursive: true, force: true });
   }
+});
+
+test("生成方参数会按各 CLI 参数位拼装（opencode 全项、codex 仅模型）", () => {
+  assert.deepEqual(
+    addToolOptionsArgsForTest(
+      { name: "opencode", modelArg: "-m", agentArg: "--agent", variantArg: "--variant" },
+      ["run", "--title", "ChatView AI Title", "--format", "json", "--", "__PROMPT__"],
+      { model: "opencode/exo-free", agent: "plan", variant: "high" }
+    ),
+    ["run", "--title", "ChatView AI Title", "--format", "json", "--", "-m", "opencode/exo-free", "--agent", "plan", "--variant", "high", "__PROMPT__"]
+  );
+  assert.deepEqual(
+    addToolOptionsArgsForTest(
+      { name: "codex", modelArg: "-m" },
+      ["exec", "--skip-git-repo-check", "--color", "never", "-"],
+      { model: "gpt-5", agent: "plan", variant: "high" }
+    ),
+    ["exec", "--skip-git-repo-check", "--color", "never", "-", "-m", "gpt-5"]
+  );
+  assert.deepEqual(
+    addToolOptionsArgsForTest({ name: "codex", modelArg: "-m" }, ["exec", "-"], undefined),
+    ["exec", "-"]
+  );
 });
 
 test("已有固定会话时会优先复用 resume 会话", async () => {

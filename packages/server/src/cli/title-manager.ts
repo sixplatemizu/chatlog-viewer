@@ -75,6 +75,9 @@ export interface CliOptions {
   retries?: number;
   cliPriority?: TitleGenerationCli[];
   reuseSession?: boolean;
+  toolModel?: string;
+  toolAgent?: string;
+  toolVariant?: string;
   force: boolean;
 }
 
@@ -99,8 +102,8 @@ Usage:
   chatview-title [interactive] [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n]
   chatview-title list [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--scope all|cwd] [--project path] [--exact|--recursive] [--search text] [--limit n] [--json]
   chatview-title rename <sessionId|provider:sessionId> <title> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--json]
-  chatview-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--cli opencode,codex,claude] [--timeout ms] [--retries n] [--json]
-  chatview-title generate-batch [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--json] [--continue-on-error] [--dry-run]
+  chatview-title generate <sessionId|provider:sessionId> [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy] [--cli opencode,codex,claude] [--model provider/model] [--agent name] [--variant effort] [--timeout ms] [--retries n] [--json]
+  chatview-title generate-batch [--provider codex|claude-code|opencode|iflow|pi|codebuddy|workbuddy|all] [--project path|--cwd path] [--exact|--recursive] [--limit n] [--cli opencode,codex,claude] [--model provider/model] [--agent name] [--variant effort] [--json] [--continue-on-error] [--dry-run]
   chatview-title rollback --report path [--json] [--continue-on-error] [--dry-run] [--force]
 
 Examples:
@@ -110,6 +113,7 @@ Examples:
   pnpm title -- rename codex:<sessionId> "新的标题"
   pnpm title -- rename claude-code:<sessionId> "新的标题"
   pnpm title -- generate opencode:<sessionId> --cli opencode,codex
+  pnpm title -- generate-batch --provider opencode --limit 15 --cli opencode --model opencode/exo-free --variant high
   pnpm title -- generate-batch --provider all --project C:/Users/mortis097 --exact --json --continue-on-error
   pnpm title -- rollback --report ~/.backups/chatview-title/2026-06-05/conversation-title-generate-batch-2026-06-05-120000.json
 `);
@@ -291,6 +295,21 @@ export function parseArgs(args: string[]): { command: string; commandArgs: strin
     }
     if (arg === "--cli") {
       options.cliPriority = parseCliPriority(args[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (arg === "--model") {
+      options.toolModel = args[index + 1]?.trim() || undefined;
+      index += 1;
+      continue;
+    }
+    if (arg === "--agent") {
+      options.toolAgent = args[index + 1]?.trim() || undefined;
+      index += 1;
+      continue;
+    }
+    if (arg === "--variant") {
+      options.toolVariant = args[index + 1]?.trim() || undefined;
       index += 1;
       continue;
     }
@@ -583,6 +602,9 @@ function buildGenerateOptions(
     retries: options.retries,
     reuseSession: options.reuseSession ?? (defaults.batch ? false : undefined),
     availableCliNames: defaults.availableCliNames,
+    toolOptions: (options.toolModel || options.toolAgent || options.toolVariant)
+      ? { model: options.toolModel, agent: options.toolAgent, variant: options.toolVariant }
+      : undefined,
   };
 }
 

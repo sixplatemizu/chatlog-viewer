@@ -53,10 +53,13 @@ pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- rename claude-c
 pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- rename opencode:<session-id> "新标题"
 ```
 
-Generate and persist a title. `--cli` chooses AI engines, not the target provider:
+Generate and persist a title. `--cli` chooses AI engines, not the target provider.
+`--model/--agent/--variant` pass through to the generator (`opencode` supports
+all three, `claude` maps variant to `--effort`, `codex` accepts model only):
 
 ```bash
 pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- generate claude-code:<session-id> --cli opencode,codex,claude --json
+pnpm --silent --dir D:/DownloadFiles/code_area/chatview title -- generate-batch --provider opencode --limit 15 --cli opencode --model opencode/exo-free --variant high --json --continue-on-error
 ```
 
 Generate titles in batch for one project:

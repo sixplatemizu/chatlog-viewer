@@ -1,5 +1,6 @@
-export type { GenerateTitleOptions, GenerateTitleResult } from "./impl.js";
+export type { GenerateTitleOptions, GenerateTitleResult, TitleToolOptions } from "./impl.js";
 export {
+  addToolOptionsArgsForTest,
   buildTitlePromptContextForTest,
   detectAvailableTitleGenerationClis,
   extractCleanOutput,
