@@ -50,4 +50,4 @@
 - [x] 调研（链路+三家参数位）
 - [x] 实现（impl/service/CLI/index/test/skill）
 - [x] 全量验证（server test 全过、双包 typecheck、eslint）
-- [ ] exo-free/high 15 条实测
+- [x] exo-free/high 15 条实测（首轮 12/15，3 条超时；120s 重试 3/3 成功；坏标题 1 条已 rename 修复）
